@@ -49,6 +49,9 @@ table.data-table tr:hover td { background:#f9fafb; }
 table.data-table td.num, table.data-table th.num { text-align:right;
        font-variant-numeric:tabular-nums; }
 td.empty { color:var(--muted); text-align:center; padding:16px; }
+table.data-table td.cell-hot { background:#fee2e2; }
+.hot-legend { background:#fee2e2; padding:1px 6px; border-radius:4px; }
+.table-scroll { overflow-x:auto; }
 .chart-box { overflow-x:auto; }
 .badge { display:inline-block; padding:2px 10px; border-radius:999px;
        font-size:11.5px; font-weight:600; }

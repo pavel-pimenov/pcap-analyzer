@@ -62,12 +62,12 @@ analyzer/
 Тестового фреймворка нет; минимальная регрессия — прогон на образцах:
 
 ```bash
-# локально (нужен tshark в PATH; для PDF — weasyprint из requirements.txt)
+# локально (нужен tshark в PATH; для PDF — weasyprint из requirements.txt);
+# <образец>.pcap — любой pcap из pcap-sample/
 python3 -m analyzer branches
-python3 -m analyzer analyze pcap-sample/kh-kb12ramp-cote2.pcap -o /tmp/r2 -f both   # ~3 c
-python3 -m analyzer analyze pcap-sample/kh-kb12ramp-cote1.pcap -o /tmp/r1 -f both   # ~25 c, 291k пакетов
+python3 -m analyzer analyze pcap-sample/<образец>.pcap -o /tmp/report -f both
 
-# веб-GUI: загрузить cote2 через POST /api/upload, дождаться done,
+# веб-GUI: загрузить образец через POST /api/upload, дождаться done,
 # проверить /view/<id> и /export/<id>?fmt=pdf
 python3 -m analyzer serve --port 8125 --data-dir /tmp/webdata --samples-dir pcap-sample
 ```
@@ -81,13 +81,16 @@ python3 -m analyzer serve --port 8125 --data-dir /tmp/webdata --samples-dir pcap
 * PDF: кириллица извлекается (например, pypdf), футер «страница N из M»,
   таблицы/графики на месте.
 
-Контрольные значения для `kh-kb12ramp-cote1.pcap`: 291 081 пакет,
-69 896 запросов, 5 серверов (.209–.213), 1 клиент (.195), медиана RTT ~20 мс.
-Для `kh-kb12ramp-cote2.pcap`: 13 111 запросов, клиент .196, 58 SYN,
-медиана RTT ~1.9 мс, 58 SYN (пара .196→.213 — 49), рекомендаций 6
-(5 warning, включая «Частые переподключения», 1 info), критичных нет.
-Для cote1 правило переподключений НЕ срабатывает: каждая пара подключается
-по одному разу (порог `conn_churn_pair_min` в `Config`).
+Контрольные значения привязаны к двум образцам из `pcap-sample/`
+(большой и малый; при замене образцов значения пересчитать по tshark):
+
+* большой: ~291 тыс. пакетов, 69 896 запросов, 5 серверов, 1 клиент,
+  медиана RTT ~20 мс; единственный SYN к порту 502, остальные соединения
+  установлены до начала захвата — правило переподключений НЕ срабатывает
+  (порог `conn_churn_pair_min` в `Config`); 15 рекомендаций;
+* малый: 13 111 запросов, медиана RTT ~1.9 мс, 49 SYN (одна пара),
+  53 потока закрыл клиент; рекомендаций 6 (5 warning, включая
+  «Частые переподключения», 1 info), критичных нет.
 
 ## Docker
 
@@ -121,7 +124,7 @@ Batch-анализ — профиль `batch` (`docker compose run --rm analyzer
 ### Изменить пороги рекомендаций
 
 Только через `Config` в `analyzer/config.py`; после изменения — перезапустить
-анализ cote2/cote1 и проверить, что рекомендации ожидаемо появляются/исчезают.
+анализ обоих образцов и проверить, что рекомендации ожидаемо появляются/исчезают.
 
 ### Изменить оформление PDF
 

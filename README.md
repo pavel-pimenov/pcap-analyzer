@@ -71,11 +71,11 @@ docker compose up --build          # затем открыть http://localhost:
 
 ```bash
 docker compose run --rm analyzer analyze \
-    /data/kh-kb12ramp-cote1.pcap -o /output/report_modbus.html
+    /data/<файл>.pcap -o /output/report
 
 # сразу HTML и PDF:
 docker compose run --rm analyzer analyze \
-    /data/kh-kb12ramp-cote2.pcap -o /output/cote2 -f both
+    /data/<файл>.pcap -o /output/report -f both
 
 docker compose run --rm analyzer branches        # список веток анализа
 ```
@@ -91,14 +91,14 @@ mkdir -p output
 docker run --rm \
   -v "$(pwd)/pcap-sample:/data:ro" \
   -v "$(pwd)/output:/output" \
-  pcap-analyzer analyze /data/kh-kb12ramp-cote1.pcap -o /output/report.html -f both
+  pcap-analyzer analyze /data/<файл>.pcap -o /output/report.html -f both
 ```
 
 ### Вариант 4 — локально (нужны tshark и weasyprint)
 
 ```bash
 pip install -r requirements.txt   # + системные библиотеки Pango (см. Dockerfile)
-python3 -m analyzer analyze pcap-sample/kh-kb12ramp-cote1.pcap -o report.html -f both
+python3 -m analyzer analyze pcap-sample/<файл>.pcap -o report.html -f both
 ```
 
 Путь к tshark: флаг `--tshark-bin`, переменная окружения `TSHARK_BIN` или `PATH`.
@@ -189,15 +189,15 @@ pcap-analyzer/
 
 ```bash
 # кто опрашивает серверы и как часто
-tshark -r pcap-sample/kh-kb12ramp-cote1.pcap -Y "mbtcp && tcp.dstport==502" \
+tshark -r <файл>.pcap -Y "mbtcp && tcp.dstport==502" \
   -T fields -e ip.src -e ip.dst | sort | uniq -c | sort -rn
 
 # распределение функций
-tshark -r pcap-sample/kh-kb12ramp-cote1.pcap -Y "mbtcp" \
+tshark -r <файл>.pcap -Y "mbtcp" \
   -T fields -e modbus.func_code | sort | uniq -c | sort -rn
 
 # времена отклика серверов
-tshark -r pcap-sample/kh-kb12ramp-cote1.pcap -Y "mbtcp && tcp.srcport==502" \
+tshark -r <файл>.pcap -Y "mbtcp && tcp.srcport==502" \
   -T fields -e ip.src -e modbus.response_time
 ```
 

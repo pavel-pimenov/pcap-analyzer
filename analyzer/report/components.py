@@ -91,15 +91,26 @@ def kpi_cards(items: Iterable) -> str:
     return '<div class="kpi-grid">' + "".join(cards) + "</div>"
 
 
-def table_html(headers: Sequence[str], rows: Sequence[Sequence[str]], cls: str = "") -> str:
+def table_html(headers: Sequence[str], rows: Sequence[Sequence], cls: str = "") -> str:
+    """Таблица; ячейка-кортеж (html, css_class) получает класс на <td>."""
     head = "".join(f"<th>{h}</th>" for h in headers)
     body_rows = []
     for row in rows:
-        body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>")
+        cells = []
+        for c in row:
+            if isinstance(c, tuple):
+                val, ccls = c
+                cells.append(f'<td class="{esc(ccls)}">{val}</td>')
+            else:
+                cells.append(f"<td>{c}</td>")
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
     body = "".join(body_rows) or '<tr><td colspan="99" class="empty">нет данных</td></tr>'
+    # обёртка с горизонтальной прокруткой: широкие таблицы не ломают вёрстку
     return (
+        '<div class="table-scroll">'
         f'<table class="data-table {cls}">'
         f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+        "</div>"
     )
 
 

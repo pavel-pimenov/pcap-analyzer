@@ -253,7 +253,9 @@ class ModbusTcpAnalyzer(BaseBranch):
         return h.hexdigest()[:16]
 
     def _cmd(self, args_tail: str) -> str:
-        return f"tshark -r {self.pcap_str} {args_tail}"
+        # в командах для пользователя — только имя файла: он может лежать
+        # где угодно, полный путь нужен лишь самому анализатору
+        return f"tshark -r {self.pcap.name} {args_tail}"
 
     # -- Проход 1: общие сведения -------------------------------------------
 
@@ -304,6 +306,11 @@ class ModbusTcpAnalyzer(BaseBranch):
                             info["first"] = ts
                         if info["last"] is None or ts > info["last"]:
                             info["last"] = ts
+                    # кто инициировал завершение соединения (первый FIN/RST)
+                    if "closed_by" not in info and (
+                            _truthy(r.get("tcp.flags.fin", ""))
+                            or _truthy(r.get("tcp.flags.reset", ""))):
+                        info["closed_by"] = src
             if (i + 1) % 100000 == 0:
                 self.progress(f"  обработано {i + 1} пакетов…")
         return g
@@ -686,8 +693,12 @@ class ModbusTcpAnalyzer(BaseBranch):
                 ["Клиент", "Сервер", "Запросы", "Ответы", "Искл.", "Нет отв.",
                  "p50, мс", "p95, мс", "Байты", "Основные функции"],
                 rows, cls="pairs")
-            + '<p class="note">«Нет отв.» — запросы без сопоставленного ответа до конца '
-              "захвата (таймауты, обрывы, ретрансмиссии).</p>"
+            + '<p class="note"><strong>p50</strong> (медиана) — половина запросов '
+              'получила ответ быстрее этого времени, половина — медленнее. '
+              '<strong>p95</strong> — 95% запросов уложились в это время, лишь 5% '
+              'были медленнее: если p50 маленький, а p95 большой, отклик обычно '
+              'быстрый, но иногда «подвисает». «Нет отв.» — запросы без '
+              'сопоставленного ответа до конца захвата.</p>'
         )
         cmds = [
             ("Диалоги клиент-сервер", self._cmd("-q -z conv,tcp")),
@@ -722,30 +733,59 @@ class ModbusTcpAnalyzer(BaseBranch):
             f"коротких (&lt;{C.fmt_dur(self.cfg.short_stream_sec)}): <strong>{short_cnt}</strong>.</p>"
         )
         syn_detail = ""
-        if gen.syn502:
+        if gen.syn502 or any(i.get("closed_by") for i in gen.streams502.values()):
+            # подключения и разрывы по парам клиент → сервер
             per_pair = Counter((c, s) for _t, c, s in gen.syn502)
+            close_by_srv, close_by_cli = Counter(), Counter()
+            for info in gen.streams502.values():
+                cb = info.get("closed_by")
+                if not cb:
+                    continue
+                key = (info["client"], info["server"])
+                if cb == info["server"]:
+                    close_by_srv[key] += 1
+                elif cb == info["client"]:
+                    close_by_cli[key] += 1
+            total_syn = len(gen.syn502)
             pair_rows = []
-            for (c, s), n in per_pair.most_common(
-                    self.cfg.max_rows_per_table):
+            keys = set(per_pair) | {k for k in close_by_srv} | {k for k in close_by_cli}
+            for (c, s) in sorted(keys, key=lambda k: per_pair.get(k, 0),
+                                 reverse=True)[: self.cfg.max_rows_per_table]:
+                n = per_pair.get((c, s), 0)
+
+                def _cell(cnt: int, hot: bool) -> str:
+                    val = f'<span class="num">{C.fmt_int(cnt)}</span>'
+                    return (val, "cell-hot") if hot and cnt > 0 else val
+
                 pair_rows.append([
                     f"<strong>{C.esc(c)}</strong>",
                     C.esc(s),
-                    f'<span class="num">{C.fmt_int(n)}</span>',
-                    f'<span class="num">{C.fmt_pct(n, len(gen.syn502))}</span>',
+                    _cell(n, True),
+                    _cell(close_by_srv.get((c, s), 0), True),
+                    _cell(close_by_cli.get((c, s), 0), True),
+                    f'<span class="num">{C.fmt_pct(n, total_syn)}</span>',
                 ])
             syn_examples = "; ".join(
                 f"{_fmt_ts_offset(t, gen.first_ts or 0)} ({c})"
                 for t, c, _s in gen.syn502[:8]
             )
             syn_detail = (
-                '<h3 class="subhead">Сколько раз клиент подключался к серверу</h3>'
-                + C.table_html(["Клиент", "Сервер", "Подключений (SYN)", "Доля"],
-                               pair_rows)
-                + '<p class="note">«Подключений &gt; 1» — пара пересоздавала '
-                  'TCP-соединение в ходе захвата; для Modbus/TCP нормой считается '
-                  'одно долгоживущее соединение на пару.</p>'
-                + '<h3 class="subhead">Моменты установки соединений (первые)</h3>'
-                + f"<p>{syn_examples}</p>"
+                '<h3 class="subhead">Подключения и разрывы по парам клиент &rarr; сервер</h3>'
+                + C.table_html(
+                    ["Клиент", "Сервер", "Подключений", "Разрывов сервером",
+                     "Разрывов клиентом", "Доля подключений"],
+                    pair_rows)
+                + '<p class="note"><strong>Подключений</strong> — сколько раз клиент '
+                  'устанавливал TCP-соединение с сервером (SYN к порту 502); больше 1 '
+                  '<span class="hot-legend">подсвечено розовым</span>: соединение '
+                  'пересоздавалось, для Modbus/TCP нормой считается одно долгоживущее '
+                  '(keep-alive) соединение на пару. <strong>Разрывов сервером / '
+                  'клиентом</strong> — кто первым послал FIN или RST при закрытии; '
+                  'розовым отмечены любые значения больше нуля. Разрывы по инициативе '
+                  'сервера (особенно RST) — повод проверить таймауты простоя на '
+                  'сервере и сетевых устройствах (NAT, межсетевые экраны).'
+                  + (f'</p><p class="note">Первые SYN: {syn_examples}.</p>'
+                     if syn_examples else '</p>')
             )
         tbl = ""
         if st_rows:
@@ -758,11 +798,19 @@ class ModbusTcpAnalyzer(BaseBranch):
             "соединений или нестабильности сети.</p>"
         )
         cmds = [
+            ("Число подключений по парам (колонка «Подключений»)",
+             self._cmd('-Y "tcp.flags.syn==1 && tcp.flags.ack==0 && tcp.dstport==502" '
+                       "-T fields -e ip.src -e ip.dst | sort | uniq -c")),
             ("Все попытки подключения к Modbus-серверам",
              self._cmd('-Y "tcp.flags.syn==1 && tcp.flags.ack==0 && tcp.dstport==502" '
                        "-T fields -e frame.time -e ip.src -e ip.dst -e tcp.stream")),
             ("Полностью проследить одно соединение (подставьте номер потока)",
              self._cmd("-q -z follow,tcp,ascii,0")),
+            ("Кто первым завершил соединение (колонки «Разрывов…»)",
+             self._cmd('-Y "(tcp.flags.fin==1 || tcp.flags.reset==1) && tcp.port==502" '
+                       '-T fields -e tcp.stream -e frame.time_epoch -e ip.src '
+                       "| sort -k1,1n -k2,2g | awk '!seen[$1]++ {print $3}' "
+                       "| sort | uniq -c")),
             ("Закрытия и сбросы соединений",
              self._cmd('-Y "(tcp.flags.reset==1 || tcp.flags.fin==1) && tcp.port==502" '
                        "-T fields -e frame.time -e ip.src -e ip.dst -e tcp.flags")),
