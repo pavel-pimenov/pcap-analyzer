@@ -126,7 +126,7 @@ class AppState:
             "status": e["status"],
             "stage": e.get("stage", ""),
             "progress": int(e.get("progress") or 0),
-            "tookS": str(e.get("took_s") or ""),
+            "tookS": "" if e.get("took_s") in (None, "") else str(e["took_s"]),
             "error": e.get("error", ""),
             "added": e.get("added", ""),
             "hasHtml": (self.reports_dir / f"{fid}.html").is_file(),
@@ -223,6 +223,25 @@ class AppState:
                 if e["status"] in ("queued", "new"):
                     e["status"] = "running"
 
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _find_cached(self, fid: str, sha256: str,
+                     branch: str) -> dict | None:
+        """Другая запись с тем же дампом, веткой и ГОТОВЫМ отчётом."""
+        with self.lock:
+            for other in self.entries.values():
+                if (other["id"] != fid and other.get("sha256") == sha256
+                        and other.get("branch") == branch
+                        and other.get("status") == "done"):
+                    return other
+            return None
+
     def _worker(self) -> None:
         while True:
             fid = self.jobs.get()
@@ -248,6 +267,31 @@ class AppState:
                 self._stage(_fid, m)
 
             try:
+                # кэш по содержимому: идентичный дамп с готовым отчётом
+                # той же ветки — просто переиспользуем результат
+                progress("  контрольная сумма файла…")
+                sha = self._sha256_file(Path(e["path"]))
+                with self.lock:
+                    e["sha256"] = sha
+                cached = self._find_cached(fid, sha, branch.name)
+                if cached is not None:
+                    for ext in ("html", "pdf"):
+                        src = self.reports_dir / f"{cached['id']}.{ext}"
+                        dst = self.reports_dir / f"{fid}.{ext}"
+                        if src.is_file():
+                            shutil.copyfile(src, dst)
+                    took = round(time.monotonic() - t0, 1)
+                    with self.lock:
+                        e["captured"] = cached.get("captured", "")
+                        e["status"] = "done"
+                        e["progress"] = 100
+                        e["took_s"] = took
+                        e["stage"] = (f"готово за {took:g} с "
+                                      "(отчёт из кэша: идентичный файл "
+                                      "уже анализировался)")
+                        e["error"] = ""
+                        self._persist(e)
+                    continue
                 result = branch.analyze(
                     Path(e["path"]), DEFAULT_CONFIG,
                     progress=progress,

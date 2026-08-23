@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import bisect
 import hashlib
 import math
 from collections import Counter, deque
@@ -245,7 +244,8 @@ class ModbusTcpAnalyzer(BaseBranch):
         self._threads = []
         if mb["req_total"] and gen.duration > 0:
             progress("Проход 3/3: подбор окон активности…")
-            self._threads = self._pass_threads(gen)
+            self._threads = self._thread_windows(
+                "mbtcp && tcp.dstport==502", gen.first_ts, gen.duration)
 
         # Если Modbus не найден — честно сообщаем в отчёте
         kpi = self._build_kpi(gen, mb)
@@ -353,108 +353,6 @@ class ModbusTcpAnalyzer(BaseBranch):
             if (i + 1) % 100000 == 0:
                 self.progress(f"  обработано {i + 1} пакетов…")
         return g
-
-    # -- Проход 3: окна активности для диаграмм Ганта --------------------------
-
-    FIELDS_THREADS = ["frame.time_epoch", "tcp.srcport", "tcp.dstport", "ip.dst"]
-
-    def _pass_threads(self, gen: GeneralStats) -> list[dict]:
-        """Данные для диаграмм Ганта: основное окно и «зум» внутри него.
-
-        Экономия памяти как у остальных проходов: один прогон tshark строит
-        гистограмму запросов по секундам (O(секунд захвата)), затем события
-        собираются отдельно только внутри каждого окна (память ограничена
-        шириной окна, а не размером файла).
-        """
-        base = gen.first_ts
-        win_big = min(self.cfg.gantt_window_sec, gen.duration)
-        if base is None or win_big <= 0:
-            return []
-        filt = "mbtcp && tcp.dstport==502"
-
-        hist: Counter = Counter()
-        for r in stream_fields(self.tshark, self.pcap_str,
-                               ["frame.time_epoch"], display_filter=filt):
-            ts = _to_float(r.get("frame.time_epoch"))
-            if ts is not None:
-                hist[int(ts - base)] += 1
-        if not hist:
-            return []
-
-        L = max(int(win_big), 1)
-        best_s, best_cnt = min(hist), -1
-        for s in range(min(hist), max(hist) + 1):
-            cnt = sum(hist.get(x, 0) for x in range(s, s + L))
-            if cnt > best_cnt:
-                best_s, best_cnt = s, cnt
-
-        windows = [
-            self._thread_events(filt, base, float(best_s), win_big)
-        ]
-        # «зум»: самая загруженная целая секунда внутри большого окна
-        win_zoom = min(self.cfg.gantt_zoom_sec, win_big)
-        if win_zoom < win_big:
-            sec = max(range(int(best_s), int(best_s) + L),
-                      key=lambda s: hist.get(s, 0))
-            zwin = self._thread_events(filt, base, float(sec), win_zoom)
-            windows.append(zwin)
-            # третья диаграмма: самая плотная пачка внутри зум-секунды
-            bw = min(self.cfg.gantt_burst_sec, win_zoom)
-            burst = self._burst_window(zwin, bw)
-            if burst:
-                windows.append(burst)
-        return [w for w in windows if w["rows"]]
-
-    @staticmethod
-    def _burst_window(zwin: dict, bw: float) -> dict | None:
-        """Окно самой плотной пачки запросов из событий зум-секунды.
-
-        Скользящее окно длиной bw по отсортированным моментам запросов;
-        новый проход tshark не нужен — события уже в памяти.
-        """
-        offs = sorted(t for e in zwin["rows"].values() for t in e["ticks"])
-        if len(offs) < 2:
-            return None
-        best_t, best_n = offs[0], 0
-        for i, t in enumerate(offs):           # скользящее окно по bisect
-            hi = bisect.bisect_right(offs, t + bw)
-            if hi - i > best_n:
-                best_n, best_t = hi - i, t
-        w0, w1 = best_t, best_t + bw
-        rows = {}
-        for key, e in zwin["rows"].items():
-            tk = [t for t in e["ticks"] if w0 <= t < w1]
-            if tk:
-                rows[key] = {"ticks": tk, "min": min(tk), "max": max(tk)}
-        if best_n < 2 or not rows:
-            return None
-        return {"win": bw, "start_off": w0, "events": best_n, "rows": rows}
-
-    def _thread_events(self, filt: str, base: float, w0: float,
-                       win: float) -> dict:
-        """Собрать события одного окна: точки запросов по каждому соединению."""
-        self.progress("  сбор событий выбранного окна…")
-        rows: dict[tuple[str, int], dict] = {}
-        events = 0
-        for r in stream_fields(self.tshark, self.pcap_str, self.FIELDS_THREADS,
-                               display_filter=filt):
-            ts = _to_float(r.get("frame.time_epoch"))
-            if ts is None:
-                continue
-            off = ts - base
-            if not (w0 <= off < w0 + win):
-                continue
-            sport = _to_int(r.get("tcp.srcport"), -1)
-            dst = r.get("ip.dst", "")
-            key = (dst, sport)
-            e = rows.setdefault(key, {"ticks": [], "min": off, "max": off})
-            e["ticks"].append(off)
-            if off < e["min"]:
-                e["min"] = off
-            if off > e["max"]:
-                e["max"] = off
-            events += 1
-        return {"win": win, "start_off": w0, "events": events, "rows": rows}
 
     # -- Проход 2: Modbus -----------------------------------------------------
 
@@ -983,80 +881,10 @@ class ModbusTcpAnalyzer(BaseBranch):
 
     def _sec_threads(self, gen: GeneralStats, mb: dict) -> Section | None:
         """Диаграммы Ганта: окно 10 с, зум 1 с и пачка запросов (~0,1 с)."""
-
-        def fmt_win(w: float) -> str:
-            return f"{w:g}".replace(".", ",")
-
         tw_list = getattr(self, "_threads", [])
-        charts = []
-        for i, tw in enumerate(tw_list):
-            # ряды группируем по ПЛК: сортировка по IP сервера, затем порт
-            ordered = sorted(
-                tw["rows"].items(),
-                key=lambda kv: (tuple(int(x) for x in kv[0][0].split(".")),
-                                kv[0][1]))
-            g_rows = []
-            for (dst, sport), e in ordered:
-                bg, strong = self._srv_colors.get(dst, ("#f1f5f9", "#334155"))
-                g_rows.append({
-                    "label": f":{sport} → {dst}",
-                    "color": strong,
-                    "bg": bg,
-                    "fg": strong,
-                    "span": (e["min"], e["max"]),
-                    "ticks": e["ticks"],
-                })
-            svg = C.gantt_svg(g_rows, tw["start_off"],
-                              tw["start_off"] + tw["win"], bursts=(i >= 1))
-            if not svg:
-                continue
-            mm, ss = divmod(int(tw["start_off"]), 60)
-            ms = int(round((tw["start_off"] % 1) * 1000))
-            if i == 0:
-                title = (f"Окно {fmt_win(tw['win'])} с "
-                         f"(начало — {mm}:{ss:02d} от начала файла)")
-            elif i == 1:
-                title = (f"Самая загруженная секунда этого окна "
-                         f"(масштаб {fmt_win(tw['win'])} с); над слитными "
-                         f"группами запросов указано их число")
-            else:
-                title = (f"Самая плотная пачка запросов (масштаб "
-                         f"{fmt_win(tw['win'])} с; начало {mm}:{ss:02d},"
-                         f"{ms:03d}) — над каждой пачкой число Modbus-обращений")
-            charts.append(
-                f'<h3 class="subhead">{title}</h3>'
-                f'<div class="chart-box">{svg}</div>'
-            )
-        if not charts:
+        body = self._gantt_section_body(tw_list)
+        if not body:
             return None
-        ev_str = " + ".join(C.fmt_int(tw["events"]) for tw in tw_list)
-        body = (
-            "".join(charts)
-            + "<p>Вертикальные полоски-чёрточки — это <strong>отдельные "
-              "Modbus-запросы</strong>: каждая чёрточка на оси времени — один "
-              "пакет-запрос к PLC. Чем гуще стоят чёрточки, тем интенсивнее "
-              "опрос в этот момент. Чёрточки окрашены цветом того PLC, "
-              f"которому адресован запрос. Запросов на диаграммах: {ev_str}.</p>"
-            + '<p class="legend">'
-              '<span><i class="lg lg-tick"></i>один Modbus-запрос</span>'
-              '<span><i class="lg lg-span"></i>активность соединения</span>'
-              '<span><i class="lg lg-grid"></i>линии сетки — деления времени</span>'
-              "</p>"
-            + '<p class="note">Каждый ряд — отдельное TCP-соединение '
-              '(эфемерный порт клиента &rarr; PLC); подпись ряда подкрашена '
-              'цветом этого PLC, как в таблицах, ряды отсортированы по IP '
-              'сервера — соединения с одним PLC идут подряд. Точки — отдельные '
-              'Modbus-запросы, светлая полоса — период, в котором '
-              'наблюдалась активность соединения. Перекрывающиеся по времени ряды — '
-              'одновременный опрос из нескольких потоков; строгое чередование '
-              'рядов «лесенкой» — последовательная работа одного потока. '
-              '«Зум»-диаграмма показывает детально одну секунду внутри большого '
-              'окна — на ней видно чередование запросов между PLC; над '
-              'сливающимися группами стрелкой указано число запросов, редкие '
-              'одиночные обращения остаются без подписи. Третья диаграмма '
-              'раскрывает самую плотную пачку (масштаб ~0,1 с): сливающиеся '
-              'в полоску запросы разделяются.</p>'
-        )
         if not tw_list:
             busy_dst, busy_port = "", -1
         else:

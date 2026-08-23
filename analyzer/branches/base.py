@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import bisect
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 from typing import Callable, Sequence
 
 ProgressCb = Callable[[str], None]
+
+from ..tshark_runner import stream_fields  # noqa: E402
 
 # Уровни важности рекомендаций
 SEVERITY_CRITICAL = "critical"
@@ -105,6 +109,203 @@ class BaseBranch(ABC):
         bg, fg = self._srv_colors.get(ip, ("#f1f5f9", "#334155"))
         return (f'<span class="srv" style="background:{bg};color:{fg}">'
                 f"{escape(str(ip), quote=True)}</span>")
+
+    # -- Диаграммы Ганта по потокам (общие для протокольных веток) -----------
+    #
+    # Три диаграммы: самое загруженное окно, «зум» внутри него и самая
+    # плотная пачка. Память ограничена шириной окна, а не размером файла:
+    # первый прогон строит гистограмму запросов по секундам, события
+    # собираются отдельно только внутри выбранных окон.
+
+    FIELDS_THREADS = ["frame.time_epoch", "tcp.srcport", "tcp.dstport",
+                      "ip.dst"]
+
+    @staticmethod
+    def _num_f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _thread_windows(self, req_filter: str, first_ts: float | None,
+                        duration: float) -> list[dict]:
+        """Окна активности соединений для диаграмм Ганта.
+
+        req_filter — дисплей-фильтр tshark, считающий «запросами»
+        (например, "mbtcp && tcp.dstport==502").
+        """
+        base = first_ts
+        win_big = min(self.cfg.gantt_window_sec, duration)
+        if base is None or win_big <= 0:
+            return []
+
+        hist: Counter = Counter()
+        for r in stream_fields(self.tshark, self.pcap_str,
+                               ["frame.time_epoch"], display_filter=req_filter):
+            ts = self._num_f(r.get("frame.time_epoch"))
+            if ts is not None:
+                hist[int(ts - base)] += 1
+        if not hist:
+            return []
+
+        L = max(int(win_big), 1)
+        best_s, best_cnt = min(hist), -1
+        for s in range(min(hist), max(hist) + 1):
+            cnt = sum(hist.get(x, 0) for x in range(s, s + L))
+            if cnt > best_cnt:
+                best_s, best_cnt = s, cnt
+
+        windows = [
+            self._thread_events(req_filter, base, float(best_s), win_big)
+        ]
+        # «зум»: самая загруженная целая секунда внутри большого окна
+        win_zoom = min(self.cfg.gantt_zoom_sec, win_big)
+        if win_zoom < win_big:
+            sec = max(range(int(best_s), int(best_s) + L),
+                      key=lambda s: hist.get(s, 0))
+            zwin = self._thread_events(req_filter, base, float(sec), win_zoom)
+            windows.append(zwin)
+            # третья диаграмма: самая плотная пачка внутри зум-секунды
+            bw = min(self.cfg.gantt_burst_sec, win_zoom)
+            burst = self._burst_window(zwin, bw)
+            if burst:
+                windows.append(burst)
+        return [w for w in windows if w["rows"]]
+
+    @staticmethod
+    def _burst_window(zwin: dict, bw: float) -> dict | None:
+        """Окно самой плотной пачки запросов из событий зум-секунды.
+
+        Скользящее окно длиной bw по отсортированным моментам запросов;
+        новый проход tshark не нужен — события уже в памяти.
+        """
+        offs = sorted(t for e in zwin["rows"].values() for t in e["ticks"])
+        if len(offs) < 2:
+            return None
+        best_t, best_n = offs[0], 0
+        for i, t in enumerate(offs):           # скользящее окно по bisect
+            hi = bisect.bisect_right(offs, t + bw)
+            if hi - i > best_n:
+                best_n, best_t = hi - i, t
+        w0, w1 = best_t, best_t + bw
+        rows = {}
+        for key, e in zwin["rows"].items():
+            tk = [t for t in e["ticks"] if w0 <= t < w1]
+            if tk:
+                rows[key] = {"ticks": tk, "min": min(tk), "max": max(tk)}
+        if best_n < 2 or not rows:
+            return None
+        return {"win": bw, "start_off": w0, "events": best_n, "rows": rows}
+
+    def _thread_events(self, filt: str, base: float, w0: float,
+                       win: float) -> dict:
+        """Собрать события одного окна: точки запросов по каждому соединению."""
+        self.progress("  сбор событий выбранного окна…")
+        rows: dict[tuple[str, int], dict] = {}
+        events = 0
+        for r in stream_fields(self.tshark, self.pcap_str, self.FIELDS_THREADS,
+                               display_filter=filt):
+            ts = self._num_f(r.get("frame.time_epoch"))
+            if ts is None:
+                continue
+            off = ts - base
+            if not (w0 <= off < w0 + win):
+                continue
+            sport = int(r.get("tcp.srcport") or -1)
+            dst = r.get("ip.dst", "")
+            key = (dst, sport)
+            e = rows.setdefault(key, {"ticks": [], "min": off, "max": off})
+            e["ticks"].append(off)
+            if off < e["min"]:
+                e["min"] = off
+            if off > e["max"]:
+                e["max"] = off
+            events += 1
+        return {"win": win, "start_off": w0, "events": events, "rows": rows}
+
+    def _gantt_section_body(self, tw_list: Sequence[dict],
+                            req_noun: str = "Modbus-запросы",
+                            unit_acc: str = "Modbus-обращений") -> str | None:
+        """Тело секции с диаграммами Ганта (графики, легенда, пояснения).
+
+        req_noun — название запросов для текста («Modbus-запросы»,
+        «S7-запросы»); unit_acc — форма для счётчика над пачкой.
+        """
+        from analyzer.report import components as C
+
+        def fmt_win(w: float) -> str:
+            return f"{w:g}".replace(".", ",")
+
+        charts = []
+        for i, tw in enumerate(tw_list):
+            # ряды группируем по серверу: сортировка по IP, затем порт
+            ordered = sorted(
+                tw["rows"].items(),
+                key=lambda kv: (self._ip_key(kv[0][0]), kv[0][1]))
+            g_rows = []
+            for (dst, sport), e in ordered:
+                bg, strong = self._srv_colors.get(dst, ("#f1f5f9", "#334155"))
+                g_rows.append({
+                    "label": f":{sport} → {dst}",
+                    "color": strong,
+                    "bg": bg,
+                    "fg": strong,
+                    "span": (e["min"], e["max"]),
+                    "ticks": e["ticks"],
+                })
+            svg = C.gantt_svg(g_rows, tw["start_off"],
+                              tw["start_off"] + tw["win"], bursts=(i >= 1))
+            if not svg:
+                continue
+            mm, ss = divmod(int(tw["start_off"]), 60)
+            ms = int(round((tw["start_off"] % 1) * 1000))
+            if i == 0:
+                title = (f"Окно {fmt_win(tw['win'])} с "
+                         f"(начало — {mm}:{ss:02d} от начала файла)")
+            elif i == 1:
+                title = (f"Самая загруженная секунда этого окна "
+                         f"(масштаб {fmt_win(tw['win'])} с); над слитными "
+                         f"группами запросов указано их число")
+            else:
+                title = (f"Самая плотная пачка запросов (масштаб "
+                         f"{fmt_win(tw['win'])} с; начало {mm}:{ss:02d},"
+                         f"{ms:03d}) — над каждой пачкой число {unit_acc}")
+            charts.append(
+                f'<h3 class="subhead">{title}</h3>'
+                f'<div class="chart-box">{svg}</div>'
+            )
+        if not charts:
+            return None
+        ev_str = " + ".join(C.fmt_int(tw["events"]) for tw in tw_list)
+        return (
+            "".join(charts)
+            + "<p>Вертикальные полоски-чёрточки — это <strong>отдельные "
+              f"{C.esc(req_noun)}</strong>: каждая чёрточка на оси времени — "
+              "один пакет-запрос к серверу. Чем гуще стоят чёрточки, тем "
+              "интенсивнее опрос в этот момент. Чёрточки окрашены цветом "
+              "того сервера, которому адресован запрос. "
+              f"Запросов на диаграммах: {ev_str}.</p>"
+            + '<p class="legend">'
+              f'<span><i class="lg lg-tick"></i>один '
+              f'{C.esc(req_noun.replace("ы", ""))}</span>'
+              '<span><i class="lg lg-span"></i>активность соединения</span>'
+              '<span><i class="lg lg-grid"></i>линии сетки — деления времени</span>'
+              "</p>"
+            + '<p class="note">Каждый ряд — отдельное TCP-соединение '
+              '(эфемерный порт клиента &rarr; сервер); подпись ряда подкрашена '
+              'цветом этого сервера, как в таблицах, ряды отсортированы по IP '
+              'сервера — соединения с одним сервером идут подряд. Точки — '
+              f'отдельные {req_noun}, светлая полоса — период, в котором '
+              'наблюдалась активность соединения. Перекрывающиеся по времени '
+              'ряды — одновременный опрос из нескольких потоков; строгое '
+              'чередование рядов «лесенкой» — последовательная работа одного '
+              'потока. «Зум»-диаграмма показывает детально одну секунду '
+              'внутри большого окна — на ней видно чередование запросов между '
+              'серверами; над сливающимися группами стрелкой указано число '
+              'запросов, редкие одиночные обращения остаются без подписи. '
+              'Третья диаграмма раскрывает самую плотную пачку '
+              '(масштаб ~0,1 с): сливающиеся в полоску запросы разделяются.</p>'
+        )
 
     @abstractmethod
     def analyze(

@@ -217,17 +217,25 @@ class S7CommAnalyzer(BaseBranch):
         )
         self.sha256_short = self._sha256_short(pcap_path)
 
-        progress("Проход 1/2: общий обзор TCP/IP…")
+        progress("Проход 1/3: общий обзор TCP/IP…")
         gen = self._pass_general()
 
         result.capture_start_ts = gen.first_ts
 
-        progress("Проход 2/2: разбор S7comm…")
+        progress("Проход 2/3: разбор S7comm…")
         s7 = self._pass_s7(gen)
 
         # тёплые цвета серверов (PLC): единая раскраска таблиц, диаграмм
         # и легенды шапки отчёта
         self._set_servers(p for (_c, p) in s7["pairs"])
+
+        # окна для диаграмм Ганта (общий хелпер BaseBranch; есть что
+        # показывать — только при наличии S7-трафика)
+        self._threads = []
+        if s7["req_total"] and gen.duration > 0:
+            progress("Проход 3/3: подбор окон активности…")
+            self._threads = self._thread_windows(
+                "s7comm && tcp.dstport==102", gen.first_ts, gen.duration)
 
         result.kpi = self._build_kpi(gen, s7)
         result.sections = self._build_sections(gen, s7)
@@ -468,6 +476,9 @@ class S7CommAnalyzer(BaseBranch):
             sections.append(self._sec_timeline(gen, s7))
             sections.append(self._sec_pairs(gen, s7))
             sections.append(self._sec_connections(gen, s7))
+            threads = self._sec_threads()
+            if threads:
+                sections.append(threads)
             sections.append(self._sec_functions(s7))
             sections.append(self._sec_areas(s7))
             sections.append(self._sec_errors(s7))
@@ -707,6 +718,51 @@ class S7CommAnalyzer(BaseBranch):
              self._cmd("-q -z follow,tcp,ascii,0")),
         ]
         return Section("connections", f"Соединения TCP (порт {PORT})",
+                       body, cmds)
+
+    def _sec_threads(self) -> Section | None:
+        """Диаграммы Ганта по потокам (общий хелпер BaseBranch)."""
+        tw_list = getattr(self, "_threads", [])
+        body = self._gantt_section_body(tw_list, req_noun="S7-запросы",
+                                        unit_acc="S7-обращений")
+        if not body:
+            return None
+        # примеры команд: самый нагруженный PLC и самый плотный поток окна
+        busy_dst, busy_port = "", -1
+        fast_pair = ("", -1)
+        if tw_list:
+            r0 = tw_list[0]["rows"]
+            if r0:
+                ticks_cnt: dict[str, int] = {}
+                for (dst, _sp), e in r0.items():
+                    ticks_cnt[dst] = ticks_cnt.get(dst, 0) + len(e["ticks"])
+                busy_dst = max(ticks_cnt, key=lambda d: ticks_cnt[d])
+                fast_pair = max(r0.items(),
+                                key=lambda kv: len(kv[1]["ticks"]))[0]
+        cmds = []
+        if busy_dst:
+            cmds.append((
+                "Все S7 Job-запросы к самому загруженному PLC",
+                self._cmd(f'-Y "s7comm && tcp.dstport==102 && '
+                          f'ip.dst=={busy_dst}" -T fields -e frame.time '
+                          "-e tcp.srcport -e s7comm.header.rosctr "
+                          "-e s7comm.param.func")))
+        if fast_pair[0]:
+            cmds.append((
+                "Самый быстрый поток: PLC "
+                f"{fast_pair[0]}, порт {fast_pair[1]} — интервалы между "
+                "строками — период цикла опроса",
+                self._cmd(f'-Y "s7comm && tcp.dstport==102 && '
+                          f'ip.dst=={fast_pair[0]} && '
+                          f'tcp.srcport=={fast_pair[1]}" '
+                          "-T fields -e frame.time -e s7comm.header.rosctr "
+                          "-e s7comm.param.func")))
+        if not cmds:
+            cmds.append((
+                "Все соединения к порту 102 с эфемеральными портами",
+                self._cmd('-Y "s7comm && tcp.dstport==102" -T fields '
+                          "-e tcp.stream -e tcp.srcport -e ip.dst | sort -u")))
+        return Section("threads", "Опрос по потокам (диаграмма Ганта)",
                        body, cmds)
 
     def _sec_functions(self, s7: dict) -> Section:
