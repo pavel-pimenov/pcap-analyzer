@@ -134,6 +134,19 @@ COPY_BTN = (
 )
 
 
+def ensure_field_headers(cmd: str) -> str:
+    """Добавить -E header=y к «чистой» команде -T fields.
+
+    Тогда при запуске первой строкой выводятся имена полей — понятно, что
+    в какой колонке. Команды с конвейером (| sort | uniq …) не трогаем:
+    заголовок ломал бы агрегацию.
+    """
+    head, sep, tail = cmd.partition(" -T fields")
+    if not sep or "|" in tail or " -E " in cmd or cmd.endswith("-E header=y"):
+        return cmd
+    return f"{head}{sep}{tail} -E header=y"
+
+
 def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
     """Блок команд tshark для проверки выборок."""
     if not commands:
@@ -142,7 +155,8 @@ def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
     for desc, cmd in commands:
         items.append(
             f'<div class="cmd-row"><div class="cmd-desc">{esc(desc)}</div>'
-            f'<div class="cmd-line"><pre class="cmd"><code>{esc(cmd)}</code>'
+            f'<div class="cmd-line"><pre class="cmd"><code>'
+            f"{esc(ensure_field_headers(cmd))}</code>"
             f"</pre>{COPY_BTN}</div></div>"
         )
     return (
