@@ -14,8 +14,9 @@
 (`requirements.txt`); системные библиотеки Pango/GDK-Pixbuf и шрифты с
 кириллицей ставятся apt-пакетами (см. `Dockerfile`).
 
-Ветки анализа (протоколы): сейчас реализована ветка `modbus` (Modbus/TCP),
-реестр — `BRANCHES` в `analyzer/branches/__init__.py`.
+Ветки анализа (протоколы): `modbus` (Modbus/TCP, порт 502) и `s7comm`
+(Siemens S7 Communication, порт 102), реестр — `BRANCHES` в
+`analyzer/branches/__init__.py`.
 
 ## Ключевые соглашения
 

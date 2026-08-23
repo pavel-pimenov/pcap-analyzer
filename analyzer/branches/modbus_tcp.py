@@ -1192,9 +1192,11 @@ class ModbusTcpAnalyzer(BaseBranch):
         return out
 
     def _rule_conn_churn(self, gen: GeneralStats) -> list[Recommendation]:
-        dur_min = gen.duration / 60 if gen.duration else 0
-        if not gen.syn502 or dur_min == 0:
+        if not gen.syn502 or not gen.duration:
             return []
+        # захваты короче минуты не масштабируем: иначе пара SYN за 5 секунд
+        # даст ложную «частоту» 24/мин
+        dur_min = max(gen.duration / 60, 1.0)
         per_pair = Counter((c, s) for _t, c, s in gen.syn502)
         rate = len(gen.syn502) / dur_min
         hot_pairs = {cs: n for cs, n in per_pair.items()

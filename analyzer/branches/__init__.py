@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from .base import BaseBranch
 from .modbus_tcp import ModbusTcpAnalyzer
+from .s7comm import S7CommAnalyzer
 
 BRANCHES: dict[str, type[BaseBranch]] = {
     ModbusTcpAnalyzer.name: ModbusTcpAnalyzer,
+    S7CommAnalyzer.name: S7CommAnalyzer,
 }
 
 DEFAULT_BRANCH = "modbus"
