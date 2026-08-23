@@ -1018,6 +1018,15 @@ class ModbusTcpAnalyzer(BaseBranch):
                 (sp for (d, sp) in r0 if d == busy_dst),
                 key=lambda sp: len(r0[(busy_dst, sp)]["ticks"]),
                 default=-1)
+        # самый плотный поток окна: больше всех запросов в секунду —
+        # пример циклического опроса одним соединением
+        fast_pair = ("", -1)
+        fast_rate = 0.0
+        if tw_list:
+            r0 = tw_list[0]["rows"]
+            if r0:
+                fast_pair, fe = max(r0.items(), key=lambda kv: len(kv[1]["ticks"]))
+                fast_rate = len(fe["ticks"]) / tw_list[0]["win"]
         cmds = [
             ("Многопоточный опрос: все запросы к самому загруженному PLC — "
              "в одну секунду строки с разными эфемерными портами клиента",
@@ -1033,10 +1042,22 @@ class ModbusTcpAnalyzer(BaseBranch):
                        "-e ip.dst -e mbtcp.trans_id -e mbtcp.unit_id "
                        "-e modbus.func_code -e modbus.reference_num "
                        "-e modbus.word_cnt")),
-            ("Все соединения к порту 502 с эфемерными портами",
+            ("Все соединения к порту 502 с эфемеральными портами",
              self._cmd('-Y "mbtcp && tcp.dstport==502" -T fields -e tcp.stream '
                        "-e tcp.srcport -e ip.dst | sort -u")),
         ]
+        if fast_rate > 1:
+            cmds.append(
+                ("Самый быстрый поток: PLC "
+                 f"{fast_pair[0]}, порт {fast_pair[1]} — около "
+                 f"{fast_rate:.0f} зап./с; интервалы между строками — период "
+                 "цикла опроса",
+                 self._cmd(f'-Y "mbtcp && tcp.dstport==502 && ip.dst=='
+                           f'{fast_pair[0]} && tcp.srcport=={fast_pair[1]}" '
+                           "-T fields -e frame.time -e mbtcp.trans_id "
+                           "-e mbtcp.unit_id -e modbus.func_code "
+                           "-e modbus.reference_num -e modbus.word_cnt"))
+            )
         return Section("threads", "Опрос по потокам (диаграмма Ганта)", body, cmds)
 
     def _sec_fcodes(self, mb: dict) -> Section:
