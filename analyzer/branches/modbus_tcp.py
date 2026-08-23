@@ -225,14 +225,28 @@ class ModbusTcpAnalyzer(BaseBranch):
         )
         self.sha256_short = self._sha256_short(pcap_path)
 
-        progress("Проход 1/2: общий обзор TCP/IP…")
+        progress("Проход 1/3: общий обзор TCP/IP…")
         gen = self._pass_general()
         duration = gen.duration
 
         result.capture_start_ts = gen.first_ts
 
-        progress("Проход 2/2: разбор Modbus/TCP…")
+        progress("Проход 2/3: разбор Modbus/TCP…")
         mb = self._pass_modbus(gen)
+
+        # тёплые цвета серверов (ПЛК): единая раскраска во всех таблицах и на
+        # диаграммах; порядок — по возрастанию IP, чтобы он был стабилен
+        self._srv_idx = {
+            ip: i for i, ip in enumerate(sorted(
+                {sv for (_c, sv) in mb["pairs"]},
+                key=lambda a: tuple(int(x) for x in a.split("."))))
+        }
+
+        # окно 10 с для диаграммы Ганта (только если есть что показывать)
+        self._threads = None
+        if mb["req_total"] and gen.duration > 0:
+            progress("Проход 3/3: подбор окна активности…")
+            self._threads = self._pass_threads_window(gen)
 
         # Если Modbus не найден — честно сообщаем в отчёте
         kpi = self._build_kpi(gen, mb)
@@ -258,6 +272,29 @@ class ModbusTcpAnalyzer(BaseBranch):
         # в командах для пользователя — только имя файла: он может лежать
         # где угодно, полный путь нужен лишь самому анализатору
         return f"tshark -r {self.pcap.name} {args_tail}"
+
+    def _srv_cell(self, ip: str) -> str:
+        """IP сервера на тёплом фоне — цвет кодирует конкретный ПЛК."""
+        bg, fg = C.warm_pair(self._srv_idx.get(ip, 0))
+        return (f'<span class="srv" style="background:{bg};color:{fg}">'
+                f"{C.esc(ip)}</span>")
+
+    @staticmethod
+    def _max_concurrent(intervals) -> int:
+        """Максимум одновременных соединений по перекрытию интервалов жизни."""
+        evts = []
+        for a, b in intervals:
+            if a is None or b is None or b < a:
+                continue
+            evts.append((a, 1))
+            evts.append((b, -1))
+        evts.sort()          # при равном времени закрытие (-1) раньше открытия
+        cur = mx = 0
+        for _t, d in evts:
+            cur += d
+            if cur > mx:
+                mx = cur
+        return mx
 
     # -- Проход 1: общие сведения -------------------------------------------
 
@@ -301,6 +338,8 @@ class ModbusTcpAnalyzer(BaseBranch):
                     info = g.streams502.setdefault(
                         st, {"client": dst if sport == 502 else src,
                              "server": src if sport == 502 else dst,
+                             # эфемерный порт стороны клиента — различает потоки
+                             "sport": dport if sport == 502 else sport,
                              "first": ts, "last": ts}
                     )
                     if ts is not None:
@@ -316,6 +355,63 @@ class ModbusTcpAnalyzer(BaseBranch):
             if (i + 1) % 100000 == 0:
                 self.progress(f"  обработано {i + 1} пакетов…")
         return g
+
+    # -- Проход 3: окно активности для диаграммы Ганта -------------------------
+
+    FIELDS_THREADS = ["frame.time_epoch", "tcp.srcport", "tcp.dstport", "ip.dst"]
+
+    def _pass_threads_window(self, gen: GeneralStats) -> dict | None:
+        """Самое плотное 10-секундное окно опроса + события в нём.
+
+        Два потоковых прохода tshark: сначала гистограмма запросов по секундам
+        (память — O(секунд захвата)), затем сбор событий только внутри
+        выбранного окна (память ограничена окном, а не всем файлом).
+        """
+        base = gen.first_ts
+        win = min(10.0, gen.duration)
+        if base is None or win <= 0:
+            return None
+        filt = "mbtcp && tcp.dstport==502"
+
+        hist: Counter = Counter()
+        for r in stream_fields(self.tshark, self.pcap_str,
+                               ["frame.time_epoch"], display_filter=filt):
+            ts = _to_float(r.get("frame.time_epoch"))
+            if ts is not None:
+                hist[int(ts - base)] += 1
+        if not hist:
+            return None
+
+        L = max(int(win), 1)               # длина окна в целых секундах
+        best_s, best_cnt = min(hist), -1
+        for s in range(min(hist), max(hist) + 1):
+            cnt = sum(hist.get(x, 0) for x in range(s, s + L))
+            if cnt > best_cnt:
+                best_s, best_cnt = s, cnt
+
+        self.progress("  сбор событий выбранного окна…")
+        w0 = float(best_s)
+        rows: dict[tuple[str, int], dict] = {}
+        events = 0
+        for r in stream_fields(self.tshark, self.pcap_str, self.FIELDS_THREADS,
+                               display_filter=filt):
+            ts = _to_float(r.get("frame.time_epoch"))
+            if ts is None:
+                continue
+            off = ts - base
+            if not (w0 <= off < w0 + win):
+                continue
+            sport = _to_int(r.get("tcp.srcport"), -1)
+            dst = r.get("ip.dst", "")
+            key = (dst, sport)
+            e = rows.setdefault(key, {"ticks": [], "min": off, "max": off})
+            e["ticks"].append(off)
+            if off < e["min"]:
+                e["min"] = off
+            if off > e["max"]:
+                e["max"] = off
+            events += 1
+        return {"win": win, "start_off": w0, "events": events, "rows": rows}
 
     # -- Проход 2: Modbus -----------------------------------------------------
 
@@ -591,6 +687,9 @@ class ModbusTcpAnalyzer(BaseBranch):
             sections.append(self._sec_timeline(gen, mb))
             sections.append(self._sec_pairs(gen, mb))
             sections.append(self._sec_connections(gen, mb))
+            gantt = self._sec_threads(gen, mb)
+            if gantt:
+                sections.append(gantt)
             sections.append(self._sec_fcodes(mb))
             sections.append(self._sec_registers(gen, mb))
             sections.append(self._sec_response_times(mb))
@@ -680,8 +779,15 @@ class ModbusTcpAnalyzer(BaseBranch):
             fc_str = ", ".join(
                 f"FC{f}<span class='note'>×{n}</span>" for f, n in top_fc
             )
+            # максимум одновременных соединений с этим ПЛК (разные потоки)
+            ivs = [(i["first"], i["last"]) for i in gen.streams502.values()
+                   if (i["client"], i["server"]) == (cl, sv)]
+            nthr = self._max_concurrent(ivs)
+            thr_cell = f'<span class="num">{nthr}</span>'
+            if nthr > 1:
+                thr_cell = (thr_cell, "cell-hot")
             rows.append([
-                f"<strong>{C.esc(cl)}</strong>", C.esc(sv),
+                f"<strong>{C.esc(cl)}</strong>", self._srv_cell(sv), thr_cell,
                 f'<span class="num">{C.fmt_int(ps.reqs)}</span>',
                 f'<span class="num">{C.fmt_int(ps.resps)}</span>',
                 f'<span class="num">{C.fmt_int(ps.excs)}</span>',
@@ -692,9 +798,16 @@ class ModbusTcpAnalyzer(BaseBranch):
             ])
         body = (
             C.table_html(
-                ["Клиент", "Сервер", "Запросы", "Ответы", "Искл.", "Нет отв.",
-                 "p50, мс", "p95, мс", "Байты", "Основные функции"],
+                ["Клиент", "Сервер", "Потоков", "Запросы", "Ответы", "Искл.",
+                 "Нет отв.", "p50, мс", "p95, мс", "Байты", "Основные функции"],
                 rows, cls="pairs")
+            + '<p class="note"><strong>Цвет фона в колонке «Сервер»</strong> '
+              'кодирует конкретный ПЛК — одинаковый во всех таблицах отчёта. '
+              '<strong>Потоков</strong> — максимум одновременно открытых '
+              'соединений с этим сервером: у каждого соединения свой эфемерный '
+              'порт клиента; значение больше 1 '
+              '<span class="hot-legend">подсвечено розовым</span> и означает '
+              'параллельный опрос ПЛК из нескольких потоков.</p>'
             + '<p class="note"><strong>p50</strong> (медиана) — половина запросов '
               'получила ответ быстрее этого времени, половина — медленнее. '
               '<strong>p95</strong> — 95% запросов уложились в это время, лишь 5% '
@@ -761,7 +874,7 @@ class ModbusTcpAnalyzer(BaseBranch):
 
                 pair_rows.append([
                     f"<strong>{C.esc(c)}</strong>",
-                    C.esc(s),
+                    self._srv_cell(s),
                     _cell(n, True),
                     _cell(close_by_srv.get((c, s), 0), True),
                     _cell(close_by_cli.get((c, s), 0), True),
@@ -819,6 +932,50 @@ class ModbusTcpAnalyzer(BaseBranch):
         ]
         return Section("connections", "Соединения TCP (порт 502)", body, cmds)
 
+    def _sec_threads(self, gen: GeneralStats, mb: dict) -> Section | None:
+        """Диаграмма Ганта: как потоки опрашивают ПЛК в окне 10 с."""
+        tw = getattr(self, "_threads", None)
+        if not tw or not tw["rows"]:
+            return None
+        ordered = sorted(tw["rows"].items(), key=lambda kv: kv[1]["min"])
+        g_rows = []
+        for (dst, sport), e in ordered:
+            _bg, strong = C.warm_pair(self._srv_idx.get(dst, 0))
+            g_rows.append({
+                "label": f":{sport} → {dst}",
+                "color": strong,
+                "span": (e["min"], e["max"]),
+                "ticks": e["ticks"],
+            })
+        svg = C.gantt_svg(g_rows, tw["start_off"], tw["start_off"] + tw["win"])
+        if not svg:
+            return None
+        mm, ss = divmod(int(tw["start_off"]), 60)
+        body = (
+            '<div class="chart-box">' + svg + "</div>"
+            + f"<p>Показан самый загруженный отрезок захвата длительностью "
+              f"{tw['win']:.0f} с (начало — {mm}:{ss:02d} от начала файла); "
+              f"запросов в окне: <strong>{C.fmt_int(tw['events'])}</strong>, "
+              f"соединений: <strong>{len(g_rows)}</strong>.</p>"
+            + '<p class="note">Каждый ряд — отдельное TCP-соединение '
+              '(эфемерный порт клиента &rarr; ПЛК); цвет ряда совпадает с цветом '
+              'ПЛК в таблицах. Точки — отдельные Modbus-запросы, светлая полоса — '
+              'наблюдаемая активность соединения. Перекрывающиеся по времени ряды — '
+              'одновременный опрос из нескольких потоков; строгое чередование '
+              'рядов «лесенкой» — последовательная работа одного потока.</p>'
+        )
+        busy_port = ordered[0][0][1]
+        cmds = [
+            ("Показать запросы одного потока (подставьте эфемерный порт)",
+             self._cmd(f'-Y "mbtcp && tcp.dstport==502 && '
+                       f'tcp.srcport=={busy_port}" -T fields -e frame.time '
+                       "-e ip.dst -e mbtcp.trans_id")),
+            ("Все соединения к порту 502 с эфемерными портами",
+             self._cmd('-Y "mbtcp && tcp.dstport==502" -T fields -e tcp.stream '
+                       "-e tcp.srcport -e ip.dst | sort -u")),
+        ]
+        return Section("threads", "Опрос по потокам (диаграмма Ганта)", body, cmds)
+
     def _sec_fcodes(self, mb: dict) -> Section:
         total_req = mb["req_total"]
         bars, rows = [], []
@@ -858,7 +1015,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                 top_reads[: self.cfg.max_rows_per_table]:
             clients = mb["range_clients"].get((sv, unit, fc, start, ln), set())
             reads_rows.append([
-                C.esc(sv), C.fmt_int(unit), f"FC{fc}",
+                self._srv_cell(sv), C.fmt_int(unit), f"FC{fc}",
                 f"<strong>{start}</strong>&ndash;<strong>{start + max(ln - 1, 0)}</strong>",
                 f'<span class="num">{C.fmt_int(ln)}</span>',
                 f'<span class="num">{C.fmt_int(ops)}</span>',
@@ -871,7 +1028,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         for (sv, unit, fc, reg), (ops, words) in \
                 top_writes[: self.cfg.max_rows_per_table]:
             writes_rows.append([
-                C.esc(sv), C.fmt_int(unit), f"FC{fc}",
+                self._srv_cell(sv), C.fmt_int(unit), f"FC{fc}",
                 f"<strong>{reg}</strong>",
                 f'<span class="num">{C.fmt_int(ops)}</span>',
                 f'<span class="num">{C.fmt_int(words)}</span>',
@@ -965,7 +1122,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         rows = []
         for (sv, unit, fc, reg), (_lv, changes, reads) in static[:10]:
             rows.append([
-                C.esc(sv), C.fmt_int(unit), f"FC{fc}", f"<strong>{reg}</strong>",
+                self._srv_cell(sv), C.fmt_int(unit), f"FC{fc}", f"<strong>{reg}</strong>",
                 f'<span class="num">{C.fmt_int(reads)}</span>',
                 f'<span class="num">{C.fmt_int(changes)}</span>',
                 f'<span class="num">{C.fmt_pct(changes, reads)}</span>',

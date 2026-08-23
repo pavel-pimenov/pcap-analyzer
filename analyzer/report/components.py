@@ -136,6 +136,17 @@ def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
 
 PALETTE = ["#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#65a30d", "#db2777"]
 
+# Тёплые оттенки для визуального разделения ПЛК (серверов) в таблицах и на
+# диаграммах: светлый фон ячейки и насыщенный цвет текста/графики той же гаммы.
+WARM_TINTS = ["#ffe1de", "#ffeadb", "#fff3bf", "#ffe3ee", "#fde8cf", "#f7f1c6"]
+WARM_STRONG = ["#b91c1c", "#c2410c", "#a16207", "#be185d", "#9a3412", "#854d0e"]
+
+
+def warm_pair(index: int) -> tuple[str, str]:
+    """Пара (светлый фон, насыщенный цвет) для сервера с номером index."""
+    i = index % len(WARM_TINTS)
+    return WARM_TINTS[i], WARM_STRONG[i]
+
 
 def _svg_open(width: int, height: int) -> str:
     return (
@@ -207,6 +218,65 @@ def timeline_svg(
             f'<text x="{lx + 14}" y="{ly}" font-size="11" fill="#374151">{esc(name)}</text>'
         )
         lx += 14 + 6 * len(name) + 24
+    out.append("</svg>")
+    return "".join(out)
+
+
+def gantt_svg(rows: Sequence[dict], t0: float, t1: float) -> str:
+    """Диаграмма Ганта опроса: ряды = соединения (потоки), точки = запросы.
+
+    rows — список словарей {"label": str, "color": str,
+    "span": tuple[float, float] | None, "ticks": Sequence[float]};
+    времена заданы в секундах от начала окна [t0; t1].
+    Возвращает "" для пустого списка рядов.
+    """
+    if not rows or t1 <= t0:
+        return ""
+    width = 960
+    label_w, pad_r, pad_t, pad_b = 175, 14, 12, 28
+    row_h = 22
+    plot_w = width - label_w - pad_r
+    height = pad_t + len(rows) * row_h + pad_b
+
+    def x(t: float) -> float:
+        return label_w + (t - t0) / (t1 - t0) * plot_w
+
+    out = [_svg_open(width, height)]
+    win = t1 - t0
+    step = 1.0 if win <= 16 else win / 10.0
+    g = t0
+    while g <= t1 + 1e-9:                      # сетка с подписями секунд
+        gx = x(g)
+        out.append(f'<line x1="{gx:.1f}" y1="{pad_t}" x2="{gx:.1f}" '
+                   f'y2="{height - pad_b}" stroke="#e2e8f0" stroke-width="1"/>')
+        out.append(f'<text x="{gx:.1f}" y="{height - pad_b + 17}" '
+                   f'font-size="11" fill="#64748b" text-anchor="middle">'
+                   f'{g - t0:g} с</text>')
+        g += step
+    for i, r in enumerate(rows):
+        y = pad_t + i * row_h
+        color = r.get("color", PALETTE[0])
+        if i % 2 == 0:                         # чередование фона рядов
+            out.append(f'<rect x="{label_w}" y="{y}" width="{plot_w}" '
+                       f'height="{row_h}" fill="#f8fafc"/>')
+        lbl = str(r.get("label", ""))
+        if len(lbl) > 26:
+            lbl = lbl[:25] + "…"
+        out.append(f'<text x="{label_w - 8}" y="{y + row_h / 2 + 4}" '
+                   f'font-size="11" fill="#334155" text-anchor="end">'
+                   f'{esc(lbl)}</text>')
+        span = r.get("span")
+        if span:                               # полоса жизни соединения
+            a, b = max(span[0], t0), min(span[1], t1)
+            if b > a:
+                out.append(f'<rect x="{x(a):.1f}" y="{y + 4}" '
+                           f'width="{max(x(b) - x(a), 1.5):.1f}" '
+                           f'height="{row_h - 8}" rx="3" fill="{color}" '
+                           f'opacity="0.25"/>')
+        for t in r.get("ticks", ()):           # сами запросы
+            tx = x(t)
+            out.append(f'<rect x="{tx - 1:.1f}" y="{y + 3}" width="2" '
+                       f'height="{row_h - 6}" fill="{color}" opacity="0.85"/>')
     out.append("</svg>")
     return "".join(out)
 

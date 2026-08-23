@@ -51,6 +51,8 @@ table.data-table td.num, table.data-table th.num { text-align:right;
 td.empty { color:var(--muted); text-align:center; padding:16px; }
 table.data-table td.cell-hot { background:#fee2e2; }
 .hot-legend { background:#fee2e2; padding:1px 6px; border-radius:4px; }
+td span.srv { padding:1px 7px; border-radius:4px; font-weight:600;
+              white-space:nowrap; }
 .table-scroll { overflow-x:auto; }
 .chart-box { overflow-x:auto; }
 .badge { display:inline-block; padding:2px 10px; border-radius:999px;
