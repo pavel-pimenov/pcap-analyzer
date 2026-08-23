@@ -140,6 +140,8 @@ class GeneralStats:
     fin502: int = 0
     streams502: dict = field(default_factory=dict)      # stream -> dict(client,server,first,last)
     ip_pkts: Counter = field(default_factory=Counter)
+    ip_bytes_tx: Counter = field(default_factory=Counter)   # отправлено узлом
+    ip_bytes_rx: Counter = field(default_factory=Counter)   # получено узлом
 
     @property
     def duration(self) -> float:
@@ -301,7 +303,8 @@ class ModbusTcpAnalyzer(BaseBranch):
         rows = stream_fields(self.tshark, self.pcap_str, self.FIELDS_GENERAL)
         for i, r in enumerate(rows):
             g.total_packets += 1
-            g.total_bytes += _to_int(r.get("frame.len"), 0)
+            plen = _to_int(r.get("frame.len"), 0)
+            g.total_bytes += plen
             ts = _to_float(r.get("frame.time_epoch"))
             if ts is not None:
                 if g.first_ts is None:
@@ -311,6 +314,9 @@ class ModbusTcpAnalyzer(BaseBranch):
             dst = r.get("ip.dst", "")
             if src:
                 g.ip_pkts[src] += 1
+                g.ip_bytes_tx[src] += plen
+            if dst:
+                g.ip_bytes_rx[dst] += plen
             sport = _to_int(r.get("tcp.srcport"), -1)
             dport = _to_int(r.get("tcp.dstport"), -1)
             if sport < 0 and dport < 0:
@@ -754,19 +760,22 @@ class ModbusTcpAnalyzer(BaseBranch):
             ["RST на порту 502", C.fmt_int(gen.rst502)],
             ["FIN на порту 502", C.fmt_int(gen.fin502)],
         ]
-        top = "".join(
-            "<li>"
-            + (self._srv_cell(ip) if ip in self._srv_colors
-               else f"<code class=\"inline\">{C.esc(ip)}</code>")
-            + f" — {C.fmt_int(cnt)} пак.</li>"
+        top_rows = [
+            [self._srv_cell(ip) if ip in self._srv_colors
+             else f"<code class=\"inline\">{C.esc(ip)}</code>",
+             f'<span class="num">{C.fmt_int(cnt)}</span>',
+             f'<span class="num">{C.fmt_bytes(gen.ip_bytes_tx.get(ip, 0))}</span>',
+             f'<span class="num">{C.fmt_bytes(gen.ip_bytes_rx.get(ip, 0))}</span>']
             for ip, cnt in gen.ip_pkts.most_common(6)
-        )
+        ]
         body = (
             C.table_html(["Параметр", "Значение"], rows)
             + '<h3 class="subhead">Самые активные узлы (по всем протоколам)</h3>'
-            + f"<ul>{top}</ul>"
+            + C.table_html(["Узел", "Пакетов", "Отправлено", "Получено"], top_rows)
             + '<p class="note">Роли определяются по порту 502: инициатор соединения '
-              "(кто шлёт SYN / запросы) — клиент, слушающая сторона — сервер.</p>"
+              "(кто шлёт SYN / запросы) — клиент, слушающая сторона — сервер. "
+              "Объём считается по длине кадров (frame.len): отправлено — узел "
+              "источник, получено — узел назначения.</p>"
         )
         cmds = [
             ("Общая статистика по файлу", self._cmd("-q -z io,stat,0")),
