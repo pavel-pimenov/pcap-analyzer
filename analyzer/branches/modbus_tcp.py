@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import math
 from collections import Counter, deque
@@ -389,8 +390,39 @@ class ModbusTcpAnalyzer(BaseBranch):
         if win_zoom < win_big:
             sec = max(range(int(best_s), int(best_s) + L),
                       key=lambda s: hist.get(s, 0))
-            windows.append(self._thread_events(filt, base, float(sec), win_zoom))
+            zwin = self._thread_events(filt, base, float(sec), win_zoom)
+            windows.append(zwin)
+            # третья диаграмма: самая плотная пачка внутри зум-секунды
+            bw = min(self.cfg.gantt_burst_sec, win_zoom)
+            burst = self._burst_window(zwin, bw)
+            if burst:
+                windows.append(burst)
         return [w for w in windows if w["rows"]]
+
+    @staticmethod
+    def _burst_window(zwin: dict, bw: float) -> dict | None:
+        """Окно самой плотной пачки запросов из событий зум-секунды.
+
+        Скользящее окно длиной bw по отсортированным моментам запросов;
+        новый проход tshark не нужен — события уже в памяти.
+        """
+        offs = sorted(t for e in zwin["rows"].values() for t in e["ticks"])
+        if len(offs) < 2:
+            return None
+        best_t, best_n = offs[0], 0
+        for i, t in enumerate(offs):           # скользящее окно по bisect
+            hi = bisect.bisect_right(offs, t + bw)
+            if hi - i > best_n:
+                best_n, best_t = hi - i, t
+        w0, w1 = best_t, best_t + bw
+        rows = {}
+        for key, e in zwin["rows"].items():
+            tk = [t for t in e["ticks"] if w0 <= t < w1]
+            if tk:
+                rows[key] = {"ticks": tk, "min": min(tk), "max": max(tk)}
+        if best_n < 2 or not rows:
+            return None
+        return {"win": bw, "start_off": w0, "events": best_n, "rows": rows}
 
     def _thread_events(self, filt: str, base: float, w0: float,
                        win: float) -> dict:
@@ -941,10 +973,12 @@ class ModbusTcpAnalyzer(BaseBranch):
         return Section("connections", "Соединения TCP (порт 502)", body, cmds)
 
     def _sec_threads(self, gen: GeneralStats, mb: dict) -> Section | None:
-        """Диаграммы Ганта: как потоки опрашивают PLC (окно 10 с и зум 1 с)."""
+        """Диаграммы Ганта: окно 10 с, зум 1 с и пачка запросов (~0,1 с)."""
+
+        def fmt_win(w: float) -> str:
+            return f"{w:g}".replace(".", ",")
+
         tw_list = getattr(self, "_threads", [])
-        titles = ["Окно {win:.0f} с (начало — {t} от начала файла)",
-                  "Самая загруженная секунда этого окна (масштаб {win:.0f} с)"]
         charts = []
         for i, tw in enumerate(tw_list):
             # ряды группируем по ПЛК: сортировка по IP сервера, затем порт
@@ -964,12 +998,21 @@ class ModbusTcpAnalyzer(BaseBranch):
                     "ticks": e["ticks"],
                 })
             svg = C.gantt_svg(g_rows, tw["start_off"],
-                              tw["start_off"] + tw["win"])
+                              tw["start_off"] + tw["win"], bursts=(i == 2))
             if not svg:
                 continue
             mm, ss = divmod(int(tw["start_off"]), 60)
-            title = titles[min(i, len(titles) - 1)].format(
-                win=tw["win"], t=f"{mm}:{ss:02d}")
+            ms = int(round((tw["start_off"] % 1) * 1000))
+            if i == 0:
+                title = (f"Окно {fmt_win(tw['win'])} с "
+                         f"(начало — {mm}:{ss:02d} от начала файла)")
+            elif i == 1:
+                title = (f"Самая загруженная секунда этого окна "
+                         f"(масштаб {fmt_win(tw['win'])} с)")
+            else:
+                title = (f"Самая плотная пачка запросов (масштаб "
+                         f"{fmt_win(tw['win'])} с; начало {mm}:{ss:02d},"
+                         f"{ms:03d}) — над каждой пачкой число Modbus-обращений")
             charts.append(
                 f'<h3 class="subhead">{title}</h3>'
                 f'<div class="chart-box">{svg}</div>'
@@ -998,7 +1041,10 @@ class ModbusTcpAnalyzer(BaseBranch):
               'одновременный опрос из нескольких потоков; строгое чередование '
               'рядов «лесенкой» — последовательная работа одного потока. '
               '«Зум»-диаграмма показывает детально одну секунду внутри большого '
-              'окна — на ней видно чередование запросов между PLC.</p>'
+              'окна — на ней видно чередование запросов между PLC. Третья '
+              'диаграмма раскрывает самую плотную пачку (масштаб ~0,1 с): '
+              'сливающиеся в полоску запросы разделяются, а над каждой пачкой '
+              'стрелкой указано число Modbus-обращений в ней.</p>'
         )
         if not tw_list:
             busy_dst, busy_port = "", -1

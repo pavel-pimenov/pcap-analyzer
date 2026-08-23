@@ -243,19 +243,20 @@ def timeline_svg(
     return "".join(out)
 
 
-def gantt_svg(rows: Sequence[dict], t0: float, t1: float) -> str:
+def gantt_svg(rows: Sequence[dict], t0: float, t1: float,
+              bursts: bool = False) -> str:
     """Диаграмма Ганта опроса: ряды = соединения (потоки), точки = запросы.
 
-    rows — список словарей {"label": str, "color": str,
-    "span": tuple[float, float] | None, "ticks": Sequence[float]};
-    времена заданы в секундах от начала окна [t0; t1].
+    rows — список словарей {"label", "color", "bg"?, "fg"?, "span"?, "ticks"};
+    времена в секундах от начала окна [t0; t1]. При bursts=True ряды высокие,
+    запросы группируются в пачки, над каждой пачкой — счётчик со стрелкой.
     Возвращает "" для пустого списка рядов.
     """
     if not rows or t1 <= t0:
         return ""
     width = 960
     label_w, pad_r, pad_t, pad_b = 175, 14, 12, 28
-    row_h = 22
+    row_h = 38 if bursts else 22
     plot_w = width - label_w - pad_r
     height = pad_t + len(rows) * row_h + pad_b
 
@@ -264,21 +265,22 @@ def gantt_svg(rows: Sequence[dict], t0: float, t1: float) -> str:
 
     out = [_svg_open(width, height)]
     win = t1 - t0
-    # шаг сетки: 0,1 с для секундных окон, 1 с для десятков секунд,
-    # иначе ~10 делений на всю ширину
-    if win <= 2.5:
+    # шаг сетки под масштаб окна; подписи — с русской десятичной запятой
+    if win <= 0.55:
+        step = 0.05
+    elif win <= 2.5:
         step = 0.1
     elif win <= 16:
         step = 1.0
     else:
         step = win / 10.0
+    dec = 2 if step < 0.1 else (1 if step < 1 else 0)
     g = t0
-    while g <= t1 + 1e-9:                      # сетка с подписями секунд
+    while g <= t1 + 1e-9:                      # сетка с подписями времени
         gx = x(g)
         out.append(f'<line x1="{gx:.1f}" y1="{pad_t}" x2="{gx:.1f}" '
                    f'y2="{height - pad_b}" stroke="#e2e8f0" stroke-width="1"/>')
-        lbl = (f"{g - t0:.1f}".replace(".", ",") if step < 1
-               else f"{g - t0:g}")
+        lbl = f"{g - t0:.{dec}f}".replace(".", ",") if step < 1 else f"{g - t0:g}"
         out.append(f'<text x="{gx:.1f}" y="{height - pad_b + 17}" '
                    f'font-size="11" fill="#64748b" text-anchor="middle">'
                    f'{lbl} с</text>')
@@ -292,21 +294,52 @@ def gantt_svg(rows: Sequence[dict], t0: float, t1: float) -> str:
         lbl = str(r.get("label", ""))
         if len(lbl) > 26:
             lbl = lbl[:25] + "…"
+        bg = r.get("bg")                       # подкраска подписи ряда (PLC)
+        if bg:
+            out.append(f'<rect x="2" y="{y + 1}" width="{label_w - 10}" '
+                       f'height="{row_h - 2}" rx="3" fill="{bg}"/>')
         out.append(f'<text x="{label_w - 8}" y="{y + row_h / 2 + 4}" '
-                   f'font-size="11" fill="#334155" text-anchor="end">'
+                   f'font-size="11" font-weight="600" '
+                   f'fill="{esc(r.get("fg") or "#334155")}" text-anchor="end">'
                    f'{esc(lbl)}</text>')
         span = r.get("span")
         if span:                               # полоса жизни соединения
             a, b = max(span[0], t0), min(span[1], t1)
             if b > a:
-                out.append(f'<rect x="{x(a):.1f}" y="{y + 4}" '
+                sy = y + row_h - 13 if bursts else y + 4
+                sh = 9 if bursts else row_h - 8
+                out.append(f'<rect x="{x(a):.1f}" y="{sy}" '
                            f'width="{max(x(b) - x(a), 1.5):.1f}" '
-                           f'height="{row_h - 8}" rx="3" fill="{color}" '
+                           f'height="{sh}" rx="3" fill="{color}" '
                            f'opacity="0.25"/>')
-        for t in r.get("ticks", ()):           # сами запросы
+        ticks = sorted(float(t) for t in r.get("ticks", ()) if t0 <= t <= t1)
+        ty = y + row_h - 16 if bursts else y + 3     # полоса самих запросов
+        th = 12 if bursts else row_h - 6
+        for t in ticks:                        # сами запросы
             tx = x(t)
-            out.append(f'<rect x="{tx - 1:.1f}" y="{y + 3}" width="2" '
-                       f'height="{row_h - 6}" fill="{color}" opacity="0.85"/>')
+            out.append(f'<rect x="{tx - 1:.1f}" y="{ty}" width="2" '
+                       f'height="{th}" fill="{color}" opacity="0.85"/>')
+        if bursts and len(ticks) > 1:          # разметка пачек со счётчиком
+            gap = max(0.005, win * 0.04)       # порог «разрыва» между пачками
+            groups = [[ticks[0]]]
+            for t in ticks[1:]:
+                if t - groups[-1][-1] > gap:
+                    groups.append([])
+                groups[-1].append(t)
+            for gr in groups:
+                if len(gr) < 2:
+                    continue                   # одиночный запрос — не пачка
+                cx = x((gr[0] + gr[-1]) / 2)
+                out.append(f'<text x="{cx:.1f}" y="{y + 13}" font-size="11" '
+                           f'font-weight="600" fill="{color}" '
+                           f'text-anchor="middle">{len(gr)} зап.</text>')
+                out.append(f'<line x1="{cx:.1f}" y1="{y + 17}" x2="{cx:.1f}" '
+                           f'y2="{y + row_h - 21}" stroke="{color}" '
+                           f'stroke-width="1.4"/>')
+                ay = y + row_h - 20            # остриё стрелки вниз
+                out.append(f'<polygon points="{cx - 3.2:.1f},{ay} '
+                           f'{cx + 3.2:.1f},{ay} {cx:.1f},{ay + 4}" '
+                           f'fill="{color}"/>')
     out.append("</svg>")
     return "".join(out)
 
