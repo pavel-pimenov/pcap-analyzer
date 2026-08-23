@@ -1000,12 +1000,39 @@ class ModbusTcpAnalyzer(BaseBranch):
               '«Зум»-диаграмма показывает детально одну секунду внутри большого '
               'окна — на ней видно чередование запросов между PLC.</p>'
         )
-        busy_port = next(iter(tw_list[0]["rows"]), ("", -1))[1]
+        if not tw_list:
+            busy_dst, busy_port = "", -1
+        else:
+            r0 = tw_list[0]["rows"]
+            # цель примера — многопоточный опрос: берём PLC с наибольшим
+            # числом РАЗНЫХ эфемерных портов в окне (при равенстве — по числу
+            # запросов); порт для второй команды — самый активный у этого PLC
+            ports_cnt: dict[str, int] = {}
+            ticks_cnt: dict[str, int] = {}
+            for (dst, _sp), e in r0.items():
+                ports_cnt[dst] = ports_cnt.get(dst, 0) + 1
+                ticks_cnt[dst] = ticks_cnt.get(dst, 0) + len(e["ticks"])
+            busy_dst = max(ports_cnt,
+                           key=lambda d: (ports_cnt[d], ticks_cnt.get(d, 0)))
+            busy_port = max(
+                (sp for (d, sp) in r0 if d == busy_dst),
+                key=lambda sp: len(r0[(busy_dst, sp)]["ticks"]),
+                default=-1)
         cmds = [
-            ("Показать запросы одного потока (подставьте эфемерный порт)",
+            ("Многопоточный опрос: все запросы к самому загруженному PLC — "
+             "в одну секунду строки с разными эфемерными портами клиента",
+             self._cmd(f'-Y "mbtcp && tcp.dstport==502 && ip.dst=={busy_dst}" '
+                       "-T fields -e frame.time -e tcp.srcport "
+                       "-e mbtcp.trans_id -e mbtcp.unit_id "
+                       "-e modbus.func_code -e modbus.reference_num "
+                       "-e modbus.word_cnt")),
+            ("Один поток: время, PLC, транзакция и какие регистры читаются "
+             "(подставьте эфемерный порт)",
              self._cmd(f'-Y "mbtcp && tcp.dstport==502 && '
                        f'tcp.srcport=={busy_port}" -T fields -e frame.time '
-                       "-e ip.dst -e mbtcp.trans_id")),
+                       "-e ip.dst -e mbtcp.trans_id -e mbtcp.unit_id "
+                       "-e modbus.func_code -e modbus.reference_num "
+                       "-e modbus.word_cnt")),
             ("Все соединения к порту 502 с эфемерными портами",
              self._cmd('-Y "mbtcp && tcp.dstport==502" -T fields -e tcp.stream '
                        "-e tcp.srcport -e ip.dst | sort -u")),
