@@ -1,0 +1,59 @@
+# =============================================================================
+# pcap-analyzer — анализ pcap-файлов через tshark, отчёты HTML и PDF
+#
+# Веб-интерфейс (по умолчанию):
+#   docker compose up --build          # http://localhost:8000
+#   Загрузка pcap в браузере, анализ, просмотр и экспорт HTML/PDF.
+#   Образцы из ./pcap-sample доступны в списке слева (удалять нельзя).
+#
+# Разовый анализ из командной строки (профиль batch):
+#   docker compose run --rm analyzer analyze \
+#       /data/kh-kb12ramp-cote1.pcap -o /output/report.html
+#   # вариант с PDF: ... -o /output/report -f both   (получите .html и .pdf)
+#
+# Список доступных веток анализа:
+#   docker compose run --rm analyzer branches
+#
+# Параметры по умолчанию можно вынести в файл .env рядом с compose-файлом.
+# =============================================================================
+
+services:
+  # --- Веб-интерфейс (запускается по умолчанию) -------------------------------
+  web:
+    build: .
+    image: pcap-analyzer:latest
+    container_name: pcap-analyzer-web
+    ports:
+      - "8000:8000"
+    volumes:
+      # Образцы pcap — только чтение, предлагаются в интерфейсе как «образцы»
+      - ./pcap-sample:/data/pcap-sample:ro
+      # Загрузки пользователей и готовые отчёты (именованный том)
+      - webdata:/data/webdata
+
+  # --- Разовый batch-анализ (запуск только через профиль) ----------------------
+  analyzer:
+    build: .
+    image: pcap-analyzer:latest
+    profiles: ["batch"]
+    container_name: pcap-analyzer
+    volumes:
+      # Каталог с исходными pcap-файлами (монтируется только на чтение)
+      - ./pcap-sample:/data:ro
+      # Каталог для готовых отчётов HTML/PDF
+      - ./output:/output
+    environment:
+      PCAP_FILE: ${PCAP_FILE:-kh-kb12ramp-cote1.pcap}
+      REPORT_FILE: ${REPORT_FILE:-report_modbus}
+      FORMAT: ${FORMAT:-html}                # html | pdf | both
+    # Контейнер выполняет один анализ и завершается
+    command:
+      - "analyze"
+      - "/data/${PCAP_FILE:-kh-kb12ramp-cote1.pcap}"
+      - "-o"
+      - "/output/${REPORT_FILE:-report_modbus}"
+      - "-f"
+      - "${FORMAT:-html}"
+
+volumes:
+  webdata:

@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+*.pcap
+*.gz
+*.7z
+
+# Готовые отчёты анализатора
+output/
+*.html
