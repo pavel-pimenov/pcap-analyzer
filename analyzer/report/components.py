@@ -136,7 +136,7 @@ def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
 
 PALETTE = ["#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#65a30d", "#db2777"]
 
-# Тёплые оттенки для визуального разделения ПЛК (серверов) в таблицах и на
+# Тёплые оттенки для визуального разделения PLC (серверов) в таблицах и на
 # диаграммах: светлый фон ячейки и насыщенный цвет текста/графики той же гаммы.
 WARM_TINTS = ["#ffe1de", "#ffeadb", "#fff3bf", "#ffe3ee", "#fde8cf", "#f7f1c6"]
 WARM_STRONG = ["#b91c1c", "#c2410c", "#a16207", "#be185d", "#9a3412", "#854d0e"]
@@ -243,15 +243,24 @@ def gantt_svg(rows: Sequence[dict], t0: float, t1: float) -> str:
 
     out = [_svg_open(width, height)]
     win = t1 - t0
-    step = 1.0 if win <= 16 else win / 10.0
+    # шаг сетки: 0,1 с для секундных окон, 1 с для десятков секунд,
+    # иначе ~10 делений на всю ширину
+    if win <= 2.5:
+        step = 0.1
+    elif win <= 16:
+        step = 1.0
+    else:
+        step = win / 10.0
     g = t0
     while g <= t1 + 1e-9:                      # сетка с подписями секунд
         gx = x(g)
         out.append(f'<line x1="{gx:.1f}" y1="{pad_t}" x2="{gx:.1f}" '
                    f'y2="{height - pad_b}" stroke="#e2e8f0" stroke-width="1"/>')
+        lbl = (f"{g - t0:.1f}".replace(".", ",") if step < 1
+               else f"{g - t0:g}")
         out.append(f'<text x="{gx:.1f}" y="{height - pad_b + 17}" '
                    f'font-size="11" fill="#64748b" text-anchor="middle">'
-                   f'{g - t0:g} с</text>')
+                   f'{lbl} с</text>')
         g += step
     for i, r in enumerate(rows):
         y = pad_t + i * row_h

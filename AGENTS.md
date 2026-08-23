@@ -47,7 +47,7 @@ analyzer/
 ├── report/
 │   ├── components.py     # esc/fmt_*, kpi_cards, table_html, cmd_block,
 │   │                     # timeline_svg/vbar_svg/hbar_svg/coverage_svg,
-│   │                     # gantt_svg; WARM_TINTS/WARM_STRONG — цвета ПЛК
+│   │                     # gantt_svg; WARM_TINTS/WARM_STRONG — цвета PLC
 │   ├── html_report.py    # render_document(BranchResult) -> один HTML-файл
 │   └── pdf_report.py     # render_pdf_bytes/render_pdf_file: HTML -> PDF
 ├── webapp/

@@ -1,6 +1,6 @@
 """Ветка анализа S7comm (Siemens S7 Communication, TCP/102).
 
-Собирает метрики обмена клиент-SCADA/HMI с ПЛК Siemens: подключения,
+Собирает метрики обмена клиент-SCADA/HMI с PLC Siemens: подключения,
 состав функций (чтение/запись переменных, установка связи), области памяти,
 времена отклика по сопоставлению Job/Ack_Data (s7comm.header.pduref),
 коды ошибок элементов — и формирует рекомендации по оптимизации.
@@ -49,8 +49,8 @@ FUNC_NAMES = {
     "0x1d": "Начало выгрузки (Start Upload)",
     "0x1e": "Выгрузка (Upload)",
     "0x1f": "Конец выгрузки (Upload End)",
-    "0x28": "Управление ПЛК (PLC Control)",
-    "0x29": "Останов ПЛК (PLC Stop)",
+    "0x28": "Управление PLC (PLC Control)",
+    "0x29": "Останов PLC (PLC Stop)",
 }
 
 # Области памяти (s7comm.param.item.area)
@@ -61,7 +61,7 @@ AREA_NAMES = {
     "0x84": "DB — блок данных",
     "0x85": "DI — блок данных экземпляра",
     "0x86": "L — локальные данные",
-    "0x87": "V — предыдущий ПЛК (S5)",
+    "0x87": "V — предыдущий PLC (S5)",
     "0x1c": "P — периферия (PE/PA)",
     "0x1d": "C — счётчики (S5)",
     "0x1e": "T — таймеры (S5)",
@@ -190,7 +190,7 @@ class S7CommAnalyzer(BaseBranch):
     name = "s7comm"
     title = "Анализ S7comm (Siemens)"
     description = (
-        "Клиенты и ПЛК, функции протокола, области памяти, времена отклика "
+        "Клиенты и PLC, функции протокола, области памяти, времена отклика "
         "(Job/Ack_Data), коды ошибок элементов и рекомендации."
     )
 
@@ -437,7 +437,7 @@ class S7CommAnalyzer(BaseBranch):
                     C.fmt_pct(s7["total_pdu"], gen.total_packets) + " от всех пакетов"),
             KpiItem("Клиентов", C.fmt_int(len(clients)),
                     ", ".join(clients[:3]) + ("…" if len(clients) > 3 else "")),
-            KpiItem("ПЛК (:102)", C.fmt_int(len(plcs))),
+            KpiItem("PLC (:102)", C.fmt_int(len(plcs))),
             KpiItem("TCP-соединений к :102", C.fmt_int(conns),
                     f"SYN-попыток: {len(gen.syn102)}"),
             KpiItem("S7-запросов (Job)", C.fmt_int(s7["req_total"]),
@@ -447,7 +447,7 @@ class S7CommAnalyzer(BaseBranch):
             KpiItem("Ошибок в ответах", C.fmt_int(s7["err_total"]),
                     (C.fmt_pct(s7["err_total"], s7["resp_total"]) +
                      " от ответов") if s7["resp_total"] else ""),
-            KpiItem("Медиана отклика ПЛК", f"{C.fmt_ms(med_rtt)} мс"
+            KpiItem("Медиана отклика PLC", f"{C.fmt_ms(med_rtt)} мс"
                     if med_rtt is not None else "&mdash;"),
         ]
 
@@ -496,7 +496,7 @@ class S7CommAnalyzer(BaseBranch):
             + '<h3 class="subhead">Самые активные узлы (по всем протоколам)</h3>'
             + f"<ul>{top}</ul>"
             + '<p class="note">Роли определяются по порту 102: сторона с портом '
-              "102 — ПЛК (сервер), инициатор соединения — клиент "
+              "102 — PLC (сервер), инициатор соединения — клиент "
               "(SCADA/HMI/TIA Portal).</p>"
         )
         cmds = [
@@ -565,7 +565,7 @@ class S7CommAnalyzer(BaseBranch):
             ])
         body = (
             C.table_html(
-                ["Клиент", "ПЛК", "Запросы", "Ответы", "Ошибки",
+                ["Клиент", "PLC", "Запросы", "Ответы", "Ошибки",
                  "Элементов", "p50, мс", "p95, мс", "Байты",
                  "Основные функции"],
                 rows, cls="pairs")
@@ -577,15 +577,15 @@ class S7CommAnalyzer(BaseBranch):
               "переменных (элементов Read/Write Var) в запросах.</p>"
         )
         cmds = [
-            ("Диалоги клиент-ПЛК", self._cmd("-q -z conv,tcp")),
+            ("Диалоги клиент-PLC", self._cmd("-q -z conv,tcp")),
             ("Кто отправляет запросы (клиенты)",
              self._cmd('-Y "s7comm && s7comm.header.rosctr==1" '
                        "-T fields -e ip.src | sort | uniq -c | sort -rn")),
-            ("Адреса ПЛК (порт 102)",
+            ("Адреса PLC (порт 102)",
              self._cmd(f'-Y "s7comm && tcp.dstport=={PORT}" '
                        "-T fields -e ip.dst | sort | uniq -c | sort -rn")),
         ]
-        return Section("pairs", "Клиенты и ПЛК (пары обмена)", body, cmds)
+        return Section("pairs", "Клиенты и PLC (пары обмена)", body, cmds)
 
     def _sec_connections(self, gen: GeneralStats, s7: dict) -> Section:
         dur = gen.duration or 1
@@ -647,18 +647,18 @@ class S7CommAnalyzer(BaseBranch):
                 ])
             detail = (
                 '<h3 class="subhead">Подключения и разрывы по парам '
-                "клиент &rarr; ПЛК</h3>"
+                "клиент &rarr; PLC</h3>"
                 + C.table_html(
-                    ["Клиент", "ПЛК", "Подключений", "Разрывов сервером",
+                    ["Клиент", "PLC", "Подключений", "Разрывов сервером",
                      "Разрывов клиентом", "Доля подключений"],
                     pair_rows)
                 + '<p class="note"><strong>Подключений</strong> — сколько раз '
-                  "клиент устанавливал TCP-соединение с ПЛК (SYN к порту 102); "
+                  "клиент устанавливал TCP-соединение с PLC (SYN к порту 102); "
                   'больше 1 <span class="hot-legend">подсвечено розовым</span>: '
                   "соединение пересоздавалось, нормой считается одно долгоживущее "
                   "(keep-alive) соединение на пару. <strong>Разрывов сервером/"
                   "клиентом</strong> — кто первым послал FIN или RST; розовым "
-                  "отмечены значения больше нуля. Разрывы со стороны ПЛК — повод "
+                  "отмечены значения больше нуля. Разрывы со стороны PLC — повод "
                   "проверить таймауты простоя на контроллере и сетевом "
                   "оборудовании (NAT, межсетевые экраны).</p>"
             )
@@ -669,7 +669,7 @@ class S7CommAnalyzer(BaseBranch):
                                    "Длительность"], st_rows))
         body = head + detail + tbl + (
             '<p class="note">Для S7comm нормой считается одно долгоживущее '
-            "соединение на пару клиент-ПЛК. Частые SYN — признак пересоздания "
+            "соединение на пару клиент-PLC. Частые SYN — признак пересоздания "
             "соединений, нестабильной сети или агрессивного таймаута HMI.</p>"
         )
         cmds = [
@@ -677,7 +677,7 @@ class S7CommAnalyzer(BaseBranch):
              self._cmd('-Y "tcp.flags.syn==1 && tcp.flags.ack==0 '
                        f'&& tcp.dstport=={PORT}" '
                        "-T fields -e ip.src -e ip.dst | sort | uniq -c")),
-            ("Все попытки подключения к ПЛК",
+            ("Все попытки подключения к PLC",
              self._cmd('-Y "tcp.flags.syn==1 && tcp.flags.ack==0 '
                        f'&& tcp.dstport=={PORT}" '
                        "-T fields -e frame.time -e ip.src -e ip.dst "
@@ -760,7 +760,7 @@ class S7CommAnalyzer(BaseBranch):
              self._cmd('-Y "s7comm.param.item.db == 0x1" '
                        "-T fields -e frame.time -e s7comm.param.item.address")),
         ]
-        return Section("areas", "Области памяти ПЛК", body, cmds)
+        return Section("areas", "Области памяти PLC", body, cmds)
 
     def _sec_errors(self, s7: dict) -> Section:
         rows = []
@@ -776,7 +776,7 @@ class S7CommAnalyzer(BaseBranch):
             '<p class="note">Коды возврата проверяются для каждого элемента '
             "данных в ответе. Ошибки вида «адрес вне диапазона» или «объект "
             "не существует» означают, что HMI/SCADA запрашивает несуществующие "
-            "переменные — это тратит циклы ПЛК впустую.</p>")
+            "переменные — это тратит циклы PLC впустую.</p>")
         if not rows:
             return Section("errors", "Ошибки и коды возврата",
                            "<p>Ошибок не зафиксировано.</p>" + note,
@@ -811,18 +811,18 @@ class S7CommAnalyzer(BaseBranch):
                 rid, sev, title, problem, advice,
                 evidence or [], commands or []))
 
-        # 1. Медленный отклик ПЛК
+        # 1. Медленный отклик PLC
         all_rtts = sorted(t for ps in s7["pairs"].values() for t in ps.rtts)
         p95 = _percentile(all_rtts, 95)
         med = _percentile(all_rtts, 50)
         if p95 is not None and p95 > self.cfg.slow_rtt_p95_ms:
             add("s7-slow-response", "warning",
-                "Медленный отклик ПЛК",
+                "Медленный отклик PLC",
                 f"95% запросов укладываются в {C.fmt_ms(p95)} мс"
                 + (f", медиана — {C.fmt_ms(med)} мс" if med is not None else "")
                 + ". При циклическом опросе это удлиняет цикл обновления "
                   "данных SCADA.",
-                "Проверьте нагрузку ПЛК (цикл OB1), длину списков чтения и "
+                "Проверьте нагрузку PLC (цикл OB1), длину списков чтения и "
                 "паузу между запросами: при p95 выше сотен миллисекунд данные "
                 "в SCADA будут запаздывать.",
                 evidence=[f"Медиана RTT: {C.fmt_ms(med)} мс",
@@ -840,7 +840,7 @@ class S7CommAnalyzer(BaseBranch):
                 "Часть ответов содержит ошибки доступа к переменным",
                 f"Ошибочные ответы: {C.fmt_int(s7['err_total'])} из "
                 f"{C.fmt_int(resp_total)} ({C.fmt_pct(s7['err_total'], resp_total)}).",
-                "Сверьте список тегов HMI/SCADA с реальными переменными ПЛК: "
+                "Сверьте список тегов HMI/SCADA с реальными переменными PLC: "
                 "ошибки адресации означают устаревшую привязку тегов после "
                 "изменения программы.",
                 evidence=ev,
@@ -856,7 +856,7 @@ class S7CommAnalyzer(BaseBranch):
                 "Есть запросы без сопоставленного ответа",
                 f"Не дождались Ack_Data: {pending_cnt}.",
                 "Возможны обрывы соединения или ретрансмиссии; проверьте "
-                "стабильность канала до ПЛК.")
+                "стабильность канала до PLC.")
 
         # 4. Частые переподключения
         dur = gen.duration
@@ -873,12 +873,12 @@ class S7CommAnalyzer(BaseBranch):
             repeat = (" Наиболее активные пары:\n" +
                       "\n".join(ev)) if ev and not by_rate else ""
             add("s7-conn-churn", "warning",
-                "Частые переподключения к ПЛК",
+                "Частые переподключения к PLC",
                 f"Новых подключений к порту {PORT}: {len(gen.syn102)} "
                 f"({len(gen.syn102)/dur_min:.1f}/мин)." + repeat,
                 "Правильнее держать одно постоянное keep-alive-соединение на "
-                "пару клиент-ПЛК: каждое переподключение — это handshake плюс "
-                "Setup communication, а ПЛК имеет ограниченный лимит "
+                "пару клиент-PLC: каждое переподключение — это handshake плюс "
+                "Setup communication, а PLC имеет ограниченный лимит "
                 "одновременных соединений (например, S7-1200 — 8).",
                 evidence=ev,
                 commands=[self._cmd(
@@ -908,7 +908,7 @@ class S7CommAnalyzer(BaseBranch):
                 "Чтение по одной переменной за запрос",
                 f"{single} из {reads} операций чтения содержат один элемент.",
                 "Группируйте соседние переменные в один Read Var: меньше "
-                "пакетов на цикл опроса и меньшая загрузка ПЛК. Один элемент "
+                "пакетов на цикл опроса и меньшая загрузка PLC. Один элемент "
                 "может прочитать непрерывный диапазон до ~480 байт.",
                 evidence=[f"Доля одиночных чтений: "
                           f"{C.fmt_pct(single, reads)}"],

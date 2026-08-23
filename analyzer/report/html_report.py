@@ -53,6 +53,12 @@ table.data-table td.cell-hot { background:#fee2e2; }
 .hot-legend { background:#fee2e2; padding:1px 6px; border-radius:4px; }
 td span.srv { padding:1px 7px; border-radius:4px; font-weight:600;
               white-space:nowrap; }
+.legend span { margin-right:18px; font-size:12.5px; color:#475569;
+               white-space:nowrap; }
+.lg { display:inline-block; vertical-align:-2px; margin-right:5px; }
+.lg-tick { width:2px; height:13px; background:#b91c1c; }
+.lg-span { width:24px; height:9px; background:#ffe1de; border-radius:3px; }
+.lg-grid { width:1px; height:13px; background:#cbd5e1; }
 .table-scroll { overflow-x:auto; }
 .chart-box { overflow-x:auto; }
 .badge { display:inline-block; padding:2px 10px; border-radius:999px;
