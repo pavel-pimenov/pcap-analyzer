@@ -7,7 +7,7 @@ from typing import Iterable
 
 from .. import __version__
 from ..branches.base import BranchResult, Recommendation, SEVERITY_ORDER
-from .components import (COPY_BTN, cmd_block, ensure_field_headers, esc,
+from .components import (COPY_BTN, cmd_block, example_cmd, esc,
                          fmt_bytes, kpi_cards, severity_badge)
 
 _CSS = """\
@@ -229,7 +229,7 @@ def _render_recommendations(recs: Iterable[Recommendation]) -> str:
         if r.commands:
             rows = "".join(
                 f'<div class="cmd-row"><div class="cmd-line">'
-                f'<pre class="cmd"><code>{esc(ensure_field_headers(c))}'
+                f'<pre class="cmd"><code>{esc(example_cmd(c))}'
                 f"</code></pre>{COPY_BTN}</div></div>"
                 for c in r.commands
             )

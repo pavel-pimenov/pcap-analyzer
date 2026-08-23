@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 from typing import Iterable, Sequence
 
 
@@ -147,6 +148,27 @@ def ensure_field_headers(cmd: str) -> str:
     return f"{head}{sep}{tail} -E header=y"
 
 
+#: Сколько строк вывода показывать в примере по умолчанию (хватает на экран;
+#: пользователь может заменить/убрать ограничение при запуске).
+EXAMPLE_MAX_LINES = 25
+
+
+def limit_example(cmd: str) -> str:
+    """Ограничить вывод примера первыми N строками (| head -N).
+
+    Если конвейер уже завершается ограничителем (head/tail/wc) — не трогаем.
+    """
+    last = cmd.rsplit("|", 1)[-1]
+    if re.search(r"\b(head|tail|wc)\b", last):
+        return cmd
+    return f"{cmd} | head -{EXAMPLE_MAX_LINES}"
+
+
+def example_cmd(cmd: str) -> str:
+    """Подготовить команду для показа в отчёте: шапка полей + лимит вывода."""
+    return limit_example(ensure_field_headers(cmd))
+
+
 def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
     """Блок команд tshark для проверки выборок."""
     if not commands:
@@ -156,7 +178,7 @@ def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
         items.append(
             f'<div class="cmd-row"><div class="cmd-desc">{esc(desc)}</div>'
             f'<div class="cmd-line"><pre class="cmd"><code>'
-            f"{esc(ensure_field_headers(cmd))}</code>"
+            f"{esc(example_cmd(cmd))}</code>"
             f"</pre>{COPY_BTN}</div></div>"
         )
     return (
