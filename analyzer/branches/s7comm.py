@@ -218,6 +218,8 @@ class S7CommAnalyzer(BaseBranch):
         progress("Проход 1/2: общий обзор TCP/IP…")
         gen = self._pass_general()
 
+        result.capture_start_ts = gen.first_ts
+
         progress("Проход 2/2: разбор S7comm…")
         s7 = self._pass_s7(gen)
 

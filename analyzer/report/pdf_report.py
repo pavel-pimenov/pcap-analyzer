@@ -41,19 +41,16 @@ h2 { font-size: 13pt; border-bottom: 0.5pt solid #e5e7eb; padding-bottom: 2pt; }
 .kpi { page-break-inside: avoid; }
 table.data-table { font-size: 8pt; }
 tr { page-break-inside: avoid; }
-/* Широкие таблицы: на печати горизонтальной прокрутки нет. WeasyPrint не
-   умеет сжимать auto-таблицы ниже суммы минимальных ширин колонок — крайние
-   колонки уходят за лист. Поэтому фиксированная раскладка (колонки делят
-   полосу набора поровну) плюс разрешённый перенос заголовков; длинные
-   токены в ячейках (IP, коды) разрываются в любом месте */
+/* Широкие таблицы: на печати горизонтальной прокрутки нет. Авто-раскладка
+   с уменьшенным шрифтом и компактными отступами позволяет колонкам занять
+   ровно столько, сколько нужно содержимому (IP и коды не переносятся),
+   и при этом вся таблица помещается в полосу набора */
 .table-scroll { overflow-x: visible; }
-table.data-table { font-size: 7.5pt; width: 100%; table-layout: fixed;
-                   word-break: normal; }
-/* !important обязателен: стили отчёта идут позже печатных в каскаде */
+table.data-table { font-size: 7pt; width: 100%; }
 table.data-table th { white-space: normal !important;
-                      overflow-wrap: normal !important;
-                      word-break: normal !important; padding: 3pt 4pt; }
-table.data-table td { padding: 2.5pt 4pt; overflow-wrap: anywhere; }
+                      overflow-wrap: anywhere !important;
+                      padding: 2pt 2.5pt; }
+table.data-table td { padding: 2pt 2.5pt; overflow-wrap: anywhere; }
 .rec { page-break-inside: avoid; }
 .cmd-row { page-break-inside: avoid; }
 pre.cmd { white-space: pre-wrap; word-break: break-all; }

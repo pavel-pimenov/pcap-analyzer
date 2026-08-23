@@ -200,6 +200,11 @@ class AppState:
                     Path(e["path"]), DEFAULT_CONFIG,
                     progress=lambda m: self._stage(fid, m),
                     tshark_bin=self.tshark_bin)
+                # момент снятия дампа — для имени файлов экспорта
+                e["captured"] = (
+                    datetime.fromtimestamp(result.capture_start_ts)
+                    .strftime("%Y-%m-%d_%H-%M-%S")
+                    if result.capture_start_ts else "")
                 (self.reports_dir / f"{fid}.html").write_text(
                     render_document(result), encoding="utf-8")
                 pdf_err = ""
@@ -406,8 +411,9 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                     self._json({"error": "отчёт в этом формате не готов"}, 404)
                     return
                 base = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(e["name"]).stem)
+                ts_part = f"_{e['captured']}" if e.get("captured") else ""
                 self._file(rep, _CT[f".{ext}"],
-                           download=f"отчет_{base}.{ext}")
+                           download=f"отчет_{base}{ts_part}.{ext}")
                 return
             self._json({"error": "нет такого маршрута"}, 404)
 

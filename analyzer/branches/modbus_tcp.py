@@ -229,6 +229,8 @@ class ModbusTcpAnalyzer(BaseBranch):
         gen = self._pass_general()
         duration = gen.duration
 
+        result.capture_start_ts = gen.first_ts
+
         progress("Проход 2/2: разбор Modbus/TCP…")
         mb = self._pass_modbus(gen)
 

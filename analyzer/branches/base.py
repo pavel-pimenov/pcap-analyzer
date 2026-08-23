@@ -58,6 +58,8 @@ class BranchResult:
     kpi: list[KpiItem] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
     recommendations: list[Recommendation] = field(default_factory=list)
+    # момент первого пакета захвата (epoch) — попадает в имена файлов экспорта
+    capture_start_ts: float | None = None
 
 
 class BaseBranch(ABC):
