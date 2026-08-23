@@ -724,16 +724,26 @@ class ModbusTcpAnalyzer(BaseBranch):
         syn_detail = ""
         if gen.syn502:
             per_pair = Counter((c, s) for _t, c, s in gen.syn502)
-            items = ", ".join(
-                f"<code class=\"inline\">{c} &rarr; {s}</code>: {n}"
-                for (c, s), n in per_pair.most_common(8)
-            )
+            pair_rows = []
+            for (c, s), n in per_pair.most_common(
+                    self.cfg.max_rows_per_table):
+                pair_rows.append([
+                    f"<strong>{C.esc(c)}</strong>",
+                    C.esc(s),
+                    f'<span class="num">{C.fmt_int(n)}</span>',
+                    f'<span class="num">{C.fmt_pct(n, len(gen.syn502))}</span>',
+                ])
             syn_examples = "; ".join(
                 f"{_fmt_ts_offset(t, gen.first_ts or 0)} ({c})"
                 for t, c, _s in gen.syn502[:8]
             )
             syn_detail = (
-                '<h3 class="subhead">Подключения по парам</h3>' + f"<p>{items}</p>"
+                '<h3 class="subhead">Сколько раз клиент подключался к серверу</h3>'
+                + C.table_html(["Клиент", "Сервер", "Подключений (SYN)", "Доля"],
+                               pair_rows)
+                + '<p class="note">«Подключений &gt; 1» — пара пересоздавала '
+                  'TCP-соединение в ходе захвата; для Modbus/TCP нормой считается '
+                  'одно долгоживущее соединение на пару.</p>'
                 + '<h3 class="subhead">Моменты установки соединений (первые)</h3>'
                 + f"<p>{syn_examples}</p>"
             )
@@ -1137,26 +1147,39 @@ class ModbusTcpAnalyzer(BaseBranch):
         dur_min = gen.duration / 60 if gen.duration else 0
         if not gen.syn502 or dur_min == 0:
             return []
-        rate = len(gen.syn502) / dur_min
-        if rate < self.cfg.conn_churn_per_min:
-            return []
         per_pair = Counter((c, s) for _t, c, s in gen.syn502)
-        ev = [f"{c} → {s}: {n} SYN" for (c, s), n in per_pair.most_common(5)]
-        sev = "critical" if rate >= self.cfg.conn_churn_per_min * 3 else "warning"
+        rate = len(gen.syn502) / dur_min
+        hot_pairs = {cs: n for cs, n in per_pair.items()
+                     if n >= self.cfg.conn_churn_pair_min}
+        by_rate = rate >= self.cfg.conn_churn_per_min
+        if not by_rate and not hot_pairs:
+            return []
+        ev = [f"{c} → {s}: {n} подключ." for (c, s), n in per_pair.most_common(5)]
+        sev = ("critical" if rate >= self.cfg.conn_churn_per_min * 3
+               else "warning")
+        repeat = ""
+        if hot_pairs and not by_rate:
+            top = max(hot_pairs.values())
+            repeat = (f" Повторные подключения одной пары: "
+                      f"{', '.join(f'{c} → {s} ({n} раз)' for (c, s), n in
+                                   sorted(hot_pairs.items(),
+                                          key=lambda kv: kv[1], reverse=True)[:3])}.")
         return [Recommendation(
             id="conn-churn",
             severity=sev,
             title="Частые переподключения к Modbus-серверам",
             problem=(
                 f"Обнаружено {len(gen.syn502)} новых подключений к порту 502 "
-                f"({rate:.1f}/мин за {C.fmt_dur(gen.duration)})."
+                f"({rate:.1f}/мин за {C.fmt_dur(gen.duration)}).{repeat}"
             ),
             advice=(
-                "Держать постоянное (keep-alive) соединение на весь срок жизни задачи "
-                "опроса: каждое переподключение — это handshake плюс таймауты риска. "
-                "Если переподключения вызваны таймаутами приложения — увеличьте их порог; "
-                "если балансировщиком/NAT — настройте время простоя сессии больше цикла "
-                "опроса."
+                "Правильнее держать соединения постоянными: одно долгоживущее "
+                "TCP-соединение (keep-alive) на пару клиент-сервер на весь срок "
+                "жизни задачи опроса. Каждое переподключение — это handshake, "
+                "задержка первого обмена и риск таймаутов. Если переподключения "
+                "вызваны таймаутами приложения — увеличьте их порог; если "
+                "сбросом NAT/балансировщика — настройте время простоя сессии "
+                "больше цикла опроса."
             ),
             evidence=ev,
             commands=[
