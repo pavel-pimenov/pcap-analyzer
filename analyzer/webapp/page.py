@@ -53,6 +53,8 @@ button:disabled { opacity:.5; cursor:default; }
 .chip.running { background:#dbeafe; color:#1e40af; }
 .chip.queued { background:#f3f4f6; color:#4b5563; }
 .chip.error { background:#fee2e2; color:#991b1b; }
+.chip.cancelled { background:#f3f4f6; color:#6b7280; }
+.chip.new { background:#fef9c3; color:#854d0e; }
 .file .acts { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
 .file .acts button { padding:4px 9px; font-size:12px; }
 .stage { color:var(--muted); font-size:11.5px; margin-top:4px;
@@ -111,7 +113,7 @@ function fmtSize(b) {
   return (i ? n.toFixed(1) : n) + " " + u[i];
 }
 const CHIP_RU = {done:"готово", running:"анализ…", queued:"в очереди",
-                 error:"ошибка"};
+                 error:"ошибка", cancelled:"отменён", new:"новый"};
 
 async function api(url, opts) {
   const r = await fetch(url, opts);
@@ -162,7 +164,8 @@ function renderFiles() {
     d.appendChild(nm); d.appendChild(meta);
     if (f.status === "running" || f.status === "queued") {
       const st = document.createElement("div"); st.className = "stage";
-      st.textContent = f.stage || ""; d.appendChild(st);
+      st.textContent = (f.progress ? f.progress + "% · " : "") +
+        (f.stage || ""); d.appendChild(st);
     } else if (f.status === "error") {
       const st = document.createElement("div"); st.className = "stage";
       st.style.color = "#b91c1c"; st.textContent = f.error || "";
@@ -174,6 +177,16 @@ function renderFiles() {
     bAn.disabled = f.status === "running" || f.status === "queued";
     bAn.onclick = (ev) => { ev.stopPropagation(); analyze(f.id, f.branch); };
     acts.appendChild(bAn);
+    if (f.status === "running" || f.status === "queued") {
+      const bC = document.createElement("button");
+      bC.textContent = "Отменить"; bC.className = "danger";
+      bC.onclick = async (ev) => {
+        ev.stopPropagation();
+        await api("/api/files/" + f.id + "/cancel", {method: "POST"});
+        loadFiles();
+      };
+      acts.appendChild(bC);
+    }
     if (f.hasHtml) {
       const bH = document.createElement("button"); bH.textContent = "Открыть";
       bH.onclick = (ev) => { ev.stopPropagation(); select(f.id); };

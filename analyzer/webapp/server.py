@@ -19,6 +19,7 @@ import queue
 import re
 import shutil
 import threading
+import time
 import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,7 +33,22 @@ from . import page
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PCAP_EXTS = {".pcap", ".pcapng", ".cap"}
-MAX_UPLOAD_BYTES = 1 << 30          # 1 ГБ
+MAX_UPLOAD_BYTES = DEFAULT_CONFIG.max_upload_bytes
+
+
+class AnalysisCancelled(Exception):
+    """Анализ отменён пользователем (поднимается в callback прогресса)."""
+
+
+def _pct_from_stage(msg: str) -> int | None:
+    """Оценить процент готовности по служебному сообщению ветки."""
+    m = re.match(r"Проход (\d+)/(\d+)", msg)
+    if not m:
+        return None
+    x, y = int(m.group(1)), int(m.group(2))
+    if y <= 0:
+        return None
+    return min(90, max(5, round((x - 0.5) / y * 100)))
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +125,8 @@ class AppState:
             "branch": e.get("branch", DEFAULT_BRANCH),
             "status": e["status"],
             "stage": e.get("stage", ""),
+            "progress": int(e.get("progress") or 0),
+            "tookS": str(e.get("took_s") or ""),
             "error": e.get("error", ""),
             "added": e.get("added", ""),
             "hasHtml": (self.reports_dir / f"{fid}.html").is_file(),
@@ -162,8 +180,25 @@ class AppState:
             e["branch"] = branch if branch in BRANCHES else DEFAULT_BRANCH
             e["status"] = "queued"
             e["stage"] = ""
+            e["progress"] = 0
+            e["took_s"] = ""
+            e["cancel"] = False
             e["error"] = ""
         self.jobs.put(fid)
+
+    def request_cancel(self, fid: str) -> bool:
+        """Пометить задание как отменённое; True, если оно было активным."""
+        with self.lock:
+            e = self.entries.get(fid)
+            if not e or e.get("status") not in ("running", "queued"):
+                return False
+            e["cancel"] = True
+            # ещё не начатое задание снимаем сразу, не дожидаясь воркера
+            if e["status"] == "queued":
+                e["status"] = "cancelled"
+                e["stage"] = "анализ отменён"
+                self._persist(e)
+            return True
 
     def delete(self, fid: str) -> None:
         with self.lock:
@@ -182,6 +217,9 @@ class AppState:
             e = self.entries.get(fid)
             if e:
                 e["stage"] = msg
+                pct = _pct_from_stage(msg)
+                if pct is not None:
+                    e["progress"] = pct
                 if e["status"] in ("queued", "new"):
                     e["status"] = "running"
 
@@ -193,12 +231,26 @@ class AppState:
             if not e:
                 continue
             with self.lock:
+                if e.get("cancel"):
+                    # отменено, пока лежало в очереди
+                    e["status"] = "cancelled"
+                    e["stage"] = "анализ отменён"
+                    continue
                 e["status"] = "running"
             branch = get_branch(e.get("branch", DEFAULT_BRANCH))
+            t0 = time.monotonic()
+
+            def progress(m: str, _fid=fid) -> None:
+                with self.lock:
+                    cancelled = bool(self.entries.get(_fid, {}).get("cancel"))
+                if cancelled:
+                    raise AnalysisCancelled()
+                self._stage(_fid, m)
+
             try:
                 result = branch.analyze(
                     Path(e["path"]), DEFAULT_CONFIG,
-                    progress=lambda m: self._stage(fid, m),
+                    progress=progress,
                     tshark_bin=self.tshark_bin)
                 # момент снятия дампа — для имени файлов экспорта
                 e["captured"] = (
@@ -213,14 +265,25 @@ class AppState:
                         render_pdf_bytes(result))
                 except Exception as pe:              # PDF не критичен
                     pdf_err = f"PDF не собран: {pe}"
+                took = round(time.monotonic() - t0, 1)
                 with self.lock:
                     e["status"] = "done"
-                    e["stage"] = "готово" + (f" ({pdf_err})" if pdf_err else "")
+                    e["progress"] = 100
+                    e["took_s"] = took
+                    e["stage"] = f"готово за {took:g} с" + \
+                        (f" ({pdf_err})" if pdf_err else "")
                     e["error"] = ""
+                    self._persist(e)
+            except AnalysisCancelled:
+                with self.lock:
+                    e["status"] = "cancelled"
+                    e["took_s"] = round(time.monotonic() - t0, 1)
+                    e["stage"] = "анализ отменён"
                     self._persist(e)
             except Exception as ex:                  # noqa: BLE001 — статус в UI
                 with self.lock:
                     e["status"] = "error"
+                    e["took_s"] = round(time.monotonic() - t0, 1)
                     e["error"] = str(ex)
                     self._persist(e)
 
@@ -293,7 +356,8 @@ def parse_multipart_file(rfile, boundary: bytes, dest: Path,
                 buf = buf[-keep:]
             tail = buf
             if total > MAX_UPLOAD_BYTES:
-                raise ValueError("файл слишком большой (лимит 1 ГБ)")
+                gb = MAX_UPLOAD_BYTES >> 30
+                raise ValueError(f"файл слишком большой (лимит {gb} ГБ)")
     return filename, total
 
 
@@ -447,6 +511,16 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 state.enqueue(e["id"], branch)
                 self._json(state.public(state.get(e["id"])), 202)
                 return
+            m = re.fullmatch(r"/api/files/([A-Za-z0-9_-]+)/cancel", u.path)
+            if m:
+                e = self._entry_or_404(m.group(1))
+                if not e:
+                    return
+                if not state.request_cancel(e["id"]):
+                    self._json({"error": "анализ не запущен"}, 409)
+                    return
+                self._json(state.public(state.get(e["id"])))
+                return
             self._json({"error": "нет такого маршрута"}, 404)
 
         def _handle_upload(self):
@@ -458,8 +532,9 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 return
             length = int(self.headers.get("Content-Length") or 0)
             if length > MAX_UPLOAD_BYTES + (1 << 20):
-                self._json({"error": "файл слишком большой (лимит 1 ГБ)"},
-                           413)
+                gb = MAX_UPLOAD_BYTES >> 30
+                self._json(
+                    {"error": f"файл слишком большой (лимит {gb} ГБ)"}, 413)
                 return
             tmp = state.uploads_dir / f"tmp-{uuid.uuid4().hex}.part"
             branch_q = None

@@ -71,7 +71,14 @@ analyzer/
 
 ## Как проверять изменения
 
-Тестового фреймворка нет; минимальная регрессия — прогон на образцах:
+Полноценного фреймворка нет. Минимальная проверка — smoke-тесты
+(`tests/test_smoke.py`, unittest, только stdlib), затем прогон на образцах:
+
+```bash
+# smoke-тесты (unittest, только stdlib; tshark/weasyprint опциональны —
+# без них соответствующие тесты пропускаются)
+python3 -m unittest discover -s tests -t . -v
+```
 
 ```bash
 # локально (нужен tshark в PATH; для PDF — weasyprint из requirements.txt);

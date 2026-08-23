@@ -30,6 +30,14 @@ services:
       - ./pcap-sample:/data/pcap-sample:ro
       # Загрузки пользователей и готовые отчёты (именованный том)
       - webdata:/data/webdata
+    healthcheck:
+      # curl в slim-образе нет — проверяем стандартной библиотекой python
+      test: ["CMD", "python3", "-c",
+             "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/api/branches', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   # --- Разовый batch-анализ (запуск только через профиль) ----------------------
   analyzer:
