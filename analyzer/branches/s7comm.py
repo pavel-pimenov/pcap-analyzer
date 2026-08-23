@@ -223,9 +223,14 @@ class S7CommAnalyzer(BaseBranch):
         progress("Проход 2/2: разбор S7comm…")
         s7 = self._pass_s7(gen)
 
+        # тёплые цвета серверов (PLC): единая раскраска таблиц, диаграмм
+        # и легенды шапки отчёта
+        self._set_servers(p for (_c, p) in s7["pairs"])
+
         result.kpi = self._build_kpi(gen, s7)
         result.sections = self._build_sections(gen, s7)
         result.recommendations = self._build_recommendations(gen, s7)
+        result.server_colors = dict(self._srv_colors)
         return result
 
     # -- вспомогательное ----------------------------------------------------
@@ -487,8 +492,10 @@ class S7CommAnalyzer(BaseBranch):
             [f"FIN на порту {PORT}", C.fmt_int(gen.fin102)],
         ]
         top = "".join(
-            f"<li><code class=\"inline\">{C.esc(ip)}</code> — "
-            f"{C.fmt_int(cnt)} пак.</li>"
+            "<li>"
+            + (self._srv_cell(ip) if ip in self._srv_colors
+               else f"<code class=\"inline\">{C.esc(ip)}</code>")
+            + f" — {C.fmt_int(cnt)} пак.</li>"
             for ip, cnt in gen.ip_pkts.most_common(6)
         )
         body = (
@@ -554,7 +561,7 @@ class S7CommAnalyzer(BaseBranch):
                 for f, n in ps.fcodes.most_common(3)
             )
             rows.append([
-                f"<strong>{C.esc(cl)}</strong>", C.esc(sv),
+                f"<strong>{C.esc(cl)}</strong>", self._srv_cell(sv),
                 f'<span class="num">{C.fmt_int(ps.reqs)}</span>',
                 f'<span class="num">{C.fmt_int(ps.resps)}</span>',
                 f'<span class="num">{C.fmt_int(ps.errors)}</span>',
@@ -600,7 +607,7 @@ class S7CommAnalyzer(BaseBranch):
             durations.append(d)
             st_rows.append([
                 f"<code class=\"inline\">{C.esc(st)}</code>",
-                f"{C.esc(info['client'])} &rarr; {C.esc(info['server'])}",
+                f"{C.esc(info['client'])} &rarr; {self._srv_cell(info['server'])}",
                 _fmt_ts_offset(info["first"] or 0, gen.first_ts or 0),
                 C.fmt_dur(d),
             ])
@@ -638,7 +645,7 @@ class S7CommAnalyzer(BaseBranch):
                     return (val, "cell-hot") if hot and cnt > 0 else val
 
                 pair_rows.append([
-                    f"<strong>{C.esc(c)}</strong>", C.esc(s),
+                    f"<strong>{C.esc(c)}</strong>", self._srv_cell(s),
                     cell(n, True),
                     cell(close_by_srv.get((c, s), 0), True),
                     cell(close_by_cli.get((c, s), 0), True),

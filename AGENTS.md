@@ -33,6 +33,11 @@
   `analyzer/report/components.py` внутри обёртки `<div class="cmd-line">`;
   обработчик — инлайновый `_CLIPBOARD_JS` в `html_report.py`, на печать
   кнопка скрывается в `_PRINT_CSS`.
+* Цвета серверов (PLC) едины на весь документ: ветки вызывают
+  `BaseBranch._set_servers(...)` (после прохода, где известны пары), ячейки
+  с IP сервера — только через `BaseBranch._srv_cell(ip)`. Карта цветов
+  попадает в `BranchResult.server_colors` и рисуется легендой в шапке
+  отчёта; новые таблицы с колонкой сервера обязаны использовать `_srv_cell`.
 * Любые эмпирические пороги правил рекомендаций выносятся в
   `analyzer/config.py` (класс `Config`), не хардкодятся в логике.
 * Данные из tshark читаем потоково (`tshark_runner.stream_fields`) — файлы

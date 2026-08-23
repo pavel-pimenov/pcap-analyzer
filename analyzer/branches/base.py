@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -60,6 +61,8 @@ class BranchResult:
     recommendations: list[Recommendation] = field(default_factory=list)
     # момент первого пакета захвата (epoch) — попадает в имена файлов экспорта
     capture_start_ts: float | None = None
+    # ip сервера (PLC) -> (светлый фон, насыщенный цвет); для легенды в шапке
+    server_colors: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 class BaseBranch(ABC):
@@ -72,6 +75,36 @@ class BaseBranch(ABC):
     name: str = "base"
     title: str = "Базовая ветка"
     description: str = ""
+
+    def __init__(self) -> None:
+        self._srv_colors: dict[str, tuple[str, str]] = {}
+
+    @staticmethod
+    def _ip_key(ip: str) -> tuple:
+        """Ключ сортировки IP по октетам (в таблицах порядок стабильный)."""
+        try:
+            return tuple(int(x) for x in ip.split("."))
+        except ValueError:
+            return (float("inf"),)
+
+    def _set_servers(self, servers) -> None:
+        """Закрепить тёплые цвета за серверами (PLC).
+
+        Одинаково используется во всех таблицах, на диаграммах и в легенде
+        шапки отчёта: один IP — один цвет на весь документ. Импорт локальный,
+        чтобы не зациклить модули (report импортирует branches.base).
+        """
+        from analyzer.report.components import warm_pair
+        self._srv_colors = {
+            ip: warm_pair(i)
+            for i, ip in enumerate(sorted(set(servers), key=self._ip_key))
+        }
+
+    def _srv_cell(self, ip: str) -> str:
+        """IP сервера на тёплом фоне — цвет кодирует конкретный PLC."""
+        bg, fg = self._srv_colors.get(ip, ("#f1f5f9", "#334155"))
+        return (f'<span class="srv" style="background:{bg};color:{fg}">'
+                f"{escape(str(ip), quote=True)}</span>")
 
     @abstractmethod
     def analyze(

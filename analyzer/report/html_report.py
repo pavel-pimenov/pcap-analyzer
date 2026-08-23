@@ -51,8 +51,11 @@ table.data-table td.num, table.data-table th.num { text-align:right;
 td.empty { color:var(--muted); text-align:center; padding:16px; }
 table.data-table td.cell-hot { background:#fee2e2; }
 .hot-legend { background:#fee2e2; padding:1px 6px; border-radius:4px; }
-td span.srv { padding:1px 7px; border-radius:4px; font-weight:600;
-              white-space:nowrap; }
+td span.srv, .srv-legend .srv { padding:1px 7px; border-radius:4px;
+              font-weight:600; white-space:nowrap; }
+.srv-legend { margin:10px 0 2px; font-size:13px; color:var(--muted); }
+.srv-legend-title { margin-right:6px; }
+.srv-legend .srv { margin-right:6px; display:inline-block; }
 .legend span { margin-right:18px; font-size:12.5px; color:#475569;
                white-space:nowrap; }
 .lg { display:inline-block; vertical-align:-2px; margin-right:5px; }
@@ -185,6 +188,16 @@ def render_document(result: BranchResult) -> str:
 </header>
 
 <nav class="toc">{toc}</nav>
+
+{(
+    '<div class="srv-legend"><span class="srv-legend-title">PLC в отчёте '
+    '(цвет одинаков во всех таблицах и на диаграммах):</span> '
+    + "".join(
+        f'<span class="srv" style="background:{esc(bg)};color:{esc(fg)}">'
+        f"{esc(ip)}</span>"
+        for ip, (bg, fg) in result.server_colors.items())
+    + "</div>"
+) if len(result.server_colors) >= 2 else ""}
 
 {('<section class="card" id="summary"><h2>Ключевые показатели</h2>' + kpi_cards(result.kpi) + '</section>') if result.kpi else ""}
 

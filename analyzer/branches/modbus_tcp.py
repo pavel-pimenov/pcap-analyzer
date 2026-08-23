@@ -234,13 +234,9 @@ class ModbusTcpAnalyzer(BaseBranch):
         progress("Проход 2/3: разбор Modbus/TCP…")
         mb = self._pass_modbus(gen)
 
-        # тёплые цвета серверов (PLC): единая раскраска во всех таблицах и на
-        # диаграммах; порядок — по возрастанию IP, чтобы он был стабилен
-        self._srv_idx = {
-            ip: i for i, ip in enumerate(sorted(
-                {sv for (_c, sv) in mb["pairs"]},
-                key=lambda a: tuple(int(x) for x in a.split("."))))
-        }
+        # тёплые цвета серверов (PLC): единая раскраска таблиц, диаграмм
+        # и легенды шапки отчёта; порядок — по возрастанию IP
+        self._set_servers(sv for (_c, sv) in mb["pairs"])
 
         # окна для диаграмм Ганта (только если есть что показывать)
         self._threads = []
@@ -256,6 +252,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         result.kpi = kpi
         result.sections = sections
         result.recommendations = recs
+        result.server_colors = dict(self._srv_colors)
         return result
 
     # -- вспомогательное ----------------------------------------------------
@@ -272,12 +269,6 @@ class ModbusTcpAnalyzer(BaseBranch):
         # в командах для пользователя — только имя файла: он может лежать
         # где угодно, полный путь нужен лишь самому анализатору
         return f"tshark -r {self.pcap.name} {args_tail}"
-
-    def _srv_cell(self, ip: str) -> str:
-        """IP сервера на тёплом фоне — цвет кодирует конкретный PLC."""
-        bg, fg = C.warm_pair(self._srv_idx.get(ip, 0))
-        return (f'<span class="srv" style="background:{bg};color:{fg}">'
-                f"{C.esc(ip)}</span>")
 
     @staticmethod
     def _max_concurrent(intervals) -> int:
@@ -732,7 +723,10 @@ class ModbusTcpAnalyzer(BaseBranch):
             ["FIN на порту 502", C.fmt_int(gen.fin502)],
         ]
         top = "".join(
-            f"<li><code class=\"inline\">{C.esc(ip)}</code> — {C.fmt_int(cnt)} пак.</li>"
+            "<li>"
+            + (self._srv_cell(ip) if ip in self._srv_colors
+               else f"<code class=\"inline\">{C.esc(ip)}</code>")
+            + f" — {C.fmt_int(cnt)} пак.</li>"
             for ip, cnt in gen.ip_pkts.most_common(6)
         )
         body = (
@@ -850,7 +844,7 @@ class ModbusTcpAnalyzer(BaseBranch):
             durations.append(d)
             st_rows.append([
                 f"<code class=\"inline\">{C.esc(st)}</code>",
-                f"{C.esc(info['client'])} &rarr; {C.esc(info['server'])}",
+                f"{C.esc(info['client'])} &rarr; {self._srv_cell(info['server'])}",
                 _fmt_ts_offset(info["first"] or 0, gen.first_ts or 0),
                 C.fmt_dur(d),
                 C.fmt_int(mb["stream_reqs"].get(st, 0)),
@@ -953,13 +947,19 @@ class ModbusTcpAnalyzer(BaseBranch):
                   "Самая загруженная секунда этого окна (масштаб {win:.0f} с)"]
         charts = []
         for i, tw in enumerate(tw_list):
-            ordered = sorted(tw["rows"].items(), key=lambda kv: kv[1]["min"])
+            # ряды группируем по ПЛК: сортировка по IP сервера, затем порт
+            ordered = sorted(
+                tw["rows"].items(),
+                key=lambda kv: (tuple(int(x) for x in kv[0][0].split(".")),
+                                kv[0][1]))
             g_rows = []
             for (dst, sport), e in ordered:
-                _bg, strong = C.warm_pair(self._srv_idx.get(dst, 0))
+                bg, strong = self._srv_colors.get(dst, ("#f1f5f9", "#334155"))
                 g_rows.append({
                     "label": f":{sport} → {dst}",
                     "color": strong,
+                    "bg": bg,
+                    "fg": strong,
                     "span": (e["min"], e["max"]),
                     "ticks": e["ticks"],
                 })
@@ -990,8 +990,10 @@ class ModbusTcpAnalyzer(BaseBranch):
               '<span><i class="lg lg-grid"></i>линии сетки — деления времени</span>'
               "</p>"
             + '<p class="note">Каждый ряд — отдельное TCP-соединение '
-              '(эфемерный порт клиента &rarr; PLC); цвет ряда совпадает с цветом '
-              'PLC в таблицах. Светлая полоса под чёрточками — период, в котором '
+              '(эфемерный порт клиента &rarr; PLC); подпись ряда подкрашена '
+              'цветом этого PLC, как в таблицах, ряды отсортированы по IP '
+              'сервера — соединения с одним PLC идут подряд. Точки — отдельные '
+              'Modbus-запросы, светлая полоса — период, в котором '
               'наблюдалась активность соединения. Перекрывающиеся по времени ряды — '
               'одновременный опрос из нескольких потоков; строгое чередование '
               'рядов «лесенкой» — последовательная работа одного потока. '
@@ -1189,7 +1191,7 @@ class ModbusTcpAnalyzer(BaseBranch):
             p95 = _percentile(srtt, 95)
             mx = srtt[-1] if srtt else None
             rows.append([
-                f"<strong>{C.esc(sv)}</strong>",
+                f"<strong>{self._srv_cell(sv)}</strong>",
                 f'<span class="num">{C.fmt_ms(mn)}</span>',
                 f'<span class="num">{C.fmt_ms(p50)}</span>',
                 f'<span class="num">{C.fmt_ms(p90)}</span>',
@@ -1233,7 +1235,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         for (sv, unit, code), cnt in mb["exc_counter"].most_common(15):
             desc = EXC_NAMES.get(code, f"Код {code}")
             rows.append([
-                C.esc(sv), C.fmt_int(unit),
+                self._srv_cell(sv), C.fmt_int(unit),
                 f"<strong>{code}</strong>", desc,
                 f'<span class="num">{C.fmt_int(cnt)}</span>',
             ])
