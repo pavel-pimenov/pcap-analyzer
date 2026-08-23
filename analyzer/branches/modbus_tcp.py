@@ -590,7 +590,7 @@ class ModbusTcpAnalyzer(BaseBranch):
             sections.append(self._sec_pairs(gen, mb))
             sections.append(self._sec_connections(gen, mb))
             sections.append(self._sec_fcodes(mb))
-            sections.append(self._sec_registers(mb))
+            sections.append(self._sec_registers(gen, mb))
             sections.append(self._sec_response_times(mb))
             sections.append(self._sec_errors(gen, mb))
         else:
@@ -847,7 +847,9 @@ class ModbusTcpAnalyzer(BaseBranch):
         ]
         return Section("fcodes", "Выполняемые команды (функциональные коды)", body, cmds)
 
-    def _sec_registers(self, mb: dict) -> Section:
+    def _sec_registers(self, gen: GeneralStats, mb: dict) -> Section:
+        # захваты короче минуты считаем за минуту — иначе частота завышена
+        dur_min = max(gen.duration / 60.0, 1.0)
         reads_rows = []
         top_reads = sorted(mb["reads"].items(), key=lambda kv: kv[1][1], reverse=True)
         for (sv, unit, fc, start, ln), (ops, words) in \
@@ -858,6 +860,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                 f"<strong>{start}</strong>&ndash;<strong>{start + max(ln - 1, 0)}</strong>",
                 f'<span class="num">{C.fmt_int(ln)}</span>',
                 f'<span class="num">{C.fmt_int(ops)}</span>',
+                f'<span class="num">{ops / dur_min:.1f}</span>',
                 f'<span class="num">{C.fmt_int(words)}</span>',
                 C.fmt_int(len(clients)),
             ])
@@ -883,8 +886,14 @@ class ModbusTcpAnalyzer(BaseBranch):
                 '<h3 class="subhead">Топ читаемых диапазонов</h3>'
                 + C.table_html(
                     ["Сервер", "Unit", "Функция", "Диапазон", "Рег./запрос",
-                     "Запросов", "Всего слов", "Клиентов"],
+                     "Запросов", "Команд/мин", "Всего слов", "Клиентов"],
                     reads_rows)
+                + '<p class="note"><strong>Команд/мин</strong> — частота опроса '
+                  "конкретного диапазона: сколько запросов в минуту он "
+                  "получает. Сравните её с требуемой свежестью данных и "
+                  "временем отклика сервера: опрос чаще, чем данные успевают "
+                  "меняться (см. «статичные» регистры ниже), тратит циклы ПЛК "
+                  "впустую.</p>"
             )
         if writes_rows:
             body += (
