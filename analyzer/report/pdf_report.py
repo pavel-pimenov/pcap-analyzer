@@ -51,6 +51,8 @@ table.data-table th { white-space: normal !important;
                       overflow-wrap: anywhere !important;
                       padding: 2pt 2.5pt; }
 table.data-table td { padding: 2pt 2.5pt; overflow-wrap: anywhere; }
+/* Кнопки «копировать в буфер» — интерактив экранного HTML, на печати не нужны */
+.copy-btn { display: none !important; }
 .rec { page-break-inside: avoid; }
 .cmd-row { page-break-inside: avoid; }
 pre.cmd { white-space: pre-wrap; word-break: break-all; }

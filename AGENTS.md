@@ -28,6 +28,11 @@
   инлайновый SVG (`analyzer/report/components.py`). Не подключать внешние ресурсы.
   PDF строится из этого же HTML (`render_document`) — единый источник контента;
   печатная специфика только через `_PRINT_CSS` в `analyzer/report/pdf_report.py`.
+* В любом блоке отчёта, где показан исполняемый код (команды tshark и т.п.),
+  всегда добавлять иконку «копировать в буфер обмена» — `COPY_BTN` из
+  `analyzer/report/components.py` внутри обёртки `<div class="cmd-line">`;
+  обработчик — инлайновый `_CLIPBOARD_JS` в `html_report.py`, на печать
+  кнопка скрывается в `_PRINT_CSS`.
 * Любые эмпирические пороги правил рекомендаций выносятся в
   `analyzer/config.py` (класс `Config`), не хардкодятся в логике.
 * Данные из tshark читаем потоково (`tshark_runner.stream_fields`) — файлы

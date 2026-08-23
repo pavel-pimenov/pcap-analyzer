@@ -114,6 +114,26 @@ def table_html(headers: Sequence[str], rows: Sequence[Sequence], cls: str = "") 
     )
 
 
+# Кнопка «копировать в буфер» для блоков команд. Обрабатывается инлайновым
+# скриптом отчёта (см. _CLIPBOARD_JS в html_report); на печать (PDF)
+# скрывается печатной таблицей стилей.
+COPY_BTN = (
+    '<button type="button" class="copy-btn" '
+    'title="Копировать команду в буфер обмена" '
+    'aria-label="Копировать команду в буфер обмена">'
+    '<svg class="ic ic-copy" viewBox="0 0 16 16" width="13" height="13" '
+    'aria-hidden="true"><rect x="5.2" y="5.2" width="8.3" height="8.3" '
+    'rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/>'
+    '<path d="M11 3H4.2A1.7 1.7 0 0 0 2.5 4.7V12" fill="none" '
+    'stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>'
+    '<svg class="ic ic-ok" viewBox="0 0 16 16" width="13" height="13" '
+    'aria-hidden="true"><path d="M2.5 8.6 6.1 12l7.4-8.4" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    'stroke-linejoin="round"/></svg>'
+    "</button>"
+)
+
+
 def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
     """Блок команд tshark для проверки выборок."""
     if not commands:
@@ -122,7 +142,8 @@ def cmd_block(commands: Sequence[tuple[str, str]]) -> str:
     for desc, cmd in commands:
         items.append(
             f'<div class="cmd-row"><div class="cmd-desc">{esc(desc)}</div>'
-            f'<pre class="cmd"><code>{esc(cmd)}</code></pre></div>'
+            f'<div class="cmd-line"><pre class="cmd"><code>{esc(cmd)}</code>'
+            f"</pre>{COPY_BTN}</div></div>"
         )
     return (
         '<details class="cmd-details"><summary>Показать команды tshark '

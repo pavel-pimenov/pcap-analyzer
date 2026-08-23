@@ -7,7 +7,7 @@ from typing import Iterable
 
 from .. import __version__
 from ..branches.base import BranchResult, Recommendation, SEVERITY_ORDER
-from .components import cmd_block, esc, fmt_bytes, kpi_cards, severity_badge
+from .components import COPY_BTN, cmd_block, esc, fmt_bytes, kpi_cards, severity_badge
 
 _CSS = """\
 :root {
@@ -78,13 +78,65 @@ td span.srv { padding:1px 7px; border-radius:4px; font-weight:600;
 .cmd-details summary { cursor:pointer; color:var(--accent); font-size:13px; user-select:none; }
 .cmd-row { margin:8px 0; }
 .cmd-desc { font-size:12.5px; color:var(--muted); margin-bottom:3px; }
+.cmd-line { position:relative; }
 pre.cmd { background:#0f172a; color:#e2e8f0; padding:9px 12px; border-radius:8px;
-       font-size:12.5px; overflow-x:auto; margin:0; }
+       font-size:12.5px; overflow-x:auto; margin:0; padding-right:42px; }
+.copy-btn { position:absolute; top:6px; right:6px; width:26px; height:26px;
+       display:inline-flex; align-items:center; justify-content:center;
+       background:transparent; border:0; border-radius:6px; color:#94a3b8;
+       cursor:pointer; padding:0; }
+.copy-btn:hover { background:#1e293b; color:#e2e8f0; }
+.copy-btn .ic-ok { display:none; }
+.copy-btn.copied .ic-copy, .copy-btn.failed .ic-copy { display:none; }
+.copy-btn.copied .ic-ok, .copy-btn.failed .ic-ok { display:block; }
+.copy-btn.copied { color:#4ade80; }
+.copy-btn.failed { color:#f87171; }
 code.inline { background:#eef2ff; padding:1px 5px; border-radius:4px;
        font-size:.92em; color:#3730a3; }
 footer.report { color:var(--muted); font-size:12px; text-align:center; margin-top:26px; }
 h3.subhead { font-size:15px; margin:18px 0 6px; }
 .note { color:var(--muted); font-size:12.5px; }
+"""
+
+# Инлайновый обработчик кнопок «копировать в буфер» (файл остаётся
+# автономным). navigator.clipboard требует защищённый контекст; для file://
+# и старых браузеров — резерв через execCommand. WeasyPrint скрипты игнорирует.
+_CLIPBOARD_JS = """
+(function(){
+"use strict";
+document.addEventListener("click", function(ev){
+  var t = ev.target;
+  var btn = t.closest ? t.closest(".copy-btn") : null;
+  if (!btn) return;
+  var line = btn.closest(".cmd-row");
+  var code = line ? line.querySelector(".cmd-line code") : null;
+  var txt = code ? code.textContent : "";
+  var timer = null;
+  function mark(ok){
+    btn.classList.add(ok ? "copied" : "failed");
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function(){ btn.classList.remove("copied","failed"); }, 1300);
+  }
+  function fallback(){
+    var ta = document.createElement("textarea");
+    ta.value = txt;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    mark(ok);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(function(){ mark(true); }, fallback);
+  } else {
+    fallback();
+  }
+});
+})();
 """
 
 
@@ -146,6 +198,7 @@ def render_document(result: BranchResult) -> str:
 </footer>
 
 </div>
+<script>{_CLIPBOARD_JS}</script>
 </body>
 </html>
 """
@@ -161,7 +214,8 @@ def _render_recommendations(recs: Iterable[Recommendation]) -> str:
         cmds = ""
         if r.commands:
             rows = "".join(
-                f'<div class="cmd-row"><pre class="cmd"><code>{esc(c)}</code></pre></div>'
+                f'<div class="cmd-row"><div class="cmd-line">'
+                f'<pre class="cmd"><code>{esc(c)}</code></pre>{COPY_BTN}</div></div>'
                 for c in r.commands
             )
             cmds = (
