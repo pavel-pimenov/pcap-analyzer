@@ -194,5 +194,102 @@ class WebApiTest(unittest.TestCase):
         self.assertEqual(code, 400)
 
 
+@unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
+class WebSeriesTest(unittest.TestCase):
+    """Серии и дифф через веб-API на быстрых сгенерированных дамперах."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tests import pcapgen
+        cls.tmp = Path(__import__("tempfile").mkdtemp(prefix="pcapweb-s-"))
+        cls.fixtures = []
+        for i, ts in enumerate((1735000000, 1735000300)):
+            p = cls.tmp / f"fix_{i}.pcap"
+            pcapgen.write_modbus_pcap(p, base_ts=ts)
+            cls.fixtures.append(p)
+        cls.state = AppState(cls.tmp / "data", None, None)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0),
+                                        make_handler(cls.state))
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever,
+                         daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _upload(self, path: Path) -> str:
+        code, _h, data = _request(
+            self.base, "/api/upload?branch=modbus", method="POST",
+            body=_multipart(path.read_bytes(), path.name),
+            content_type=MULTIPART_CT)
+        self.assertEqual(code, 201, data[:200])
+        return json.loads(data)["id"]
+
+    def _poll_group(self, gid: str, timeout: float = 300.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            _c, _h, data = _request(self.base, f"/api/groups/{gid}")
+            st = json.loads(data)
+            if st["status"] in ("done", "error", "cancelled"):
+                return st
+            time.sleep(0.4)
+        self.fail("задание группы не завершилось")
+
+    def test_series_and_diff_end_to_end(self):
+        fids = [self._upload(p) for p in self.fixtures]
+        # серия из двух файлов
+        code, _h, data = _request(self.base, "/api/series", method="POST",
+                                  body=json.dumps(
+                                      {"fids": fids, "branch": "modbus"}
+                                  ).encode(),
+                                  content_type="application/json")
+        self.assertEqual(code, 201, data[:200])
+        g1 = json.loads(data)["id"]
+        st = self._poll_group(g1)
+        self.assertEqual(st["status"], "done",
+                         f"ошибка серии: {st.get('error')}")
+        code, headers, body = _request(self.base, f"/view/{g1}")
+        self.assertEqual(code, 200)
+        self.assertIn("Тренды по серии", body.decode("utf-8"))
+        # вторая серия (те же файлы, отдельная группа)
+        code, _h, data = _request(self.base, "/api/series", method="POST",
+                                  body=json.dumps(
+                                      {"fids": fids, "branch": "modbus"}
+                                  ).encode(),
+                                  content_type="application/json")
+        g2 = json.loads(data)["id"]
+        self._poll_group(g2)
+        # дифф
+        code, _h, data = _request(self.base, "/api/diff", method="POST",
+                                  body=json.dumps({"a": g1, "b": g2}).encode(),
+                                  content_type="application/json")
+        self.assertEqual(code, 201, data[:200])
+        gd = json.loads(data)["id"]
+        st = self._poll_group(gd)
+        self.assertEqual(st["status"], "done",
+                         f"ошибка диффа: {st.get('error')}")
+        code, _h, body = _request(self.base, f"/view/{gd}")
+        self.assertIn("Сравнение периодов", body.decode("utf-8"))
+        # удаление групп не трогает исходные файлы
+        code, _h, _d = _request(self.base, f"/api/groups/{g1}",
+                                method="DELETE")
+        self.assertEqual(code, 200)
+        self.assertEqual(_request(self.base, f"/view/{g1}")[0], 404)
+        code, _h, data = _request(self.base, "/api/files")
+        names = {x["id"] for x in json.loads(data)}
+        self.assertTrue(set(fids).issubset(names))
+
+    def test_series_requires_two_files(self):
+        fid = self._upload(self.fixtures[0])
+        code, _h, data = _request(self.base, "/api/series", method="POST",
+                                  body=json.dumps({"fids": [fid]}).encode(),
+                                  content_type="application/json")
+        self.assertEqual(code, 400)
+        self.assertIn("минимум два", json.loads(data)["error"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

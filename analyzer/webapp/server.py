@@ -28,7 +28,9 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from ..branches import BRANCHES, DEFAULT_BRANCH, get_branch
 from ..config import DEFAULT_CONFIG
-from ..report import render_document, render_pdf_bytes
+from ..report import render_document, render_pdf_bytes, \
+    render_diff_html, render_trend_html
+from ..trend import build_trend
 from . import page
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -68,10 +70,15 @@ class AppState:
             p.unlink(missing_ok=True)
         self.samples_dir = samples_dir.resolve() if samples_dir else None
         self.tshark_bin = tshark_bin
+        self.groups_dir = self.data_dir / "groups"
+        self.groups_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.entries: dict[str, dict] = {}
-        self.jobs: queue.Queue[str] = queue.Queue()
+        self.groups: dict[str, dict] = {}
+        # задания: ("file", fid) | ("series", gid) | ("diff", gid)
+        self.jobs: queue.Queue[tuple[str, str]] = queue.Queue()
         self._load_persisted()
+        self._load_groups()
         for _ in range(2):
             threading.Thread(target=self._worker, daemon=True).start()
 
@@ -98,6 +105,31 @@ class AppState:
                 self.entries[fid] = meta
             except (KeyError, ValueError, OSError, json.JSONDecodeError):
                 continue
+
+    def _load_groups(self) -> None:
+        """Восстановить серии/сравнения с прошлого запуска."""
+        for mp in sorted(self.groups_dir.glob("*.json")):
+            try:
+                g = json.loads(mp.read_text(encoding="utf-8"))
+                gid = g["id"]
+                if not _ID_RE.match(gid):
+                    continue
+                g.setdefault("status", "error")
+                if g["status"] == "done" and \
+                        not (self.reports_dir / f"{gid}.html").is_file():
+                    g["status"] = "error"
+                    g["error"] = "отчёт не найден, запустите повторно"
+                self.groups[gid] = g
+            except (KeyError, ValueError, OSError, json.JSONDecodeError):
+                continue
+
+    def _persist_group(self, g: dict) -> None:
+        try:
+            (self.groups_dir / f"{g['id']}.json").write_text(
+                json.dumps(g, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except OSError:
+            pass
 
     def _scan_samples(self) -> None:
         """Зарегистрировать образцы из read-only каталога."""
@@ -136,12 +168,32 @@ class AppState:
             "hasPdf": (self.reports_dir / f"{fid}.pdf").is_file(),
         }
 
+    def group_public(self, g: dict) -> dict:
+        gid = g["id"]
+        return {
+            "id": gid,
+            "kind": "series" if g["kind"] == "trend" else "diff",
+            "name": g["name"],
+            "branch": g.get("branch", DEFAULT_BRANCH),
+            "status": g["status"],
+            "stage": g.get("stage", ""),
+            "progress": int(g.get("progress") or 0),
+            "tookS": "" if g.get("took_s") in (None, "") else str(g["took_s"]),
+            "error": g.get("error", ""),
+            "added": g.get("added", ""),
+            "members": len(g.get("fids", [])),
+            "hasHtml": (self.reports_dir / f"{gid}.html").is_file(),
+            "hasPdf": False,
+        }
+
     def list_files(self) -> list[dict]:
         with self.lock:
             self._scan_samples()
             items = [self.public(e) for e in self.entries.values()]
+            items += [self.group_public(g) for g in self.groups.values()]
         items.sort(key=lambda x: (
-            0 if x["kind"] == "sample" else 1, x["name"]))
+            0 if x["kind"] == "sample" else
+            1 if x["kind"] in ("series", "diff") else 2, x["name"]))
         return items
 
     def get(self, fid: str) -> dict | None:
@@ -177,6 +229,72 @@ class AppState:
         except OSError:
             pass
 
+    def create_series(self, fids: list[str], branch: str) -> dict:
+        """Группа-серия из существующих файлов; сразу ставится в очередь."""
+        pairs: list[tuple[str, str]] = []
+        with self.lock:
+            for fid in fids:
+                e = self.entries.get(fid)
+                if e and _ID_RE.match(fid):
+                    pairs.append((fid, e["path"]))
+            if len(pairs) < 2:
+                raise ValueError("для серии нужно минимум два файла")
+            gid = "g" + uuid.uuid4().hex[:10]
+            g = {
+                "id": gid, "kind": "trend", "branch":
+                    branch if branch in BRANCHES else DEFAULT_BRANCH,
+                "fids": [fid for fid, _p in pairs],
+                "paths": [p for _fid, p in pairs],
+                "name": f"серия из {len(pairs)} файлов",
+                "status": "queued", "stage": "", "progress": 0,
+                "error": "", "added":
+                    datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            }
+            self.groups[gid] = g
+            self._persist_group(g)
+        self.jobs.put(("series", gid))
+        return g
+
+    def create_diff(self, gid_a: str, gid_b: str) -> dict:
+        with self.lock:
+            ga, gb = self.groups.get(gid_a), self.groups.get(gid_b)
+            if not ga or not gb or ga.get("kind") != "trend" \
+                    or gb.get("kind") != "trend":
+                raise ValueError("нужны две существующие серии")
+            gid = "d" + uuid.uuid4().hex[:10]
+            g = {
+                "id": gid, "kind": "diff",
+                "branch": ga.get("branch", DEFAULT_BRANCH),
+                "fids": [gid_a, gid_b], "a": gid_a, "b": gid_b,
+                "paths": [],
+                "name": (f"{ga['name']} vs {gb['name']}"),
+                "status": "queued", "stage": "", "progress": 0,
+                "error": "", "added":
+                    datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            }
+            self.groups[gid] = g
+            self._persist_group(g)
+        self.jobs.put(("diff", gid))
+        return g
+
+    def request_cancel_group(self, gid: str) -> bool:
+        with self.lock:
+            g = self.groups.get(gid)
+            if not g or g.get("status") not in ("running", "queued"):
+                return False
+            g["cancel"] = True
+            if g["status"] == "queued":
+                g["status"] = "cancelled"
+                g["stage"] = "отменено"
+                self._persist_group(g)
+            return True
+
+    def delete_group(self, gid: str) -> None:
+        with self.lock:
+            self.groups.pop(gid, None)
+            (self.groups_dir / f"{gid}.json").unlink(missing_ok=True)
+        (self.reports_dir / f"{gid}.html").unlink(missing_ok=True)
+
     def enqueue(self, fid: str, branch: str) -> None:
         with self.lock:
             e = self.entries[fid]
@@ -187,7 +305,7 @@ class AppState:
             e["took_s"] = ""
             e["cancel"] = False
             e["error"] = ""
-        self.jobs.put(fid)
+        self.jobs.put(("file", fid))
 
     def request_cancel(self, fid: str) -> bool:
         """Пометить задание как отменённое; True, если оно было активным."""
@@ -250,94 +368,187 @@ class AppState:
                     return other
             return None
 
+    def _gstage(self, gid: str, msg: str, pct: int | None = None) -> None:
+        with self.lock:
+            g = self.groups.get(gid)
+            if g:
+                g["stage"] = msg
+                if pct is not None:
+                    g["progress"] = max(0, min(100, int(pct)))
+                if g["status"] in ("queued", "new"):
+                    g["status"] = "running"
+
+    def _run_series(self, gid: str) -> None:
+        with self.lock:
+            g = self.groups.get(gid)
+        t0 = time.monotonic()
+        paths = [Path(x) for x in g.get("paths", [])]
+
+        def prog(msg, pct=None, _gid=gid):
+            with self.lock:
+                cancelled = bool(self.groups.get(_gid, {}).get("cancel"))
+            if cancelled:
+                raise AnalysisCancelled()
+            self._gstage(_gid, msg, pct)
+
+        branch = get_branch(g.get("branch", DEFAULT_BRANCH))
+        points, took = build_trend(paths, branch, DEFAULT_CONFIG,
+                                   progress=prog)
+        html = render_trend_html(points, branch.title,
+                                 g.get("name") or gid)
+        (self.reports_dir / f"{gid}.html").write_text(html, encoding="utf-8")
+        with self.lock:
+            g2 = self.groups.get(gid)
+            g2.update(status="done", progress=100,
+                      took_s=round(time.monotonic() - t0, 1),
+                      stage=f"готово: {len(points)} файлов за {took:.0f} c",
+                      error="")
+            self._persist_group(g2)
+
+    def _run_diff(self, gid: str) -> None:
+        with self.lock:
+            g = self.groups.get(gid)
+            ga = self.groups.get(g.get("a"))
+            gb = self.groups.get(g.get("b"))
+        branch = get_branch(ga.get("branch", DEFAULT_BRANCH))
+
+        def prog(msg, pct=None, _gid=gid):
+            with self.lock:
+                cancelled = bool(self.groups.get(_gid, {}).get("cancel"))
+            if cancelled:
+                raise AnalysisCancelled()
+            self._gstage(_gid, msg, pct)
+
+        pa, ta = build_trend([Path(x) for x in ga.get("paths", [])],
+                             branch, DEFAULT_CONFIG, progress=prog)
+        pb, tb = build_trend([Path(x) for x in gb.get("paths", [])],
+                             branch, DEFAULT_CONFIG, progress=prog)
+        html = render_diff_html(pa, pb, ga["name"], gb["name"], branch.title)
+        (self.reports_dir / f"{gid}.html").write_text(html, encoding="utf-8")
+        with self.lock:
+            g2 = self.groups.get(gid)
+            g2.update(status="done", progress=100,
+                      took_s=round(ta + tb, 1),
+                      stage=f"готово ({len(pa)}+{len(pb)} файлов)",
+                      error="")
+            self._persist_group(g2)
+
     def _worker(self) -> None:
         while True:
-            fid = self.jobs.get()
-            with self.lock:
-                e = self.entries.get(fid)
+            kind, fid = self.jobs.get()
+            if kind == "series":
+                self._guarded(self._run_series, fid)
+                continue
+            if kind == "diff":
+                self._guarded(self._run_diff, fid)
+                continue
+            e = self._file_job(fid)
             if not e:
                 continue
+
+    def _guarded(self, fn, gid: str) -> None:
+        try:
+            fn(gid)
+        except AnalysisCancelled:
             with self.lock:
-                if e.get("cancel"):
-                    # отменено, пока лежало в очереди
-                    e["status"] = "cancelled"
-                    e["stage"] = "анализ отменён"
-                    continue
-                e["status"] = "running"
-            branch = get_branch(e.get("branch", DEFAULT_BRANCH))
-            t0 = time.monotonic()
+                g = self.groups.get(gid)
+                if g:
+                    g.update(status="cancelled", stage="анализ отменён")
+                    self._persist_group(g)
+        except Exception as ex:                  # noqa: BLE001 — статус в UI
+            with self.lock:
+                g = self.groups.get(gid)
+                if g:
+                    g.update(status="error", error=str(ex))
+                    self._persist_group(g)
 
-            def progress(m: str, pct: int | None = None, _fid=fid) -> None:
-                with self.lock:
-                    cancelled = bool(self.entries.get(_fid, {}).get("cancel"))
-                if cancelled:
-                    raise AnalysisCancelled()
-                self._stage(_fid, m, pct)
+    def _file_job(self, fid: str):
+        """Обработка одного файла; вернуть None, если задание отброшено."""
+        with self.lock:
+            e = self.entries.get(fid)
+        if not e:
+            return None
+        with self.lock:
+            if e.get("cancel"):
+                # отменено, пока лежало в очереди
+                e["status"] = "cancelled"
+                e["stage"] = "анализ отменён"
+                return None
+            e["status"] = "running"
+        branch = get_branch(e.get("branch", DEFAULT_BRANCH))
+        t0 = time.monotonic()
 
-            try:
-                # кэш по содержимому: идентичный дамп с готовым отчётом
-                # той же ветки — просто переиспользуем результат
-                progress("  контрольная сумма файла…")
-                sha = self._sha256_file(Path(e["path"]))
-                with self.lock:
-                    e["sha256"] = sha
-                cached = self._find_cached(fid, sha, branch.name)
-                if cached is not None:
-                    for ext in ("html", "pdf"):
-                        src = self.reports_dir / f"{cached['id']}.{ext}"
-                        dst = self.reports_dir / f"{fid}.{ext}"
-                        if src.is_file():
-                            shutil.copyfile(src, dst)
-                    took = round(time.monotonic() - t0, 1)
-                    with self.lock:
-                        e["captured"] = cached.get("captured", "")
-                        e["status"] = "done"
-                        e["progress"] = 100
-                        e["took_s"] = took
-                        e["stage"] = (f"готово за {took:g} с "
-                                      "(отчёт из кэша: идентичный файл "
-                                      "уже анализировался)")
-                        e["error"] = ""
-                        self._persist(e)
-                    continue
-                result = branch.analyze(
-                    Path(e["path"]), DEFAULT_CONFIG,
-                    progress=progress,
-                    tshark_bin=self.tshark_bin)
-                # момент снятия дампа — для имени файлов экспорта
-                e["captured"] = (
-                    datetime.fromtimestamp(result.capture_start_ts)
-                    .strftime("%Y-%m-%d_%H-%M-%S")
-                    if result.capture_start_ts else "")
-                (self.reports_dir / f"{fid}.html").write_text(
-                    render_document(result), encoding="utf-8")
-                pdf_err = ""
-                try:
-                    (self.reports_dir / f"{fid}.pdf").write_bytes(
-                        render_pdf_bytes(result))
-                except Exception as pe:              # PDF не критичен
-                    pdf_err = f"PDF не собран: {pe}"
+        def progress(m: str, pct: int | None = None, _fid=fid) -> None:
+            with self.lock:
+                cancelled = bool(self.entries.get(_fid, {}).get("cancel"))
+            if cancelled:
+                raise AnalysisCancelled()
+            self._stage(_fid, m, pct)
+
+        try:
+            # кэш по содержимому: идентичный дамп с готовым отчётом
+            # той же ветки — просто переиспользуем результат
+            progress("  контрольная сумма файла…")
+            sha = self._sha256_file(Path(e["path"]))
+            with self.lock:
+                e["sha256"] = sha
+            cached = self._find_cached(fid, sha, branch.name)
+            if cached is not None:
+                for ext in ("html", "pdf"):
+                    src = self.reports_dir / f"{cached['id']}.{ext}"
+                    dst = self.reports_dir / f"{fid}.{ext}"
+                    if src.is_file():
+                        shutil.copyfile(src, dst)
                 took = round(time.monotonic() - t0, 1)
                 with self.lock:
+                    e["captured"] = cached.get("captured", "")
                     e["status"] = "done"
                     e["progress"] = 100
                     e["took_s"] = took
-                    e["stage"] = f"готово за {took:g} с" + \
-                        (f" ({pdf_err})" if pdf_err else "")
+                    e["stage"] = (f"готово за {took:g} с "
+                                  "(отчёт из кэша: идентичный файл "
+                                  "уже анализировался)")
                     e["error"] = ""
                     self._persist(e)
-            except AnalysisCancelled:
-                with self.lock:
-                    e["status"] = "cancelled"
-                    e["took_s"] = round(time.monotonic() - t0, 1)
-                    e["stage"] = "анализ отменён"
-                    self._persist(e)
-            except Exception as ex:                  # noqa: BLE001 — статус в UI
-                with self.lock:
-                    e["status"] = "error"
-                    e["took_s"] = round(time.monotonic() - t0, 1)
-                    e["error"] = str(ex)
-                    self._persist(e)
+                return e
+            result = branch.analyze(
+                Path(e["path"]), DEFAULT_CONFIG,
+                progress=progress,
+                tshark_bin=self.tshark_bin)
+            # момент снятия дампа — для имени файлов экспорта
+            e["captured"] = (
+                datetime.fromtimestamp(result.capture_start_ts)
+                .strftime("%Y-%m-%d_%H-%M-%S")
+                if result.capture_start_ts else "")
+            (self.reports_dir / f"{fid}.html").write_text(
+                render_document(result), encoding="utf-8")
+            pdf_err = ""
+            try:
+                (self.reports_dir / f"{fid}.pdf").write_bytes(
+                    render_pdf_bytes(result))
+            except Exception as pe:              # PDF не критичен
+                pdf_err = f"PDF не собран: {pe}"
+            took = round(time.monotonic() - t0, 1)
+            with self.lock:
+                e["status"] = "done"
+                e["progress"] = 100
+                e["took_s"] = took
+                e["stage"] = f"готово за {took:g} с" + \
+                    (f" ({pdf_err})" if pdf_err else "")
+                e["error"] = ""
+                self._persist(e)
+        except AnalysisCancelled:
+            with self.lock:
+                e["status"] = "cancelled"
+                e["took_s"] = round(time.monotonic() - t0, 1)
+                e["stage"] = "анализ отменён"
+                self._persist(e)
+        except Exception as ex:                  # noqa: BLE001 — статус в UI
+            with self.lock:
+                e["status"] = "error"
+                e["took_s"] = round(time.monotonic() - t0, 1)
+                e["error"] = str(ex)
+                self._persist(e)
 
 
 # ---------------------------------------------------------------------------
@@ -476,14 +687,20 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
             with open(path, "rb") as f:
                 shutil.copyfileobj(f, self.wfile)
 
-        def _entry_or_404(self, fid: str):
+        def _target_exists(self, fid: str) -> bool:
+            """Файл или группа (серия/дифф) с таким идентификатором."""
+            with state.lock:
+                return fid in state.entries or fid in state.groups
+
+        def _view_target(self, fid: str):
+            """Проверка id для /view и /export (файлы и группы)."""
             if not _ID_RE.match(fid):
                 self._json({"error": "некорректный идентификатор"}, 400)
-                return None
-            e = state.get(fid)
-            if not e:
+                return False
+            if not self._target_exists(fid):
                 self._json({"error": "файл не найден"}, 404)
-            return e
+                return False
+            return True
 
         # -- GET -------------------------------------------------------------
         def do_GET(self):                        # noqa: N802 (стандарт API)
@@ -513,6 +730,15 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                      "default": k == DEFAULT_BRANCH}
                     for k in sorted(BRANCHES)])
                 return
+            m = re.fullmatch(r"/api/groups/([A-Za-z0-9_-]+)", path)
+            if m:
+                with state.lock:
+                    g = state.groups.get(m.group(1))
+                    if not g:
+                        self._json({"error": "серия не найдена"}, 404)
+                        return
+                    self._json(state.group_public(g))
+                return
             m = re.fullmatch(r"/api/status/([A-Za-z0-9_-]+)", path)
             if m:
                 e = self._entry_or_404(m.group(1))
@@ -521,10 +747,9 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 return
             m = re.fullmatch(r"/view/([A-Za-z0-9_-]+)", path)
             if m:
-                e = self._entry_or_404(m.group(1))
-                if not e:
+                if not self._view_target(m.group(1)):
                     return
-                rep = state.reports_dir / f"{e['id']}.html"
+                rep = state.reports_dir / f"{m.group(1)}.html"
                 if rep.is_file():
                     self._file(rep, _CT[".html"])
                 else:
@@ -532,8 +757,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 return
             m = re.fullmatch(r"/export/([A-Za-z0-9_-]+)", path)
             if m:
-                e = self._entry_or_404(m.group(1))
-                if not e:
+                if not self._view_target(m.group(1)):
                     return
                 fmt = (parse_qs(u.query).get("fmt") or ["html"])[0]
                 ext = {"html": "html", "pdf": "pdf"}.get(fmt)
@@ -544,8 +768,14 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 if not rep.is_file():
                     self._json({"error": "отчёт в этом формате не готов"}, 404)
                     return
-                base = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(e["name"]).stem)
-                ts_part = f"_{e['captured']}" if e.get("captured") else ""
+                with state.lock:
+                    tgt = state.entries.get(m.group(1)) \
+                        or state.groups.get(m.group(1))
+                src_name = tgt["name"] if tgt else m.group(1)
+                captured = tgt.get("captured", "") if tgt else ""
+                base = re.sub(r"[^A-Za-z0-9._-]+", "_",
+                              Path(src_name).stem or "report")
+                ts_part = f"_{captured}" if captured else ""
                 self._file(rep, _CT[f".{ext}"],
                            download=f"отчет_{base}{ts_part}.{ext}")
                 return
@@ -586,6 +816,62 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                         return
                 state.enqueue(e["id"], branch)
                 self._json(state.public(state.get(e["id"])), 202)
+                return
+            m = re.fullmatch(r"/api/series", u.path)
+            if m:
+                length = self._content_length()
+                if length < 0 or length > (64 << 10):
+                    self._json({"error": "некорректное тело запроса"}, 400)
+                    return
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                    fids = [str(x) for x in body.get("fids", [])]
+                    branch = body.get("branch", DEFAULT_BRANCH)
+                except (ValueError, UnicodeDecodeError):
+                    self._json({"error": "ожидается JSON"}, 400)
+                    return
+                if branch not in BRANCHES:
+                    self._json({"error": "неизвестная ветка анализа"}, 400)
+                    return
+                try:
+                    g = state.create_series(fids, branch)
+                except ValueError as ve:
+                    self._json({"error": str(ve)}, 400)
+                    return
+                self._json(state.group_public(g), 201)
+                return
+            m = re.fullmatch(r"/api/diff", u.path)
+            if m:
+                length = self._content_length()
+                if length < 0 or length > (64 << 10):
+                    self._json({"error": "некорректное тело запроса"}, 400)
+                    return
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                    gid_a, gid_b = str(body.get("a", "")), str(body.get("b", ""))
+                except (ValueError, UnicodeDecodeError):
+                    self._json({"error": "ожидается JSON"}, 400)
+                    return
+                if not (_ID_RE.match(gid_a) and _ID_RE.match(gid_b)):
+                    self._json({"error": "некорректный идентификатор серии"}, 400)
+                    return
+                try:
+                    g = state.create_diff(gid_a, gid_b)
+                except ValueError as ve:
+                    self._json({"error": str(ve)}, 400)
+                    return
+                self._json(state.group_public(g), 201)
+                return
+            m = re.fullmatch(r"/api/groups/([A-Za-z0-9_-]+)/cancel", u.path)
+            if m:
+                if not state.request_cancel_group(m.group(1)):
+                    self._json({"error": "задание не запущено"}, 409)
+                    return
+                with state.lock:
+                    g = state.groups.get(m.group(1))
+                    self._json(state.group_public(g) if g else {"ok": True})
                 return
             m = re.fullmatch(r"/api/files/([A-Za-z0-9_-]+)/cancel", u.path)
             if m:
@@ -641,13 +927,26 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
         # -- DELETE --------------------------------------------------------------
         def do_DELETE(self):                     # noqa: N802
-            m = re.fullmatch(r"/api/files/([A-Za-z0-9_-]+)",
-                             urlparse(self.path).path)
+            path = urlparse(self.path).path
+            mg = re.fullmatch(r"/api/groups/([A-Za-z0-9_-]+)", path)
+            if mg:
+                with state.lock:
+                    g = state.groups.get(mg.group(1))
+                if not g:
+                    self._json({"error": "серия не найдена"}, 404)
+                    return
+                state.delete_group(mg.group(1))
+                self._json({"ok": True})
+                return
+            m = re.fullmatch(r"/api/files/([A-Za-z0-9_-]+)", path)
             if not m:
                 self._json({"error": "нет такого маршрута"}, 404)
                 return
             e = self._entry_or_404(m.group(1))
             if not e:
+                return
+            if not e:
+                self._json({"error": "файл не найден"}, 404)
                 return
             if e["kind"] == "sample":
                 self._json({"error": "образцы удалять нельзя"}, 403)

@@ -62,6 +62,11 @@ button:disabled { opacity:.5; cursor:default; }
 .empty { color:var(--muted); text-align:center; padding:26px 8px; }
 .tag-sample { font-size:10.5px; color:#1e40af; background:#dbeafe;
        border-radius:4px; padding:1px 6px; }
+.tag-series { font-size:10.5px; color:#854d0e; background:#fef9c4;
+       border-radius:4px; padding:1px 6px; }
+.file.selset { outline:2px dashed var(--accent); }
+.cmpbar { background:#fffbeb; border:1px solid #fcd34d; border-radius:7px;
+       padding:6px 10px; font-size:12px; margin-top:6px; display:none; }
 .hint { color:var(--muted); font-size:11.5px; }
 </style>
 </head>
@@ -84,7 +89,12 @@ button:disabled { opacity:.5; cursor:default; }
       <div class="hint" style="margin-top:8px;" id="uphint"></div>
     </div>
     <div class="panel" style="flex:1; display:flex; flex-direction:column;">
-      <h2>Файлы</h2>
+      <h2>Файлы и серии</h2>
+      <div class="row" id="seriesbar" style="display:none; margin-bottom:8px;">
+        <span class="hint" id="selcount"></span>
+        <button class="primary" id="mkseries">Создать серию</button>
+        <button id="clearsel">Сброс</button>
+      </div>
       <div id="files"><div class="empty">Загрузка…</div></div>
     </div>
   </div>
@@ -105,6 +115,9 @@ const $ = (id) => document.getElementById(id);
 let FILES = [];
 let SEL = null;
 let POLL = null;
+const SELSET = new Set();     // файлы, выбранные в серию
+let CMP_A = null;             // первая серия для сравнения
+let CMP_HINT = null;          // элемент подсказки
 
 function fmtSize(b) {
   if (b == null) return "";
@@ -171,12 +184,51 @@ function renderFiles() {
       st.style.color = "#b91c1c"; st.textContent = f.error || "";
       d.appendChild(st);
     }
+    if (f.kind === "series" || f.kind === "diff") {
+      const t2 = document.createElement("span"); t2.className = "tag-series";
+      t2.textContent = f.kind === "diff" ? "дифф" : "серия";
+      t2.style.marginLeft = "6px"; nm.appendChild(t2);
+    }
     const acts = document.createElement("div"); acts.className = "acts";
-    const bAn = document.createElement("button");
-    bAn.textContent = "Анализ";
-    bAn.disabled = f.status === "running" || f.status === "queued";
-    bAn.onclick = (ev) => { ev.stopPropagation(); analyze(f.id, f.branch); };
-    acts.appendChild(bAn);
+
+    // --- группа (серия/дифф): открыть, сравнить, отменить, удалить ---
+    if (f.kind === "series") {
+      const bCmp = document.createElement("button");
+      bCmp.textContent = CMP_A === f.id ? "выбрано (А)" : "Сравнить";
+      bCmp.disabled = f.status !== "done";
+      bCmp.onclick = (ev) => {
+        ev.stopPropagation();
+        if (!CMP_A) { CMP_A = f.id; renderFiles();
+          showCmpHint(f.name); return; }
+        if (CMP_A === f.id) { CMP_A = null; hideCmpHint(); renderFiles(); return; }
+        createDiff(CMP_A, f.id);
+        CMP_A = null; hideCmpHint();
+      };
+      acts.appendChild(bCmp);
+    }
+    if (f.hasHtml) {
+      const bH = document.createElement("button"); bH.textContent = "Открыть";
+      bH.onclick = (ev) => { ev.stopPropagation(); select(f.id); };
+      acts.appendChild(bH);
+    }
+
+    // --- обычный файл: анализ, отметить в серию ---
+    if (f.kind !== "series" && f.kind !== "diff") {
+      const bAn = document.createElement("button");
+      bAn.textContent = "Анализ";
+      bAn.disabled = f.status === "running" || f.status === "queued";
+      bAn.onclick = (ev) => { ev.stopPropagation(); analyze(f.id, f.branch); };
+      acts.appendChild(bAn);
+      const bS = document.createElement("button");
+      bS.textContent = SELSET.has(f.id) ? "✓ в серии" : "в серию";
+      if (SELSET.has(f.id)) d.classList.add("selset");
+      bS.onclick = (ev) => {
+        ev.stopPropagation();
+        if (SELSET.has(f.id)) SELSET.delete(f.id); else SELSET.add(f.id);
+        renderFiles(); updateSeriesBar();
+      };
+      acts.appendChild(bS);
+    }
     if (f.status === "running" || f.status === "queued") {
       const bC = document.createElement("button");
       bC.textContent = "Отменить"; bC.className = "danger";
@@ -192,13 +244,25 @@ function renderFiles() {
       bH.onclick = (ev) => { ev.stopPropagation(); select(f.id); };
       acts.appendChild(bH);
     }
+    if (f.kind === "series" || f.kind === "diff") {
+      if (f.status === "running" || f.status === "queued") {
+        const bX = document.createElement("button");
+        bX.textContent = "Отменить"; bX.className = "danger";
+        bX.onclick = async (ev) => { ev.stopPropagation();
+          await api("/api/groups/" + f.id + "/cancel", {method:"POST"});
+          loadFiles(); };
+        acts.appendChild(bX);
+      }
+    }
     if (f.kind !== "sample") {
       const bD = document.createElement("button"); bD.textContent = "Удалить";
       bD.className = "danger";
       bD.onclick = async (ev) => {
         ev.stopPropagation();
-        if (!confirm("Удалить файл «" + f.name + "»?")) return;
-        await api("/api/files/" + f.id, {method: "DELETE"});
+        if (!confirm("Удалить «" + f.name + "»?")) return;
+        const url = (f.kind === "series" || f.kind === "diff")
+          ? "/api/groups/" + f.id : "/api/files/" + f.id;
+        await api(url, {method: "DELETE"});
         if (SEL === f.id) { SEL = null; $("viewer").src = "about:blank";
           updateBar(null); }
         loadFiles();
@@ -242,6 +306,43 @@ function schedulePoll() {
       schedulePoll();
     } catch (e) { schedulePoll(); }
   }, 1500);
+}
+
+function updateSeriesBar() {
+  const bar = $("seriesbar");
+  bar.style.display = SELSET.size ? "flex" : "none";
+  $("selcount").textContent = "Выбрано файлов: " + SELSET.size;
+}
+
+$("clearsel").onclick = () => { SELSET.clear(); renderFiles(); updateSeriesBar(); };
+
+$("mkseries").onclick = async () => {
+  if (SELSET.size < 2) return;
+  try {
+    await api("/api/series", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({fids:[...SELSET], branch:$("branch").value})});
+    SELSET.clear(); updateSeriesBar(); loadFiles();
+  } catch(e) { alert("Не удалось создать серию: " + e.message); }
+};
+
+function showCmpHint(name) {
+  hideCmpHint();
+  CMP_HINT = document.createElement("div");
+  CMP_HINT.className = "cmpbar";
+  CMP_HINT.style.display = "block";
+  CMP_HINT.textContent = "Период А: «" + name + "». Теперь нажмите «Сравнить» у второй серии.";
+  $("files").prepend(CMP_HINT);
+}
+function hideCmpHint() { if (CMP_HINT) { CMP_HINT.remove(); CMP_HINT = null; } }
+
+async function createDiff(a, b) {
+  try {
+    await api("/api/diff", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({a, b})});
+    loadFiles();
+  } catch(e) { alert("Не удалось запустить сравнение: " + e.message); }
 }
 
 async function analyze(id, branch) {
