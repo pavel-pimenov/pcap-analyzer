@@ -15,7 +15,8 @@
 кириллицей ставятся apt-пакетами (см. `Dockerfile`).
 
 Ветки анализа (протоколы): `modbus` (Modbus/TCP, порт 502) и `s7comm`
-(Siemens S7 Communication, порт 102), реестр — `BRANCHES` в
+(Siemens S7 Communication, порт 102) и **services** (TCP/UDP-сервисы
+без дизассемблера), реестр — `BRANCHES` в
 `analyzer/branches/__init__.py`.
 
 ## Ключевые соглашения
@@ -33,6 +34,14 @@
   `analyzer/report/components.py` внутри обёртки `<div class="cmd-line">`;
   обработчик — инлайновый `_CLIPBOARD_JS` в `html_report.py`, на печать
   кнопка скрывается в `_PRINT_CSS`.
+* Числовые метрики для трендов ветка складывает в `BranchResult.metrics`
+  (ключи — латиницей; человекочитаемые названия — в
+  `report/trend_report.py::METRIC_TITLES`). Трендам не нужен Гант:
+  `Config.skip_gantt` (build_trend включает сам).
+* Время в отчётах — через `base.epoch_to_str` (зона: `--tz` /
+  `Config.display_tz_offset`, `base.set_display_tz` до запуска анализа).
+* Выборки значений (RTT, интервалы) — только через `Reservoir`
+  (лимиты из Config), никаких «всех значений в список».
 * Цвета серверов (PLC) едины на весь документ: ветки вызывают
   `BaseBranch._set_servers(...)` (после прохода, где известны пары), ячейки
   с IP сервера — только через `BaseBranch._srv_cell(ip)`. Карта цветов
@@ -59,14 +68,18 @@ analyzer/
 │   │                     # timeline_svg/vbar_svg/hbar_svg/coverage_svg,
 │   │                     # gantt_svg; WARM_TINTS/WARM_STRONG — цвета PLC
 │   ├── html_report.py    # render_document(BranchResult) -> один HTML-файл
-│   └── pdf_report.py     # render_pdf_bytes/render_pdf_file: HTML -> PDF
+│   ├── pdf_report.py     # HTML -> PDF (_PRINT_CSS)
+│   ├── trend_report.py   # render_trend_html: серия -> графики + матрица правил
+│   └── diff_report.py    # render_diff_html: «до/после» (ΔKPI, статусы правил)
+├── trend.py              # серии дампов → точки тренда (build_trend, --jobs N)
 ├── webapp/
-│   ├── server.py         # http.server: загрузка, очередь анализа, /view, /export
+│   ├── server.py         # http.server: файлы/группы(серии,дифф), /view, /export,
+│   │                     # /api/series, /api/diff, токен (--token), HTTP/1.1
 │   └── page.py           # одностраничный интерфейс (всё инлайном)
 └── branches/
     ├── base.py           # BaseBranch, BranchResult, Section, Recommendation, KpiItem,
     │                     # Reservoir, общие утилиты (to_int/percentile/…), Гант-хелперы
-    ├── __init__.py       # BRANCHES = {"modbus": ModbusTcpAnalyzer, "s7comm": S7CommAnalyzer}
+    ├── __init__.py       # BRANCHES: modbus / s7comm / services
     ├── modbus_tcp.py     # два прохода по pcap + правила рекомендаций
     ├── s7comm.py         # ветка S7comm (Siemens, порт 102)
     └── services.py       # ветка TCP/UDP-сервисов без дизассемблера
@@ -92,6 +105,13 @@ python3 -m analyzer analyze pcap-sample/<образец>.pcap -o /tmp/report -f 
 # веб-GUI: загрузить образец через POST /api/upload, дождаться done,
 # проверить /view/<id> и /export/<id>?fmt=pdf
 python3 -m analyzer serve --port 8125 --data-dir /tmp/webdata --samples-dir pcap-sample
+
+# тренды и сравнение серий (параллельно):
+python3 -m analyzer trend "pcap-sample/plc_cgn_*.pcap" -b s7comm --jobs 4 -o /tmp/trend.html
+python3 -m analyzer diff "dump/before_*.pcap" "dump/after_*.pcap" -b modbus -o /tmp/diff.html
+
+# конфигурация порогов и зона времени:
+python3 -m analyzer analyze <pcap> --config thresholds.toml --tz 3 -o /tmp/r.html
 ```
 
 Критерии корректности (сверяются с tshark напрямую):
@@ -153,6 +173,18 @@ Batch-анализ — профиль `batch` (`docker compose run --rm analyzer
 Правки только в `_PRINT_CSS` (`analyzer/report/pdf_report.py`): @page, поля,
 нумерация, запрет разрывов (`.rec`, `.cmd-row`, `tr { page-break-inside }`).
 Контент трогать нельзя — он общий с HTML.
+
+### Добавить метрику в тренды
+1. В конце `analyze()` ветки дополнить `result.metrics["ключ"] = float`.
+2. Название по ключу — в `METRIC_TITLES` (trend_report.py).
+График появится автоматически у trend/diff.
+
+### Починить сопоставление Job/Ack_Data (S7)
+Логика — `_pass_s7`: сопоставление по `(tcp.stream, s7comm.header.pduref)`;
+очередь на ключ ограничена (`s7_max_pending_per_ref`), RTT выше
+`s7_rtt_sanity_max_sec` считается потерянной транзакцией. Значения чтений
+достаются вручную из `tcp.payload` (`_value_digests`) — полей с байтами
+данных в tshark нет; длины элементов берутся из `s7comm.data.length`.
 
 ### Починить сопоставление запросов и ответов
 

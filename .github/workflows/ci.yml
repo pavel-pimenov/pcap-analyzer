@@ -28,6 +28,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fixtures"
           python tests/pcapgen.py "$RUNNER_TEMP/fixtures/modbus_smoke.pcap"
 
+      - name: Линтер (ruff: синтаксис и неопределённые имена)
+        run: |
+          python -m pip install ruff
+          python -m ruff check .
+
       - name: Тесты (unittest)
         env:
           PCAP_SAMPLES: ${{ runner.temp }}/fixtures
