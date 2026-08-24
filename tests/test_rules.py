@@ -158,8 +158,11 @@ class SlowServersRuleTest(unittest.TestCase):
 
 class ExceptionsRuleTest(unittest.TestCase):
     def _mb(self, exc: int, resp: int) -> dict:
+        from collections import Counter as _C
         return {"exc_total": exc, "resp_total": resp,
-                "exc_counter": {(("10.0.0.1"), 1, 2): exc}}
+                "exc_counter": _C({("10.0.0.1", 1, 2): exc}),
+                "exc_targets": _C({("10.0.0.9", "10.0.0.1", 1, 3,
+                                    200, 1, 2): exc})}
 
     def test_below_threshold_silent(self):
         self.assertEqual(_branch()._rule_exceptions(self._mb(1, 1000)), [])
