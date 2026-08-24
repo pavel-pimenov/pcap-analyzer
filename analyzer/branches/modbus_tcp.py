@@ -355,6 +355,9 @@ class ModbusTcpAnalyzer(BaseBranch):
             "poll_targets": {},          # ключ -> PollTarget
             "valtrack": {},              # (server,unit,fc,reg) -> [last,changes,reads]
             "exc_counter": Counter(),    # (server,unit,code) -> count
+            # кто какими запросами вызвал исключения:
+            # (client,server,unit,fc,ref,cnt,code) -> раз
+            "exc_targets": Counter(),
             "timeline": {},              # bucket -> [req,resp,exc]
             "stream_reqs": Counter(),    # tcp.stream -> число запросов
             "mb_streams": set(),
@@ -429,6 +432,12 @@ class ModbusTcpAnalyzer(BaseBranch):
                         mb["exc_total"] += 1
                         code = to_int(exc_field, -1)
                         mb["exc_counter"][(server, unit_p, code)] += 1
+                        # привязка к конкретному запросу: клиент, функция,
+                        # диапазон регистров (req.ref/req.cnt из запроса)
+                        if req is not None:
+                            mb["exc_targets"][
+                                (req.src, server, unit_p, fc,
+                                 req.ref, max(req.cnt, 1), code)] += 1
                         mb["timeline"][bucket][2] += 1
                     else:
                         # значения регистров FC3/FC4 -> трекинг изменений
@@ -1171,6 +1180,33 @@ class ModbusTcpAnalyzer(BaseBranch):
             exc_tbl = ('<h3 class="subhead">Исключения Modbus</h3>'
                        + C.table_html(["Сервер", "Unit", "Код", "Расшифровка", "Кол-во"],
                                       rows))
+        tgt_rows = []
+        for (cl, sv, unit, fc, ref, cnt, code), n in sorted(
+                mb["exc_targets"].items(),
+                key=lambda kv: kv[1], reverse=True)[:10]:
+            rng = (f"{ref}&ndash;{ref + cnt - 1}" if cnt > 1 else str(ref))
+            tgt_rows.append([
+                f"<strong>{C.esc(cl)}</strong>",
+                self._srv_cell(sv),
+                C.fmt_int(unit),
+                f"FC{fc}",
+                f"<code class=\"inline\">{rng}</code>",
+                f"<strong>{code}</strong> "
+                f'<span class="note">{EXC_NAMES.get(code, "")}</span>',
+                f'<span class="num">{C.fmt_int(n)}</span>',
+            ])
+        tgt_tbl = ""
+        if tgt_rows:
+            tgt_tbl = (
+                '<h3 class="subhead">Кто и какими запросами вызывает '
+                "ошибки</h3>"
+                + C.table_html(
+                    ["Клиент", "Сервер", "Unit", "Функция", "Регистр(ы)",
+                     "Код", "Раз"], tgt_rows)
+                + '<p class="note">Диапазон восстановлен из запроса, вызвавшего '
+                  'исключение: так видно, какой именно клиент читает/пишет '
+                  'несуществующие регистры. Чинится на стороне клиента '
+                  '(теги/карта опроса) либо расширением карты устройства.</p>')
         rst_note = (
             f"<p>RST на порту 502: <strong>{gen.rst502}</strong>, FIN: "
             f"<strong>{gen.fin502}</strong>, запросов без ответа: <strong>{no_resp}</strong> "
@@ -1180,7 +1216,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         if mb["unanswered_frames"]:
             frames = ", ".join(f"#{n}" for n in mb["unanswered_frames"])
             unans = f'<p class="note">Примеры кадров без ответа: {frames}.</p>'
-        body = rst_note + exc_tbl + unans + (
+        body = rst_note + exc_tbl + tgt_tbl + unans + (
             '<p class="note">Исключение — это штатный отказ slave-устройства: неверный адрес '
             "регистра, неподдерживаемая функция, занятость. Регулярные исключения означают "
             "ошибку конфигурации клиента или перегрузку устройства.</p>"
@@ -1414,6 +1450,13 @@ class ModbusTcpAnalyzer(BaseBranch):
         codes = Counter()
         for (_sv, _u, code), n in mb["exc_counter"].items():
             codes[code] += n
+        tgt_ev = [
+            f"{cl} → {sv} u{u} FC{f} @{r}..{r + c - 1 if c > 1 else r}: "
+            f"{n}× {code}"
+            for (cl, sv, u, f, r, c, code), n in sorted(
+                mb["exc_targets"].items(), key=lambda kv: kv[1],
+                reverse=True)[:3]
+        ]
         ev = [
             f"код {code}: {EXC_NAMES.get(code, '?')} — {n} раз"
             for code, n in codes.most_common(5)
@@ -1433,7 +1476,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                 "SLAVE DEVICE BUSY (6) — снизить темп опроса или разбить на группы. "
                 "Каждое исключение — бесполезная транзакция, тратящая цикл сервера."
             ),
-            evidence=ev,
+            evidence=tgt_ev + ev,
             commands=[
                 self._cmd("-Y \"modbus.exception_code\" -T fields -e ip.dst "
                           "-e mbtcp.unit_id -e modbus.func_code "

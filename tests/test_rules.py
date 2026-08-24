@@ -356,6 +356,30 @@ class MultipartParserTest(unittest.TestCase):
             self._parse(_multipart_body(payload), limit=50_000)
 
 
+class ExcTargetsTableTest(unittest.TestCase):
+    """Таблица «кто и какими запросами вызывает исключения»."""
+
+    def test_table_shows_client_and_range(self):
+        from analyzer.branches.modbus_tcp import GeneralStats
+        b = _branch()
+        gen = GeneralStats()
+        gen.first_ts, gen.last_ts = 0.0, 600.0
+        from collections import Counter as _C
+        mb = {
+            "exc_counter": _C({("10.0.0.1", 1, 2): 7}),
+            "exc_targets": {("10.0.0.9", "10.0.0.1", 1, 3, 200, 4, 2): 7},
+            "unanswered_frames": [],
+            "pairs": {},
+            "req_total": 500,
+        }
+        html = b._sec_errors(gen, mb).body_html
+        self.assertIn("какими запросами вызывает", html)
+        self.assertIn("10.0.0.9", html)
+        self.assertIn("200&ndash;203", html)
+        recs = b._rule_exceptions(mb | {"exc_total": 10, "resp_total": 100})
+        self.assertTrue(recs[0].evidence[0].startswith("10.0.0.9 →"))
+
+
 class ConnectionsTableTest(unittest.TestCase):
     """Таблица соединений: RST показывается независимо от «кто закрыл первым»."""
 
