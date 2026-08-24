@@ -63,6 +63,9 @@ class AppState:
         self.reports_dir = self.data_dir / "reports"
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        # обрывки прерванных загрузок больше не нужны
+        for p in self.uploads_dir.glob("tmp-*.part"):
+            p.unlink(missing_ok=True)
         self.samples_dir = samples_dir.resolve() if samples_dir else None
         self.tshark_bin = tshark_bin
         self.lock = threading.RLock()
@@ -420,25 +423,39 @@ _CT = {
 def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "pcap-analyzer-web"
+        protocol_version = "HTTP/1.1"       # keep-alive: UI опрашивает статус каждые ~1,5 с
 
         def log_message(self, fmt, *args):       # тише в консоли
             pass
 
         # -- ответы ----------------------------------------------------------
+        def _content_length(self) -> int:
+            """Разобрать Content-Length; -1 — отсутствует/некорректное значение."""
+            raw = self.headers.get("Content-Length")
+            if raw is None or not raw.strip():
+                return 0
+            try:
+                value = int(raw.strip())
+            except ValueError:
+                return -1
+            return value if value >= 0 else -1
+
         def _json(self, obj, code: int = 200):
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", _CT[".json"])
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
 
         def _file(self, path: Path, ctype: str, download: str | None = None):
-            data = path.read_bytes()
+            """Отдать файл поточно: отчёты бывают по десяткам мегабайт."""
+            size = path.stat().st_size
             self.send_response(200)
             self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(size))
             if download:
                 # RFC 6266/5987: ascii-фолбэк + UTF-8 имя для кириллицы
                 stem = download.rsplit(".", 1)[0]
@@ -449,8 +466,10 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                     f'attachment; filename="report.{ext}"; '
                     f"filename*=UTF-8''{utf8}")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            self.wfile.write(data)
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
 
         def _entry_or_404(self, fid: str):
             if not _ID_RE.match(fid):
@@ -470,11 +489,13 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 self.send_response(200)
                 self.send_header("Content-Type", _CT[".html"])
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(body)
                 return
             if path == "/favicon.ico":
                 self.send_response(204)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             if path == "/api/files":
@@ -536,7 +557,13 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 e = self._entry_or_404(m.group(1))
                 if not e:
                     return
-                length = int(self.headers.get("Content-Length") or 0)
+                length = self._content_length()
+                if length < 0:
+                    self._json({"error": "некорректный Content-Length"}, 400)
+                    return
+                if length > (64 << 10):          # JSON с именем ветки — байты
+                    self._json({"error": "тело запроса слишком большое"}, 413)
+                    return
                 raw = self.rfile.read(length) if length else b""
                 branch = DEFAULT_BRANCH
                 if raw:
@@ -574,7 +601,10 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 self._json(
                     {"error": "ожидается multipart/form-data"}, 400)
                 return
-            length = int(self.headers.get("Content-Length") or 0)
+            length = self._content_length()
+            if length < 0:
+                self._json({"error": "некорректный Content-Length"}, 400)
+                return
             if length > MAX_UPLOAD_BYTES + (1 << 20):
                 gb = MAX_UPLOAD_BYTES >> 30
                 self._json(

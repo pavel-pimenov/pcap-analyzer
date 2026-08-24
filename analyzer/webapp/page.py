@@ -68,7 +68,7 @@ button:disabled { opacity:.5; cursor:default; }
 <body>
 <header class="top">
   <h1>pcap-analyzer</h1>
-  <div class="sub">анализ Modbus/TCP · отчёты HTML и PDF</div>
+  <div class="sub">анализ Modbus/TCP и S7comm &middot; отчёты HTML и PDF</div>
 </header>
 <main>
   <div id="left">
