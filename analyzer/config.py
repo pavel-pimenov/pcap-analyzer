@@ -3,7 +3,9 @@
 Все значения можно менять здесь, не трогая логику анализа.
 """
 
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -87,3 +89,64 @@ class Config:
 
 # Экземпляр по умолчанию
 DEFAULT_CONFIG = Config()
+
+
+def load_config(path: Path) -> Config:
+    """Загрузить конфигурацию из TOML-файла поверх значений по умолчанию.
+
+    В файле задаются только те пороги, которые нужно переопределить:
+
+        [modbus]
+        slow_rtt_p95_ms = 150.0
+
+        [services]
+        arp_storm_per_min = 60.0
+
+    Имена секций игнорируются (удобно группировать по веткам), ключи
+    должны совпадать с полями Config. Неизвестный ключ или неверный тип —
+    ошибка с понятным сообщением.
+    """
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    flat: dict[str, object] = {}
+    for section, values in data.items():
+        if not isinstance(values, dict):
+            raise ValueError(
+                f"{path}: секция [{section}] должна содержать пары "
+                "ключ=значение")
+        flat.update(values)
+    defaults = DEFAULT_CONFIG
+    valid = {f.name: f.type for f in
+             __import__("dataclasses").fields(Config)}
+    unknown = sorted(set(flat) - set(valid))
+    if unknown:
+        raise ValueError(
+            f"{path}: неизвестные ключи: {', '.join(unknown)}. Допустимо: "
+            + ", ".join(sorted(valid)))
+    coerced: dict[str, object] = {}
+    hints = {f.name: f.type for f in
+             __import__("dataclasses").fields(defaults)}
+    for k, v in flat.items():
+        hint = str(hints[k])
+        if hint.startswith("bool"):
+            if not isinstance(v, bool):
+                # допускаем строки «true/false» из других форматов
+                if isinstance(v, str) and v.lower() in ("true", "false"):
+                    v = v.lower() == "true"
+                else:
+                    raise ValueError(f"{path}: {k} ожидает true/false")
+        elif hint.startswith("int"):
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"{path}: {k} ожидает целое число")
+        elif hint.startswith("float"):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{path}: {k} ожидает число")
+            v = float(v)
+        coerced[k] = v
+    return replace_cfg(defaults, **coerced)
+
+
+def replace_cfg(cfg: Config, **kw) -> Config:
+    """dataclasses.replace без импорта в нескольких местах."""
+    from dataclasses import replace
+    return replace(cfg, **kw)

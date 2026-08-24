@@ -63,7 +63,11 @@ td span.srv, .srv-legend .srv { padding:1px 7px; border-radius:4px;
 .lg-tick { width:2px; height:13px; background:#b91c1c; }
 .lg-span { width:24px; height:9px; background:#ffe1de; border-radius:3px; }
 .lg-grid { width:1px; height:13px; background:#cbd5e1; }
-.table-scroll { overflow-x:auto; }
+.table-scroll { overflow-x:auto; position:relative; }
+.csv-btn { position:absolute; top:-9px; right:2px; font-size:10px; line-height:1;
+       padding:3px 7px; border-radius:5px; border:1px solid var(--border);
+       background:#fff; color:var(--muted); cursor:pointer; }
+.csv-btn:hover { color:var(--accent); border-color:var(--accent); }
 .chart-box { overflow-x:auto; }
 .badge { display:inline-block; padding:2px 10px; border-radius:999px;
        font-size:11.5px; font-weight:600; }
@@ -143,6 +147,54 @@ document.addEventListener("click", function(ev){
 })();
 """
 
+# Кнопка «CSV» у каждой таблицы: сериализация DOM в CSV и скачивание
+# через Blob — работает офлайн, файл остаётся полностью автономным.
+_TABLE_CSV_JS = """
+(function(){
+"use strict";
+function csvFromTable(tbl){
+  var rows=[];
+  tbl.querySelectorAll("tr").forEach(function(tr){
+    var row=[];
+    tr.querySelectorAll("th,td").forEach(function(c){
+      var t=(c.textContent||"").replace(/\s+/g," ").trim();
+      if(/[;"\n]/.test(t)) t='"'+t.replace(/"/g,'""')+'"';
+      row.push(t);
+    });
+    rows.push(row.join(";"));
+  });
+  return "\ufeff"+rows.join("\r\n");
+}
+document.addEventListener("click",function(ev){
+  var b=ev.target.closest?ev.target.closest(".csv-btn"):null;
+  if(!b) return;
+  var wrap=b.closest(".table-scroll");
+  var tbl=wrap?wrap.querySelector("table"):null;
+  if(!tbl) return;
+  var sec=tbl.closest("section.card");
+  var name="таблица";
+  if(sec){var h=sec.querySelector("h2");
+    if(h){name=h.textContent.replace(/[^\wа-яА-ЯёЁ ]+/g," ").trim()
+          .slice(0,48)||name;}}
+  var blob=new Blob([csvFromTable(tbl)],{type:"text/csv;charset=utf-8"});
+  var a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=name+".csv";
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(function(){URL.revokeObjectURL(a.href);},3000);
+});
+document.addEventListener("DOMContentLoaded",function(){
+  document.querySelectorAll(".table-scroll").forEach(function(w){
+    if(w.querySelector(".csv-btn")) return;
+    var b=document.createElement("button");
+    b.type="button";b.className="csv-btn";b.textContent="CSV";
+    b.title="Скачать таблицу в CSV (разделитель ;, кодировка UTF-8)";
+    w.appendChild(b);
+  });
+});
+})();
+"""
+
 
 def render_document(result: BranchResult) -> str:
     """Собрать полный HTML-файл отчёта (один автономный файл)."""
@@ -213,6 +265,7 @@ def render_document(result: BranchResult) -> str:
 
 </div>
 <script>{_CLIPBOARD_JS}</script>
+<script>{_TABLE_CSV_JS}</script>
 </body>
 </html>
 """

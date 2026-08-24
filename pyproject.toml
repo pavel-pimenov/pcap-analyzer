@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcap-analyzer"
+version = "0.1.0"
+description = "Анализ сетевых дампов (pcap) через tshark: отчёты HTML/PDF по Modbus/TCP, S7comm и сетевым сервисам"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.13"
+dependencies = ["weasyprint==69.0"]
+authors = [{ name = "pcap-analyzer contributors" }]
+keywords = ["pcap", "tshark", "modbus", "s7comm", "ics", "scada"]
+
+[project.scripts]
+pcap-analyzer = "analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["analyzer*"]

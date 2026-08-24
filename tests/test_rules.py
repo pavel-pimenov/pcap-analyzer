@@ -420,6 +420,51 @@ class TrendRenderTest(unittest.TestCase):
         self.assertIn("<th>Правило</th><th>1</th><th>2</th><th>3</th>", html)
 
 
+class CsvButtonTest(unittest.TestCase):
+    """Кнопка CSV есть в HTML и скрыта печатной таблицей стилей."""
+
+    def test_print_css_hides_csv_button(self):
+        from analyzer.report.pdf_report import _PRINT_CSS
+        self.assertIn(".csv-btn", _PRINT_CSS)
+
+
+class LoadConfigTest(unittest.TestCase):
+    """Загрузка порогов из TOML поверх значений по умолчанию."""
+
+    def test_load_and_override(self):
+        import tempfile
+        from analyzer.config import DEFAULT_CONFIG, load_config
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "c.toml"
+            f.write_text("[modbus]\nslow_rtt_p95_ms = 150.0\n"
+                         "[services]\narp_storm_per_min = 60\n")
+            cfg = load_config(f)
+        self.assertEqual(cfg.slow_rtt_p95_ms, 150.0)
+        self.assertEqual(cfg.arp_storm_per_min, 60.0)
+        # не заданные ключи остались дефолтными
+        self.assertEqual(cfg.gantt_window_sec,
+                         DEFAULT_CONFIG.gantt_window_sec)
+
+    def test_unknown_key_rejected(self):
+        import tempfile
+        from analyzer.config import load_config
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "bad.toml"
+            f.write_text("no_such_key = 1\n")
+            with self.assertRaises(ValueError) as ctx:
+                load_config(f)
+            self.assertIn("no_such_key", str(ctx.exception))
+
+    def test_bad_type_rejected(self):
+        import tempfile
+        from analyzer.config import load_config
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "bad2.toml"
+            f.write_text('slow_rtt_p95_ms = "быстро"\n')
+            with self.assertRaises(ValueError):
+                load_config(f)
+
+
 class DiffRenderTest(unittest.TestCase):
     """Дифф-отчёт: статусы правил и оценка метрик без tshark."""
 

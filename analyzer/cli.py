@@ -43,6 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="ветка анализа (по умолчанию: %(default)s)")
     p_an.add_argument("--tshark-bin", default=None,
                       help="путь к tshark (иначе TSHARK_BIN или PATH)")
+    p_an.add_argument("--config", default=None,
+                      help="TOML-файл с порогами правил "
+                           "(ключи как в analyzer/config.py)")
 
     # --- branches --------------------------------------------------------------
     sub.add_parser("branches", help="список доступных веток анализа")
@@ -61,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="путь к итоговому HTML (по умолчанию trend.html)")
     p_tr.add_argument("--tshark-bin", default=None,
                       help="путь к tshark (иначе TSHARK_BIN или PATH)")
+    p_tr.add_argument("--config", default=None,
+                      help="TOML-файл с порогами правил "
+                           "(ключи как в analyzer/config.py)")
 
     # --- diff -------------------------------------------------------------------
     p_df = sub.add_parser(
@@ -75,6 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="путь к итоговому HTML (по умолчанию diff.html)")
     p_df.add_argument("--tshark-bin", default=None,
                       help="путь к tshark (иначе TSHARK_BIN или PATH)")
+    p_df.add_argument("--config", default=None,
+                      help="TOML-файл с порогами правил "
+                           "(ключи как в analyzer/config.py)")
 
     # --- serve -----------------------------------------------------------------
     p_sv = sub.add_parser(
@@ -91,6 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "только чтение)")
     p_sv.add_argument("--tshark-bin", default=None,
                       help="путь к tshark (иначе TSHARK_BIN или PATH)")
+    p_sv.add_argument("--config", default=None,
+                      help="TOML-файл с порогами правил "
+                           "(ключи как в analyzer/config.py)")
     return parser
 
 
@@ -117,8 +129,20 @@ def _write_reports(result, fmt: str, out_path: Path) -> list[Path]:
     return written
 
 
+def _load_cfg(path: str | None):
+    from .config import load_config
+    if not path:
+        return DEFAULT_CONFIG
+    try:
+        return load_config(Path(path))
+    except (OSError, ValueError) as e:
+        print(f"Ошибка конфигурации: {e}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    cfg = _load_cfg(getattr(args, "config", None))
 
     if args.command == "branches":
         print("Доступные ветки анализа:")
@@ -139,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = branch.analyze(
                 pcap_path,
-                cfg=DEFAULT_CONFIG,
+                cfg=cfg,
                 progress=_progress,
                 tshark_bin=args.tshark_bin,
             )
@@ -179,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         branch = get_branch(args.branch)
         try:
             points, took = build_trend(
-                files, branch, DEFAULT_CONFIG,
+                files, branch, cfg,
                 progress=lambda m, pct=None: _progress(m),
                 tshark_bin=args.tshark_bin)
         except TsharkError as e:
@@ -214,11 +238,11 @@ def main(argv: list[str] | None = None) -> int:
             _progress(m)
 
         _progress("Период «до»…")
-        points_a, ta = build_trend(files_a, branch, DEFAULT_CONFIG,
+        points_a, ta = build_trend(files_a, branch, cfg,
                                    progress=prog,
                                    tshark_bin=args.tshark_bin)
         _progress("Период «после»…")
-        points_b, tb = build_trend(files_b, branch, DEFAULT_CONFIG,
+        points_b, tb = build_trend(files_b, branch, cfg,
                                    progress=prog,
                                    tshark_bin=args.tshark_bin)
         out = _Path(args.output)

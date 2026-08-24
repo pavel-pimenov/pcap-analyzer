@@ -179,7 +179,7 @@ class ModbusAnalyzeTest(unittest.TestCase):
 
     def test_html_is_balanced_and_has_key_blocks(self):
         self.assertTrue(_balanced_html(self.html), "HTML содержит непарные теги")
-        for frag in ('id="general"', "cmd-line", "copy-btn"):
+        for frag in ('id="general"', "cmd-line", "copy-btn", "csv-btn"):
             self.assertIn(frag, self.html)
 
     def test_examples_have_header_and_limit(self):
