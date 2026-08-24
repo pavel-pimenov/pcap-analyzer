@@ -11,6 +11,7 @@ from . import __version__
 from .branches import DEFAULT_BRANCH, BRANCHES, get_branch
 from .config import DEFAULT_CONFIG
 from .report import render_document
+from .tshark_runner import TsharkError
 
 
 def _progress(msg: str) -> None:
@@ -106,13 +107,21 @@ def main(argv: list[str] | None = None) -> int:
         branch = get_branch(args.branch)
         t0 = time.monotonic()
         _progress(f"[pcap-analyzer] Ветка: {branch.title}")
-        result = branch.analyze(
-            pcap_path,
-            cfg=DEFAULT_CONFIG,
-            progress=_progress,
-            tshark_bin=args.tshark_bin,
-        )
-        written = _write_reports(result, args.format, Path(args.output))
+        try:
+            result = branch.analyze(
+                pcap_path,
+                cfg=DEFAULT_CONFIG,
+                progress=_progress,
+                tshark_bin=args.tshark_bin,
+            )
+        except TsharkError as e:
+            print(f"Ошибка: {e}", file=sys.stderr)
+            return 1
+        try:
+            written = _write_reports(result, args.format, Path(args.output))
+        except OSError as e:
+            print(f"Ошибка записи отчёта: {e}", file=sys.stderr)
+            return 1
         elapsed = time.monotonic() - t0
         rec_counts: dict[str, int] = {}
         for r in result.recommendations:
