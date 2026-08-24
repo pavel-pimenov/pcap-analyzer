@@ -773,13 +773,19 @@ class ModbusTcpAnalyzer(BaseBranch):
     def _sec_connections(self, gen: GeneralStats, mb: dict) -> Section:
         dur = gen.duration or 1
         syn_per_min = len(gen.syn502) / (dur / 60) if dur else 0
-        durations = []
+        # короткие соединения считаем по ВСЕМ потокам: таблица ниже показывает
+        # только топ-N самых долгих, они почти всегда длиннее порога
+        all_durations = [
+            max((i["last"] or 0) - (i["first"] or 0), 0)
+            for i in gen.streams502.values()
+        ]
+        short_cnt = sum(1 for d in all_durations
+                        if d < self.cfg.short_stream_sec)
         st_rows = []
         for st, info in sorted(gen.streams502.items(),
                                key=lambda kv: (kv[1]["last"] or 0) - (kv[1]["first"] or 0),
                                reverse=True)[: self.cfg.max_rows_per_table]:
             d = max((info["last"] or 0) - (info["first"] or 0), 0)
-            durations.append(d)
             st_rows.append([
                 f"<code class=\"inline\">{C.esc(st)}</code>",
                 f"{C.esc(info['client'])} &rarr; {self._srv_cell(info['server'])}",
@@ -787,7 +793,6 @@ class ModbusTcpAnalyzer(BaseBranch):
                 C.fmt_dur(d),
                 C.fmt_int(mb["stream_reqs"].get(st, 0)),
             ])
-        short_cnt = sum(1 for d in durations if d < self.cfg.short_stream_sec)
         head = (
             f"<p>Новых подключений к порту 502 (SYN): <strong>{len(gen.syn502)}</strong> "
             f"({syn_per_min:.1f}/мин); наблюдаемых потоков: <strong>{len(gen.streams502)}</strong>; "

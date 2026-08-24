@@ -620,21 +620,26 @@ class S7CommAnalyzer(BaseBranch):
     def _sec_connections(self, gen: GeneralStats, s7: dict) -> Section:
         dur = gen.duration or 1
         syn_per_min = len(gen.syn102) / (dur / 60) if dur else 0
-        durations = []
+        # короткие соединения считаем по ВСЕМ потокам: таблица ниже показывает
+        # только топ-N самых долгих, они почти всегда длиннее порога
+        all_durations = [
+            max((i["last"] or 0) - (i["first"] or 0), 0)
+            for i in gen.streams102.values()
+        ]
+        short_cnt = sum(1 for d in all_durations
+                        if d < self.cfg.short_stream_sec)
         st_rows = []
         for st, info in sorted(
                 gen.streams102.items(),
                 key=lambda kv: (kv[1]["last"] or 0) - (kv[1]["first"] or 0),
                 reverse=True)[: self.cfg.max_rows_per_table]:
             d = max((info["last"] or 0) - (info["first"] or 0), 0)
-            durations.append(d)
             st_rows.append([
                 f"<code class=\"inline\">{C.esc(st)}</code>",
                 f"{C.esc(info['client'])} &rarr; {self._srv_cell(info['server'])}",
                 _fmt_ts_offset(info["first"] or 0, gen.first_ts or 0),
                 C.fmt_dur(d),
             ])
-        short_cnt = sum(1 for d in durations if d < self.cfg.short_stream_sec)
         head = (
             f"<p>Новых подключений к порту {PORT} (SYN): "
             f"<strong>{len(gen.syn102)}</strong> ({syn_per_min:.1f}/мин); "
