@@ -12,6 +12,7 @@ from html import escape
 
 from .. import __version__
 from ..branches.base import SEVERITY_ORDER
+from ..branches.base import display_tz as _display_tz
 from .html_report import _CSS
 from ..report.trend_report import METRIC_TITLES, TrendPoint, _psize
 
@@ -49,7 +50,7 @@ def _label(ts: float | None) -> str:
     if ts is None:
         return "?"
     return datetime.datetime.fromtimestamp(
-        ts, tz=datetime.timezone.utc).astimezone().strftime("%H:%M")
+        ts, tz=datetime.timezone.utc).astimezone(_display_tz()).strftime("%H:%M")
 
 
 def _period(points: list[TrendPoint]) -> str:

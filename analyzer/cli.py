@@ -46,6 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_an.add_argument("--config", default=None,
                       help="TOML-файл с порогами правил "
                            "(ключи как в analyzer/config.py)")
+    p_an.add_argument("--tz", type=float, default=None, metavar="ЧАСЫ",
+                      help="зона показа времени в отчёте, часов от UTC "
+                           "(например 3 или -5.5); по умолчанию — локальная")
 
     # --- branches --------------------------------------------------------------
     sub.add_parser("branches", help="список доступных веток анализа")
@@ -67,6 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--config", default=None,
                       help="TOML-файл с порогами правил "
                            "(ключи как в analyzer/config.py)")
+    p_tr.add_argument("--tz", type=float, default=None, metavar="ЧАСЫ",
+                      help="зона показа времени в отчёте, часов от UTC "
+                           "(например 3 или -5.5); по умолчанию — локальная")
 
     # --- diff -------------------------------------------------------------------
     p_df = sub.add_parser(
@@ -84,6 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_df.add_argument("--config", default=None,
                       help="TOML-файл с порогами правил "
                            "(ключи как в analyzer/config.py)")
+    p_df.add_argument("--tz", type=float, default=None, metavar="ЧАСЫ",
+                      help="зона показа времени в отчёте, часов от UTC "
+                           "(например 3 или -5.5); по умолчанию — локальная")
 
     # --- serve -----------------------------------------------------------------
     p_sv = sub.add_parser(
@@ -103,6 +112,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_sv.add_argument("--config", default=None,
                       help="TOML-файл с порогами правил "
                            "(ключи как в analyzer/config.py)")
+    p_sv.add_argument("--token", default=None,
+                      help="требовать токен доступа: все маршруты, кроме "
+                           "самой страницы, проверяют ?token= или заголовок "
+                           "X-Auth-Token")
     return parser
 
 
@@ -143,6 +156,11 @@ def _load_cfg(path: str | None):
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = _load_cfg(getattr(args, "config", None))
+    tz_val = getattr(args, "tz", None)
+    if tz_val is None:
+        tz_val = getattr(cfg, "display_tz_offset", None)
+    from .branches.base import set_display_tz
+    set_display_tz(tz_val)
 
     if args.command == "branches":
         print("Доступные ветки анализа:")
@@ -265,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
             data_dir=Path(args.data_dir),
             samples_dir=Path(args.samples_dir) if args.samples_dir else None,
             tshark_bin=args.tshark_bin,
+            token=args.token,
         )
 
     return 0

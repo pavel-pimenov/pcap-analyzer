@@ -13,7 +13,7 @@ from html import escape
 from pathlib import Path
 
 from .. import __version__
-from ..branches.base import SEVERITY_ORDER
+from ..branches.base import SEVERITY_ORDER, display_tz
 from .html_report import _CSS
 
 #: человекочитаемые названия метрик по ключам из BranchResult.metrics
@@ -60,7 +60,7 @@ def _label(ts: float | None) -> str:
     if ts is None:
         return "?"
     return datetime.datetime.fromtimestamp(
-        ts, tz=datetime.timezone.utc).astimezone().strftime("%H:%M")
+        ts, tz=datetime.timezone.utc).astimezone(display_tz()).strftime("%H:%M")
 
 
 def _psize(p: Path) -> int:

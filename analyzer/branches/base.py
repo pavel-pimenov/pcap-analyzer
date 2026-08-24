@@ -428,11 +428,30 @@ def fmt_ts_offset(ts: float, first_ts: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+#: зона отображения времени в отчётах; None — локальная машина аналитика
+_DISPLAY_TZ: _dt.tzinfo | None = None
+
+
+def set_display_tz(offset_hours: float | None) -> None:
+    """Задать смещение зоны показа времени от UTC в часах (например 3, -5.5)."""
+    global _DISPLAY_TZ
+    if offset_hours is None:
+        _DISPLAY_TZ = None
+    else:
+        _DISPLAY_TZ = _dt.timezone(
+            _dt.timedelta(hours=float(offset_hours)))
+
+
+def display_tz() -> _dt.tzinfo:
+    return _DISPLAY_TZ or _dt.timezone.utc
+
+
 def epoch_to_str(ts, time_only: bool = False) -> str:
-    """epoch → локальное время; единый формат дат во всех отчётах."""
+    """epoch → время в зоне отображения; единый формат дат во всех отчётах."""
     if ts is None:
         return "&mdash;"
     d = _dt.datetime.fromtimestamp(float(ts),
-                                   tz=_dt.timezone.utc).astimezone()
+                                   tz=_dt.timezone.utc).astimezone(
+                                       display_tz())
     return d.strftime("%H:%M:%S") if time_only \
         else d.strftime("%d.%m.%Y %H:%M:%S")

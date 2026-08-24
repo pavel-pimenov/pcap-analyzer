@@ -291,5 +291,53 @@ class WebSeriesTest(unittest.TestCase):
         self.assertIn("минимум два", json.loads(data)["error"])
 
 
+class WebTokenTest(unittest.TestCase):
+    """Токен доступа: без него API закрыт, с ним — открыт."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(__import__("tempfile").mkdtemp(prefix="pcapweb-t-"))
+        cls.state = AppState(cls.tmp / "data", None, None)
+        cls.httpd = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(cls.state, token="секрет123"))
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever,
+                         daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_page_open_api_closed(self):
+        code, _h, _b = _request(self.base, "/")
+        self.assertEqual(code, 200)               # страница отдаётся всем
+        code, _h, data = _request(self.base, "/api/branches")
+        self.assertEqual(code, 401)
+        self.assertIn("токен", json.loads(data)["error"])
+
+    def test_token_via_query(self):
+        from urllib.parse import quote
+        code, _h, _b = _request(
+            self.base, "/api/branches?token=" + quote("секрет123"))
+        self.assertEqual(code, 200)
+
+    def test_token_via_header_ascii(self):
+        # заголовки HTTP — latin-1: для X-Auth-Token практичнее ASCII-токен
+        req = urllib.request.Request(self.base + "/api/branches",
+                                     headers={"X-Auth-Token": "tok"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 401)  # неверный токен -> отказ
+
+    def test_wrong_token_401(self):
+        code, _h, _b = _request(self.base, "/api/branches?token=nope")
+        self.assertEqual(code, 401)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

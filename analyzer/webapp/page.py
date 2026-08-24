@@ -116,6 +116,11 @@ let FILES = [];
 let SEL = null;
 let POLL = null;
 const SELSET = new Set();     // файлы, выбранные в серию
+let TOK = new URLSearchParams(location.search).get("token") || "";
+if (TOK) localStorage.setItem("pcap_token", TOK);
+TOK = localStorage.getItem("pcap_token") || "";
+const tq = (u) => u + (u.includes("?") ? "&" : "?") +
+  "token=" + encodeURIComponent(TOK);
 let CMP_A = null;             // первая серия для сравнения
 let CMP_HINT = null;          // элемент подсказки
 
@@ -129,7 +134,14 @@ const CHIP_RU = {done:"готово", running:"анализ…", queued:"в оч
                  error:"ошибка", cancelled:"отменён", new:"новый"};
 
 async function api(url, opts) {
-  const r = await fetch(url, opts);
+  let r = await fetch(tq(url), opts);
+  if (r.status === 401) {
+    const t = prompt("Требуется токен доступа:");
+    if (t != null) { TOK = t; localStorage.setItem("pcap_token", TOK);
+      r = await fetch(tq(url), opts);
+      if (r.ok) { $("viewer").src = $("viewer").src; return r.json().then(j=>j); }
+    }
+  }
   if (!r.ok) {
     let msg = r.status;
     try { const j = await r.json(); if (j.error) msg = j.error; } catch (e) {}
@@ -289,7 +301,7 @@ function select(id) {
   SEL = id;
   renderFiles();
   updateBar(f);
-  $("viewer").src = f.hasHtml ? ("/view/" + id) : "about:blank";
+  $("viewer").src = f.hasHtml ? tq("/view/" + id) : "about:blank";
 }
 
 function schedulePoll() {
@@ -376,8 +388,8 @@ $("upbtn").onclick = async () => {
   } finally { $("upbtn").disabled = false; }
 };
 
-$("btnHtml").onclick = () => SEL && window.open("/export/" + SEL + "?fmt=html");
-$("btnPdf").onclick = () => SEL && window.open("/export/" + SEL + "?fmt=pdf");
+$("btnHtml").onclick = () => SEL && window.open(tq("/export/" + SEL + "?fmt=html"));
+$("btnPdf").onclick = () => SEL && window.open(tq("/export/" + SEL + "?fmt=pdf"));
 $("btnRerun").onclick = () => {
   const f = FILES.find(x => x.id === SEL);
   if (f) analyze(SEL, f.branch);

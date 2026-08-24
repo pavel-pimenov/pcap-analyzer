@@ -17,6 +17,7 @@ import hashlib
 import json
 import queue
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -636,13 +637,36 @@ _CT = {
 }
 
 
-def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
+def make_handler(state: AppState, token: str | None = None
+                 ) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "pcap-analyzer-web"
         protocol_version = "HTTP/1.1"       # keep-alive: UI опрашивает статус каждые ~1,5 с
 
         def log_message(self, fmt, *args):       # тише в консоли
             pass
+
+        def _authorized(self) -> bool:
+            """Проверка токена (если задан): ?token= или X-Auth-Token."""
+            if not token:
+                return True
+            tb = token.encode("utf-8")
+            qs = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+            if qs and secrets.compare_digest(qs.encode("utf-8"), tb):
+                return True
+            hdr = self.headers.get("X-Auth-Token", "").encode("utf-8")
+            return bool(hdr) and secrets.compare_digest(hdr, tb)
+
+        def _deny(self):
+            body = json.dumps(
+                {"error": "требуется токен доступа (?token= или "
+                          "заголовок X-Auth-Token)"},
+                ensure_ascii=False).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", _CT[".json"])
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         # -- ответы ----------------------------------------------------------
         def _content_length(self) -> int:
@@ -715,6 +739,9 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
         def do_GET(self):                        # noqa: N802 (стандарт API)
             u = urlparse(self.path)
             path = u.path
+            if path not in ("/", "/index.html") and not self._authorized():
+                self._deny()
+                return
             if path in ("/", "/index.html"):
                 body = page.PAGE.encode("utf-8")
                 self.send_response(200)
@@ -792,6 +819,9 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
         # -- POST --------------------------------------------------------------
         def do_POST(self):                       # noqa: N802
+            if not self._authorized():
+                self._deny()
+                return
             u = urlparse(self.path)
             if u.path == "/api/upload":
                 self._handle_upload()
@@ -936,6 +966,9 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
         # -- DELETE --------------------------------------------------------------
         def do_DELETE(self):                     # noqa: N802
+            if not self._authorized():
+                self._deny()
+                return
             path = urlparse(self.path).path
             mg = re.fullmatch(r"/api/groups/([A-Za-z0-9_-]+)", path)
             if mg:
@@ -967,9 +1000,10 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
 
 def run_server(host: str, port: int, data_dir: Path,
-               samples_dir: Path | None, tshark_bin: str | None) -> int:
+               samples_dir: Path | None, tshark_bin: str | None,
+               token: str | None = None) -> int:
     state = AppState(data_dir, samples_dir, tshark_bin)
-    httpd = ThreadingHTTPServer((host, port), make_handler(state))
+    httpd = ThreadingHTTPServer((host, port), make_handler(state, token))
     url = f"http://{host}:{port}"
     print(f"[pcap-analyzer] Веб-интерфейс запущен: {url}", flush=True)
     print(f"[pcap-analyzer] Каталог данных: {state.data_dir}", flush=True)
