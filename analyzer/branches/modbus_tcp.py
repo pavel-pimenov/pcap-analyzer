@@ -417,7 +417,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                                 key = (server, unit_p, fc, ref + off)
                                 rec_ = vt.get(key)
                                 if rec_ is None:
-                                    if len(vt) < 300000:
+                                    if len(vt) < self.cfg.valtrack_max_registers:
                                         vt[key] = [v, 0, 1]
                                 else:
                                     rec_[2] += 1
@@ -452,8 +452,9 @@ class ModbusTcpAnalyzer(BaseBranch):
                 # FIFO-страховка для дизассемблеров без request_frame
                 if trans >= 0:
                     pending_fifo.setdefault((stream, trans, unit), []).append(req)
-                    if len(pending_fifo) > 50000:
-                        for k in [k for k, v in pending_fifo.items() if not v][:25000]:
+                    if len(pending_fifo) > self.cfg.pending_fifo_max_keys:
+                        half = self.cfg.pending_fifo_max_keys // 2
+                        for k in [k for k, v in pending_fifo.items() if not v][:half]:
                             del pending_fifo[k]
 
                 client, server = src, dst
@@ -481,7 +482,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                     mb["all_reads_by_key"][ck] += 1
                     if 0 < wcnt <= self.cfg.small_read_max_words:
                         lst = mb["small_reads"].setdefault(ck, [])
-                        if len(lst) < 400000:
+                        if len(lst) < self.cfg.small_reads_max_items:
                             lst.append((ts, ref, wcnt))
                         mb["small_reads_total"][ck] += 1
                 # Регистры: записи
@@ -495,7 +496,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                         mb["writes_coil"][ck] += 1
                     else:
                         lst = mb["writes_single"].setdefault(ck, [])
-                        if len(lst) < 200000:
+                        if len(lst) < self.cfg.writes_single_max_items:
                             lst.append((ts, ref))
                         mb["writes_single_total"][ck] += 1
                 elif fc_base in WRITE_MULTI_FCS and ref >= 0:
@@ -527,7 +528,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         for nf, req in req_by_frame.items():
             if not req.answered:
                 mb["pairs"][(req.src, req.dst)].no_resp += 1
-                if len(mb["unanswered_frames"]) < 10:
+                if len(mb["unanswered_frames"]) < self.cfg.unanswered_examples:
                     mb["unanswered_frames"].append(req.n)
         return mb
 
@@ -1188,7 +1189,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         cfg = self.cfg
         for (cl, sv, unit), items in mb["small_reads"].items():
             orig = mb["small_reads_total"][(cl, sv, unit)]
-            if orig < 20:
+            if orig < cfg.merge_reads_min_total:
                 continue
             items_sorted = sorted(items)
             batches, span_lo, span_hi, t0 = 0, None, None, None
@@ -1379,7 +1380,7 @@ class ModbusTcpAnalyzer(BaseBranch):
             f"код {code}: {EXC_NAMES.get(code, '?')} — {n} раз"
             for code, n in codes.most_common(5)
         ]
-        sev = "critical" if rate >= 5 else "warning"
+        sev = "critical" if rate >= self.cfg.critical_rate_pct else "warning"
         return [Recommendation(
             id="exceptions",
             severity=sev,
@@ -1412,7 +1413,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                                    reverse=True):
             if ps.no_resp:
                 ev.append(f"{cl} → {sv}: {ps.no_resp} без ответа")
-        sev = "critical" if rate >= 5 else "warning"
+        sev = "critical" if rate >= self.cfg.critical_rate_pct else "warning"
         return [Recommendation(
             id="no-response",
             severity=sev,
@@ -1445,11 +1446,11 @@ class ModbusTcpAnalyzer(BaseBranch):
         }
         offenders = []
         for target in mb["poll_targets"].values():
-            if len(target.intervals) < 10:
+            if len(target.intervals) < self.cfg.poll_pressure_min_intervals:
                 continue
             med_iv = percentile(sorted(target.intervals), 50)
             med_rtt = med_by_server.get(target.server)
-            if med_iv is not None and med_rtt is not None and med_iv <= 2 * med_rtt:
+            if med_iv is not None and med_rtt is not None and med_iv <= self.cfg.poll_pressure_factor * med_rtt:
                 offenders.append((target, med_iv, med_rtt))
         if not offenders:
             return out
@@ -1470,7 +1471,8 @@ class ModbusTcpAnalyzer(BaseBranch):
                 f"{C.fmt_ms(iv)} мс, а сервер отвечает медианно за {C.fmt_ms(rtt)} мс."
             ),
             advice=(
-                "Когда период опроса ≤ 2×RTT, транзакции встают в очередь друг за другом: "
+                f"Когда период опроса ≤ {self.cfg.poll_pressure_factor:g}×RTT, "
+                "транзакции встают в очередь друг за другом: "
                 "латентность растёт лавинообразно. Увеличьте интервал, сократите количество "
                 "целей у этого клиента либо ускорьте сервер; полезен джиттер ±20%, чтобы "
                 "развести клиентов по фазе."
@@ -1526,12 +1528,12 @@ class ModbusTcpAnalyzer(BaseBranch):
     def _rule_static_registers(self, mb: dict) -> list[Recommendation]:
         cfg = self.cfg
         candidates = [(k, v) for k, v in mb["valtrack"].items() if v[2] >= cfg.static_reg_min_reads]
-        if len(candidates) < 10:
+        if len(candidates) < cfg.static_reg_min_candidates:
             return []
         static = [(k, v) for k, v in candidates
                   if 100.0 * v[1] / v[2] < cfg.static_reg_change_pct]
         share = 100.0 * len(static) / len(candidates)
-        if share < 30:
+        if share < cfg.static_share_pct:
             return []
         static.sort(key=lambda kv: kv[1][2], reverse=True)
         sv, unit, fc, reg = static[0][0]
