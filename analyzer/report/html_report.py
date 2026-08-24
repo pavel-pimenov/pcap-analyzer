@@ -240,9 +240,9 @@ def _render_recommendations(recs: Iterable[Recommendation]) -> str:
         items.append(
             f'<div class="rec {esc(r.severity)}">'
             f"<h3>{severity_badge(r.severity)} {esc(r.title)}</h3>"
-            f'<p class="problem"><strong>Обнаружено:</strong> {r.problem}</p>'
+            f'<p class="problem"><strong>Обнаружено:</strong> {esc(r.problem)}</p>'
             f"{evidence}"
-            f'<p><strong>Рекомендация:</strong> {r.advice}</p>'
+            f'<p><strong>Рекомендация:</strong> {esc(r.advice)}</p>'
             f"{cmds}</div>"
         )
     body = "".join(items)
