@@ -692,6 +692,15 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
             with state.lock:
                 return fid in state.entries or fid in state.groups
 
+        def _entry_or_404(self, fid: str):
+            if not _ID_RE.match(fid):
+                self._json({"error": "некорректный идентификатор"}, 400)
+                return None
+            e = state.get(fid)
+            if not e:
+                self._json({"error": "файл не найден"}, 404)
+            return e
+
         def _view_target(self, fid: str):
             """Проверка id для /view и /export (файлы и группы)."""
             if not _ID_RE.match(fid):
@@ -764,7 +773,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 if ext is None:
                     self._json({"error": "формат должен быть html|pdf"}, 400)
                     return
-                rep = state.reports_dir / f"{e['id']}.{ext}"
+                rep = state.reports_dir / f"{m.group(1)}.{ext}"
                 if not rep.is_file():
                     self._json({"error": "отчёт в этом формате не готов"}, 404)
                     return
