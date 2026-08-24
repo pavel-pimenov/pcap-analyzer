@@ -15,10 +15,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from analyzer.branches.base import Reservoir                     # noqa: E402
+from analyzer.branches.base import (                             # noqa: E402
+    Reservoir, percentile)
 from analyzer.branches.modbus_tcp import (                       # noqa: E402
-    GeneralStats, ModbusTcpAnalyzer, PairStats, PollTarget, _percentile,
-    merge_ranges)
+    GeneralStats, ModbusTcpAnalyzer, PairStats, PollTarget, merge_ranges)
 from analyzer.config import Config                               # noqa: E402
 
 
@@ -35,21 +35,21 @@ def _branch() -> ModbusTcpAnalyzer:
 
 class PercentileTest(unittest.TestCase):
     def test_empty(self):
-        self.assertIsNone(_percentile([], 50))
+        self.assertIsNone(percentile([], 50))
 
     def test_single_value(self):
-        self.assertEqual(_percentile([5.0], 95), 5.0)
+        self.assertEqual(percentile([5.0], 95), 5.0)
 
     def test_exact_index(self):
-        self.assertEqual(_percentile([1.0, 2.0, 3.0], 50), 2.0)
+        self.assertEqual(percentile([1.0, 2.0, 3.0], 50), 2.0)
 
     def test_interpolation(self):
         # k = 0.5 → середина между 10 и 20
-        self.assertAlmostEqual(_percentile([10.0, 20.0], 50), 15.0)
+        self.assertAlmostEqual(percentile([10.0, 20.0], 50), 15.0)
 
     def test_p95(self):
         vals = [float(i) for i in range(1, 101)]      # 1..100
-        self.assertAlmostEqual(_percentile(vals, 95), 95.05)
+        self.assertAlmostEqual(percentile(vals, 95), 95.05)
 
 
 class ReservoirTest(unittest.TestCase):

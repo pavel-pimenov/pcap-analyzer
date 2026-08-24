@@ -8,12 +8,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import math
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 from ..config import Config
 from ..tshark_runner import find_tshark, stream_fields
@@ -27,6 +24,12 @@ from .base import (
     Recommendation,
     Reservoir,
     Section,
+    epoch_to_str,
+    fmt_ts_offset,
+    percentile,
+    to_float,
+    to_int,
+    truthy,
 )
 
 # Функциональные коды чтения/записи
@@ -151,45 +154,6 @@ class GeneralStats:
 
 
 # ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
-
-def _to_int(value, default=-1):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _truthy(v: str) -> bool:
-    return v.strip() in {"1", "True", "true"}
-
-
-def _percentile(sorted_vals, p: float):
-    if not sorted_vals:
-        return None
-    k = (len(sorted_vals) - 1) * p / 100.0
-    lo, hi = math.floor(k), math.ceil(k)
-    if lo == hi:
-        return sorted_vals[int(k)]
-    return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
-
-
-def _fmt_ts_offset(ts: float, first_ts: float) -> str:
-    d = max(ts - first_ts, 0)
-    m, s = divmod(int(d), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-# ---------------------------------------------------------------------------
 # Анализатор
 # ---------------------------------------------------------------------------
 
@@ -257,19 +221,6 @@ class ModbusTcpAnalyzer(BaseBranch):
     # -- вспомогательное ----------------------------------------------------
 
     @staticmethod
-    def _sha256_short(path: Path) -> str:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()[:16]
-
-    def _cmd(self, args_tail: str) -> str:
-        # в командах для пользователя — только имя файла: он может лежать
-        # где угодно, полный путь нужен лишь самому анализатору
-        return f"tshark -r {self.pcap.name} {args_tail}"
-
-    @staticmethod
     def _max_concurrent(intervals) -> int:
         """Максимум одновременных соединений по перекрытию интервалов жизни."""
         evts = []
@@ -299,9 +250,9 @@ class ModbusTcpAnalyzer(BaseBranch):
         rows = stream_fields(self.tshark, self.pcap_str, self.FIELDS_GENERAL)
         for i, r in enumerate(rows):
             g.total_packets += 1
-            plen = _to_int(r.get("frame.len"), 0)
+            plen = to_int(r.get("frame.len"), 0)
             g.total_bytes += plen
-            ts = _to_float(r.get("frame.time_epoch"))
+            ts = to_float(r.get("frame.time_epoch"))
             if ts is not None:
                 if g.first_ts is None:
                     g.first_ts = ts
@@ -313,15 +264,15 @@ class ModbusTcpAnalyzer(BaseBranch):
                 g.ip_bytes_tx[src] += plen
             if dst:
                 g.ip_bytes_rx[dst] += plen
-            sport = _to_int(r.get("tcp.srcport"), -1)
-            dport = _to_int(r.get("tcp.dstport"), -1)
+            sport = to_int(r.get("tcp.srcport"), -1)
+            dport = to_int(r.get("tcp.dstport"), -1)
             if sport < 0 and dport < 0:
                 continue
-            is_syn = _truthy(r.get("tcp.flags.syn", ""))
-            is_ack = _truthy(r.get("tcp.flags.ack", ""))
-            if _truthy(r.get("tcp.flags.reset", "")) and (sport == 502 or dport == 502):
+            is_syn = truthy(r.get("tcp.flags.syn", ""))
+            is_ack = truthy(r.get("tcp.flags.ack", ""))
+            if truthy(r.get("tcp.flags.reset", "")) and (sport == 502 or dport == 502):
                 g.rst502 += 1
-            if _truthy(r.get("tcp.flags.fin", "")) and (sport == 502 or dport == 502):
+            if truthy(r.get("tcp.flags.fin", "")) and (sport == 502 or dport == 502):
                 g.fin502 += 1
             if is_syn and not is_ack and dport == 502 and src:
                 g.syn502.append((ts or 0.0, src, dst))
@@ -343,8 +294,8 @@ class ModbusTcpAnalyzer(BaseBranch):
                             info["last"] = ts
                     # кто инициировал завершение соединения (первый FIN/RST)
                     if "closed_by" not in info and (
-                            _truthy(r.get("tcp.flags.fin", ""))
-                            or _truthy(r.get("tcp.flags.reset", ""))):
+                            truthy(r.get("tcp.flags.fin", ""))
+                            or truthy(r.get("tcp.flags.reset", ""))):
                         info["closed_by"] = src
             if (i + 1) % 100000 == 0:
                 self.progress(f"  обработано {i + 1} пакетов…")
@@ -399,14 +350,14 @@ class ModbusTcpAnalyzer(BaseBranch):
                              display_filter="mbtcp")
         for i, row in enumerate(rows):
             mb["total_pdu"] += 1
-            n = _to_int(row.get("frame.number"), 0)
-            ts = _to_float(row.get("frame.time_epoch")) or 0.0
+            n = to_int(row.get("frame.number"), 0)
+            ts = to_float(row.get("frame.time_epoch")) or 0.0
             src = row.get("ip.src", "?")
             dst = row.get("ip.dst", "?")
             stream = row.get("tcp.stream", "")
-            trans = _to_int(row.get("mbtcp.trans_id"), -1)
-            unit = _to_int(row.get("mbtcp.unit_id"), -1)
-            fc_raw = _to_int(row.get("modbus.func_code"), -1)
+            trans = to_int(row.get("mbtcp.trans_id"), -1)
+            unit = to_int(row.get("mbtcp.unit_id"), -1)
+            fc_raw = to_int(row.get("modbus.func_code"), -1)
             if fc_raw < 0:
                 continue
             fc_base = fc_raw & 0x7F
@@ -414,8 +365,8 @@ class ModbusTcpAnalyzer(BaseBranch):
 
             # Направление: сначала порт 502, при нестандартных портах — наличие ссылки
             # на запрос (поле modbus.request_frame есть только у ответов).
-            sport_row = _to_int(row.get("tcp.srcport"), -1)
-            dport_row = _to_int(row.get("tcp.dstport"), -1)
+            sport_row = to_int(row.get("tcp.srcport"), -1)
+            dport_row = to_int(row.get("tcp.dstport"), -1)
             if sport_row == 502:
                 is_response = True
             elif dport_row == 502:
@@ -427,13 +378,13 @@ class ModbusTcpAnalyzer(BaseBranch):
                 mb["resp_total"] += 1
                 bucket = int((ts - first_ts) // bucket_sec)
                 mb["timeline"].setdefault(bucket, [0, 0, 0])
-                req = req_by_frame.get(_to_int(rf_field, -1))
+                req = req_by_frame.get(to_int(rf_field, -1))
                 if req is None and trans >= 0:
                     # Страховка: дизассемблер не дал request_frame
                     q = pending_fifo.get((stream, trans, unit))
                     if q and q[0].ts <= ts:
                         req = q.pop(0)
-                rtt = _to_float(row.get("modbus.response_time"))
+                rtt = to_float(row.get("modbus.response_time"))
                 if req is not None and rtt is None:
                     rtt = max(ts - req.ts, 0.0)
                 exc_field = row.get("modbus.exception_code", "").strip()
@@ -450,7 +401,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                     if is_exc:
                         ps.excs += 1
                         mb["exc_total"] += 1
-                        code = _to_int(exc_field, -1)
+                        code = to_int(exc_field, -1)
                         mb["exc_counter"][(server, unit_p, code)] += 1
                         mb["timeline"][bucket][2] += 1
                     else:
@@ -483,10 +434,10 @@ class ModbusTcpAnalyzer(BaseBranch):
                 tl = mb["timeline"].setdefault(bucket, [0, 0, 0])
                 tl[0] += 1
 
-                ref = _to_int(row.get("modbus.reference_num"), -1)
-                wcnt = _to_int(row.get("modbus.word_cnt"), 0)
-                wref = _to_int(row.get("modbus.write_reference_num"), -1)
-                wwcnt = _to_int(row.get("modbus.write_word_cnt"), 0)
+                ref = to_int(row.get("modbus.reference_num"), -1)
+                wcnt = to_int(row.get("modbus.word_cnt"), 0)
+                wref = to_int(row.get("modbus.write_reference_num"), -1)
+                wwcnt = to_int(row.get("modbus.write_word_cnt"), 0)
                 if fc_base in WRITE_SINGLE_FCS:
                     ref = wref if wref >= 0 else ref
                     wcnt = 1
@@ -508,7 +459,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                 client, server = src, dst
                 ps = self._pair(mb, client, server)
                 ps.reqs += 1
-                ps.bytes_ += _to_int(row.get("frame.len"), 0)
+                ps.bytes_ += to_int(row.get("frame.len"), 0)
                 ps.fcodes[fc_base] += 1
                 if ps.first_ts is None:
                     ps.first_ts = ts
@@ -595,7 +546,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         clients = sorted({c for (c, _s) in mb["pairs"]})
         servers = sorted({s for (_c, s) in mb["pairs"]})
         all_rtts = sorted(r for ps in mb["pairs"].values() for r in ps.rtts)
-        med_rtt = _percentile(all_rtts, 50)
+        med_rtt = percentile(all_rtts, 50)
         conns = len(set(gen.streams502.keys())) or len(gen.syn502)
         return [
             KpiItem("Длительность захвата", C.fmt_dur(dur)),
@@ -649,8 +600,8 @@ class ModbusTcpAnalyzer(BaseBranch):
             ["Файл", C.esc(self.pcap.name)],
             ["Размер файла", C.fmt_bytes(self.pcap.stat().st_size)],
             ["SHA-256 (фрагмент)", f'<code class="inline">{self.sha256_short}&hellip;</code>'],
-            ["Начало захвата", _epoch_to_str(gen.first_ts)],
-            ["Конец захвата", _epoch_to_str(gen.last_ts)],
+            ["Начало захвата", epoch_to_str(gen.first_ts)],
+            ["Конец захвата", epoch_to_str(gen.last_ts)],
             ["Длительность", C.fmt_dur(gen.duration)],
             ["Всего пакетов", C.fmt_int(gen.total_packets)],
             ["Объём трафика", C.fmt_bytes(gen.total_bytes)],
@@ -691,7 +642,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         for b in range(n_buckets):
             r, _resp, e = mb["timeline"].get(b, [0, 0, 0])
             reqs[b], excs[b] = r, e
-            labels.append(_epoch_to_str(first_ts + b * bucket_sec, time_only=True))
+            labels.append(epoch_to_str(first_ts + b * bucket_sec, time_only=True))
         svg = C.timeline_svg(labels, [reqs, excs],
                              [C.PALETTE[0], C.PALETTE[3]],
                              [f"Modbus-запросы / {bucket_sec // 60 or 1} мин",
@@ -720,7 +671,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         for (cl, sv), ps in sorted(mb["pairs"].items(),
                                    key=lambda kv: kv[1].reqs, reverse=True):
             rtts = sorted(ps.rtts)
-            p50, p95 = _percentile(rtts, 50), _percentile(rtts, 95)
+            p50, p95 = percentile(rtts, 50), percentile(rtts, 95)
             top_fc = ps.fcodes.most_common(3)
             fc_str = ", ".join(
                 f"FC{f}<span class='note'>×{n}</span>" for f, n in top_fc
@@ -789,7 +740,7 @@ class ModbusTcpAnalyzer(BaseBranch):
             st_rows.append([
                 f"<code class=\"inline\">{C.esc(st)}</code>",
                 f"{C.esc(info['client'])} &rarr; {self._srv_cell(info['server'])}",
-                _fmt_ts_offset(info["first"] or 0, gen.first_ts or 0),
+                fmt_ts_offset(info["first"] or 0, gen.first_ts or 0),
                 C.fmt_dur(d),
                 C.fmt_int(mb["stream_reqs"].get(st, 0)),
             ])
@@ -832,7 +783,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                     f'<span class="num">{C.fmt_pct(n, total_syn)}</span>',
                 ])
             syn_examples = "; ".join(
-                f"{_fmt_ts_offset(t, gen.first_ts or 0)} ({c})"
+                f"{fmt_ts_offset(t, gen.first_ts or 0)} ({c})"
                 for t, c, _s in gen.syn502[:8]
             )
             syn_detail = (
@@ -1123,9 +1074,9 @@ class ModbusTcpAnalyzer(BaseBranch):
         for sv, rtts in sorted(per_server.items()):
             srtt = sorted(rtts)
             mn = srtt[0] if srtt else None
-            p50 = _percentile(srtt, 50)
-            p90 = _percentile(srtt, 90)
-            p95 = _percentile(srtt, 95)
+            p50 = percentile(srtt, 50)
+            p90 = percentile(srtt, 90)
+            p95 = percentile(srtt, 95)
             mx = srtt[-1] if srtt else None
             rows.append([
                 f"<strong>{self._srv_cell(sv)}</strong>",
@@ -1388,7 +1339,7 @@ class ModbusTcpAnalyzer(BaseBranch):
             per_server.setdefault(sv, []).extend(ps.rtts)
         slow = []
         for sv, rtts in per_server.items():
-            p95 = _percentile(sorted(rtts), 95)
+            p95 = percentile(sorted(rtts), 95)
             if p95 is not None and p95 * 1000 > self.cfg.slow_rtt_p95_ms:
                 slow.append((sv, p95 * 1000))
         if not slow:
@@ -1490,13 +1441,13 @@ class ModbusTcpAnalyzer(BaseBranch):
         for (_cl, sv), ps in mb["pairs"].items():
             server_rtt.setdefault(sv, []).extend(ps.rtts)
         med_by_server = {
-            sv: _percentile(sorted(vals), 50) for sv, vals in server_rtt.items()
+            sv: percentile(sorted(vals), 50) for sv, vals in server_rtt.items()
         }
         offenders = []
         for target in mb["poll_targets"].values():
             if len(target.intervals) < 10:
                 continue
-            med_iv = _percentile(sorted(target.intervals), 50)
+            med_iv = percentile(sorted(target.intervals), 50)
             med_rtt = med_by_server.get(target.server)
             if med_iv is not None and med_rtt is not None and med_iv <= 2 * med_rtt:
                 offenders.append((target, med_iv, med_rtt))
@@ -1632,11 +1583,3 @@ def merge_ranges(spans: dict[tuple[int, int], float]) -> list[tuple[int, int, fl
             merged.append([s, e])
             weights[(s, e)] = w
     return [(s, e, weights.get((s, e), 0.0)) for s, e in merged]
-
-
-def _epoch_to_str(ts, time_only: bool = False) -> str:
-    import datetime as dt
-    if ts is None:
-        return "&mdash;"
-    d = dt.datetime.fromtimestamp(float(ts), tz=dt.timezone.utc).astimezone()
-    return d.strftime("%H:%M:%S") if time_only else d.strftime("%d.%m.%Y %H:%M:%S")

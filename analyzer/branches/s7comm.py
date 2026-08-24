@@ -8,10 +8,8 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import Config
@@ -25,7 +23,13 @@ from .base import (
     Recommendation,
     Reservoir,
     Section,
+    epoch_to_str,
+    fmt_ts_offset,
+    percentile,
     sort_recommendations,
+    to_float,
+    to_int,
+    truthy,
 )
 
 PORT = 102  # стандартный порт S7comm
@@ -87,53 +91,6 @@ RETCODE_NAMES = {
 # ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
-
-def _to_int(value, default=-1):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _truthy(v: str) -> bool:
-    return v.strip() in {"1", "True", "true"}
-
-
-def _first(value: str) -> str:
-    """Первое значение из агрегированного tshark поля (разделитель ',')."""
-    return (value or "").split(",")[0].strip().lower()
-
-
-def _percentile(sorted_vals, p: float):
-    if not sorted_vals:
-        return None
-    k = (len(sorted_vals) - 1) * p / 100.0
-    lo, hi = int(k // 1), int(-(-k // 1))
-    return sorted_vals[lo] if lo == hi else \
-        sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
-
-
-def _epoch_to_str(ts: float | None, time_only: bool = False) -> str:
-    if ts is None:
-        return "&mdash;"
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
-    return (dt.strftime("%H:%M:%S") if time_only
-            else dt.strftime("%Y-%m-%d %H:%M:%S"))
-
-
-def _fmt_ts_offset(ts: float, first_ts: float) -> str:
-    d = max(ts - first_ts, 0)
-    m, s = divmod(int(d), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
 
 # ---------------------------------------------------------------------------
 # Структуры данных
@@ -247,19 +204,6 @@ class S7CommAnalyzer(BaseBranch):
     # -- вспомогательное ----------------------------------------------------
 
     @staticmethod
-    def _sha256_short(path: Path) -> str:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()[:16]
-
-    def _cmd(self, args_tail: str) -> str:
-        # в командах для пользователя — только имя файла: он может лежать
-        # где угодно, полный путь нужен лишь самому анализатору
-        return f"tshark -r {self.pcap.name} {args_tail}"
-
-    @staticmethod
     def _roles(sport: int, dport: int, src: str, dst: str) -> tuple[str, str]:
         """(клиент, сервер) по положению порта 102."""
         if sport == PORT and dport != PORT:
@@ -279,9 +223,9 @@ class S7CommAnalyzer(BaseBranch):
         rows = stream_fields(self.tshark, self.pcap_str, self.FIELDS_GENERAL)
         for r in rows:
             g.total_packets += 1
-            plen = _to_int(r.get("frame.len"), 0)
+            plen = to_int(r.get("frame.len"), 0)
             g.total_bytes += plen
-            ts = _to_float(r.get("frame.time_epoch"))
+            ts = to_float(r.get("frame.time_epoch"))
             if ts is not None:
                 if g.first_ts is None:
                     g.first_ts = ts
@@ -293,16 +237,16 @@ class S7CommAnalyzer(BaseBranch):
                 g.ip_bytes_tx[src] += plen
             if dst:
                 g.ip_bytes_rx[dst] += plen
-            sport = _to_int(r.get("tcp.srcport"), -1)
-            dport = _to_int(r.get("tcp.dstport"), -1)
+            sport = to_int(r.get("tcp.srcport"), -1)
+            dport = to_int(r.get("tcp.dstport"), -1)
             if sport < 0 and dport < 0:
                 continue
-            is_syn = _truthy(r.get("tcp.flags.syn", ""))
-            is_ack = _truthy(r.get("tcp.flags.ack", ""))
+            is_syn = truthy(r.get("tcp.flags.syn", ""))
+            is_ack = truthy(r.get("tcp.flags.ack", ""))
             on_port = sport == PORT or dport == PORT
-            if on_port and _truthy(r.get("tcp.flags.reset", "")):
+            if on_port and truthy(r.get("tcp.flags.reset", "")):
                 g.rst102 += 1
-            if on_port and _truthy(r.get("tcp.flags.fin", "")):
+            if on_port and truthy(r.get("tcp.flags.fin", "")):
                 g.fin102 += 1
             if is_syn and not is_ack and dport == PORT and src:
                 g.syn102.append((ts or 0.0, src, dst))
@@ -320,8 +264,8 @@ class S7CommAnalyzer(BaseBranch):
                         if info["last"] is None or ts > info["last"]:
                             info["last"] = ts
                     if "closed_by" not in info and (
-                            _truthy(r.get("tcp.flags.fin", ""))
-                            or _truthy(r.get("tcp.flags.reset", ""))):
+                            truthy(r.get("tcp.flags.fin", ""))
+                            or truthy(r.get("tcp.flags.reset", ""))):
                         info["closed_by"] = src
         return g
 
@@ -360,14 +304,14 @@ class S7CommAnalyzer(BaseBranch):
 
         for r in rows:
             s7["total_pdu"] += 1
-            ts = _to_float(r.get("frame.time_epoch"))
+            ts = to_float(r.get("frame.time_epoch"))
             rosctr = _first(r.get("s7comm.header.rosctr"))
             pduref = _first(r.get("s7comm.header.pduref"))
             func = _first(r.get("s7comm.param.func"))
             src = r.get("ip.src", "")
             dst = r.get("ip.dst", "")
-            sport = _to_int(r.get("tcp.srcport"), -1)
-            dport = _to_int(r.get("tcp.dstport"), -1)
+            sport = to_int(r.get("tcp.srcport"), -1)
+            dport = to_int(r.get("tcp.dstport"), -1)
             st = r.get("tcp.stream", "")
             client, plc = self._roles(sport, dport, src, dst)
             key = (client, plc)
@@ -376,7 +320,7 @@ class S7CommAnalyzer(BaseBranch):
             if ps is None:
                 ps = s7["pairs"][key] = PairStats(
                     rtts=Reservoir(self.cfg.max_rtts_per_pair))
-            ps.bytes_ += _to_int(r.get("frame.len"), 0)
+            ps.bytes_ += to_int(r.get("frame.len"), 0)
             if st != "":
                 ps.streams.add(st)
 
@@ -391,7 +335,7 @@ class S7CommAnalyzer(BaseBranch):
                     s7["fcodes_all"][func] += 1
                 if func == "0xf0":
                     s7["setup_comms"] += 1
-                itemcnt = _to_int(_first(r.get("s7comm.param.itemcount")), 0)
+                itemcnt = to_int(_first(r.get("s7comm.param.itemcount")), 0)
                 ps.items += max(itemcnt, 0)
                 if itemcnt <= 1:
                     ps.single_item_reqs += 1
@@ -449,7 +393,7 @@ class S7CommAnalyzer(BaseBranch):
         clients = sorted({c for (c, _s) in s7["pairs"]})
         plcs = sorted({p for (_c, p) in s7["pairs"]})
         all_rtts = sorted(t for ps in s7["pairs"].values() for t in ps.rtts)
-        med_rtt = _percentile(all_rtts, 50)
+        med_rtt = percentile(all_rtts, 50)
         conns = len(gen.streams102) or len(gen.syn102)
         no_resp = sum(p.no_resp for p in s7["pairs"].values())
         return [
@@ -504,8 +448,8 @@ class S7CommAnalyzer(BaseBranch):
             ["Размер файла", C.fmt_bytes(self.pcap.stat().st_size)],
             ["SHA-256 (фрагмент)",
              f'<code class="inline">{self.sha256_short}&hellip;</code>'],
-            ["Начало захвата", _epoch_to_str(gen.first_ts)],
-            ["Конец захвата", _epoch_to_str(gen.last_ts)],
+            ["Начало захвата", epoch_to_str(gen.first_ts)],
+            ["Конец захвата", epoch_to_str(gen.last_ts)],
             ["Длительность", C.fmt_dur(gen.duration)],
             ["Всего пакетов", C.fmt_int(gen.total_packets)],
             ["Объём трафика", C.fmt_bytes(gen.total_bytes)],
@@ -546,7 +490,7 @@ class S7CommAnalyzer(BaseBranch):
         for b in range(n_buckets):
             rq, _rp, er = (*s7["timeline"].get(b, (0, 0)), 0)[:3]
             reqs[b], errs[b] = rq, er
-            labels.append(_epoch_to_str(first_ts + b * bucket_sec,
+            labels.append(epoch_to_str(first_ts + b * bucket_sec,
                                         time_only=True))
         svg = C.timeline_svg(labels, [reqs, errs],
                              [C.PALETTE[0], C.PALETTE[3]],
@@ -577,8 +521,8 @@ class S7CommAnalyzer(BaseBranch):
         for (cl, sv), ps in sorted(s7["pairs"].items(),
                                    key=lambda kv: kv[1].reqs, reverse=True):
             rtts = sorted(ps.rtts)
-            p50 = _percentile(rtts, 50)
-            p95 = _percentile(rtts, 95)
+            p50 = percentile(rtts, 50)
+            p95 = percentile(rtts, 95)
             fc_str = ", ".join(
                 f"{FUNC_NAMES.get(f, f)}<span class='note'>×{n}</span>"
                 for f, n in ps.fcodes.most_common(3)
@@ -637,7 +581,7 @@ class S7CommAnalyzer(BaseBranch):
             st_rows.append([
                 f"<code class=\"inline\">{C.esc(st)}</code>",
                 f"{C.esc(info['client'])} &rarr; {self._srv_cell(info['server'])}",
-                _fmt_ts_offset(info["first"] or 0, gen.first_ts or 0),
+                fmt_ts_offset(info["first"] or 0, gen.first_ts or 0),
                 C.fmt_dur(d),
             ])
         head = (
@@ -893,8 +837,8 @@ class S7CommAnalyzer(BaseBranch):
 
         # 1. Медленный отклик PLC
         all_rtts = sorted(t for ps in s7["pairs"].values() for t in ps.rtts)
-        p95 = _percentile(all_rtts, 95)
-        med = _percentile(all_rtts, 50)
+        p95 = percentile(all_rtts, 95)
+        med = percentile(all_rtts, 50)
         if p95 is not None and p95 > self.cfg.slow_rtt_p95_ms:
             add("s7-slow-response", "warning",
                 "Медленный отклик PLC",

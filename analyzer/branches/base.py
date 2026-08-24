@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import bisect
+import datetime as _dt
+import hashlib
+import math
 import random
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -118,6 +121,26 @@ class BaseBranch(ABC):
 
     def __init__(self) -> None:
         self._srv_colors: dict[str, tuple[str, str]] = {}
+
+    # -- общее для веток ------------------------------------------------------
+    # Атрибуты pcap/pcap_str/cfg/tshark/progress заполняет analyze() ветки.
+
+    @staticmethod
+    def _sha256_short(path: Path) -> str:
+        """Первые 16 hex-символов SHA-256 файла (идентификатор дампа в отчёте)."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+
+    def _cmd(self, args_tail: str) -> str:
+        """Команда tshark для блока «проверить в отчёте».
+
+        В команде — только имя файла: он может лежать где угодно, полный
+        путь нужен лишь самому анализатору.
+        """
+        return f"tshark -r {self.pcap.name} {args_tail}"
 
     @staticmethod
     def _ip_key(ip: str) -> tuple:
@@ -356,3 +379,55 @@ class BaseBranch(ABC):
 
 def sort_recommendations(items: Sequence[Recommendation]) -> list[Recommendation]:
     return sorted(items, key=lambda r: (SEVERITY_ORDER.get(r.severity, 9), r.id))
+
+
+# ---------------------------------------------------------------------------
+# Общие утилиты разбора и форматирования (используются ветками протоколов)
+# ---------------------------------------------------------------------------
+
+def to_int(value, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def truthy(v: str) -> bool:
+    """tshark отдаёт булевы поля строками «1»/«True»."""
+    return (v or "").strip() in {"1", "True", "true"}
+
+
+def percentile(sorted_vals, p: float):
+    """Перцентиль p по ЗАРАНЕЕ отсортированному списку (линейная интерполяция)."""
+    if not sorted_vals:
+        return None
+    k = (len(sorted_vals) - 1) * p / 100.0
+    lo, hi = math.floor(k), math.ceil(k)
+    if lo == hi:
+        return sorted_vals[int(k)]
+    return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
+
+
+def fmt_ts_offset(ts: float, first_ts: float) -> str:
+    """Смещение от начала захвата в виде ЧЧ:ММ:СС."""
+    d = max(ts - first_ts, 0)
+    m, s = divmod(int(d), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def epoch_to_str(ts, time_only: bool = False) -> str:
+    """epoch → локальное время; единый формат дат во всех отчётах."""
+    if ts is None:
+        return "&mdash;"
+    d = _dt.datetime.fromtimestamp(float(ts),
+                                   tz=_dt.timezone.utc).astimezone()
+    return d.strftime("%H:%M:%S") if time_only \
+        else d.strftime("%d.%m.%Y %H:%M:%S")
