@@ -285,6 +285,37 @@ class TrendSeriesTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
+class TrendParallelTest(unittest.TestCase):
+    """--jobs 2 даёт те же точки, что и последовательная обработка."""
+
+    def runTest(self):  # noqa: N802
+        import tempfile
+        from tests import pcapgen
+        from analyzer.branches import get_branch
+        from analyzer.config import DEFAULT_CONFIG
+        from analyzer.trend import build_trend
+
+        tmp = Path(tempfile.mkdtemp(prefix="trendpar-"))
+        paths = []
+        for i, ts in enumerate((1735000000, 1735000300, 1735000600)):
+            p = tmp / f"p_{i}.pcap"
+            pcapgen.write_modbus_pcap(p, base_ts=ts)
+            paths.append(p)
+        branch = get_branch("modbus")
+
+        def prog(m, pct=None):
+            pass
+
+        seq, _ = build_trend(paths, branch, DEFAULT_CONFIG, progress=prog)
+        par, _ = build_trend(paths, branch, DEFAULT_CONFIG, progress=prog,
+                             jobs=3)
+        self.assertEqual([pt.path for pt in par], paths)   # порядок входа
+        for a, b in zip(seq, par):
+            self.assertEqual(a.metrics, b.metrics)
+            self.assertEqual(a.rec_ids, b.rec_ids)
+
+
+@unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
 class S7commAnalyzeTest(unittest.TestCase):
     """s7comm на первом образце, где такой трафик есть."""
 

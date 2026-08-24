@@ -3,11 +3,17 @@
 Точка тренда — результат обычного analyze() одного файла (ветка
 складывает компактные метрики в BranchResult.metrics). Тяжёлый проход
 диаграмм Ганта пропускается через Config.skip_gantt.
+
+Файлы можно обрабатывать параллельно (--jobs N): каждый воркер получает
+СВОЙ экземпляр ветки — состояние анализа инкапсулировано в экземпляре,
+общие данные только для чтения (зона отображения времени задаётся до
+запуска пула). Порядок результатов всегда соответствует порядку файлов.
 """
 
 from __future__ import annotations
 
 import time as _time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from glob import iglob
 from pathlib import Path
@@ -21,26 +27,59 @@ def expand_series(pattern: str) -> list[Path]:
     return sorted(Path(x) for x in iglob(pattern) if Path(x).is_file())
 
 
+def _analyze_file(branch: BaseBranch, f: Path, cfg,
+                  tshark_bin: str | None) -> tuple[TrendPoint, float]:
+    """Анализ одного файла; вернуть (точка, время анализа)."""
+    from dataclasses import replace
+    t0 = _time.monotonic()
+    res = branch.analyze(f, cfg=replace(cfg, skip_gantt=True),
+                         progress=lambda m, pct=None: None,
+                         tshark_bin=tshark_bin)
+    pt = TrendPoint(path=f, start_ts=res.capture_start_ts,
+                    metrics=dict(res.metrics),
+                    took_s=_time.monotonic() - t0)
+    for r in res.recommendations:
+        pt.rec_ids.add(r.id)
+        pt.rule_info.setdefault(r.id, (r.severity, r.title))
+    return pt, _time.monotonic() - t0
+
+
 def build_trend(files: list[Path], branch: BaseBranch, cfg,
                 progress=lambda msg, pct=None: None,
-                tshark_bin: str | None = None
+                tshark_bin: str | None = None, jobs: int = 1
                 ) -> tuple[list[TrendPoint], float]:
-    """Проанализировать каждый файл серии; вернуть точки и общее время."""
-    from dataclasses import replace
-    run_cfg = replace(cfg, skip_gantt=True)
-    points: list[TrendPoint] = []
+    """Проанализировать каждый файл серии; вернуть точки и общее время.
+
+    jobs > 1 — параллельная обработка в потоках; прогресс сообщается по
+    мере завершения файлов, порядок точек — как на входе.
+    """
     t_all = _time.monotonic()
-    for i, f in enumerate(files, 1):
-        t0 = _time.monotonic()
-        progress(f"[{i}/{len(files)}] {f.name} …")
-        res = branch.analyze(f, cfg=run_cfg, progress=progress,
-                             tshark_bin=tshark_bin)
-        pt = TrendPoint(path=f, start_ts=res.capture_start_ts,
-                        metrics=dict(res.metrics),
-                        took_s=_time.monotonic() - t0)
-        for r in res.recommendations:
-            pt.rec_ids.add(r.id)
-            pt.rule_info.setdefault(r.id, (r.severity, r.title))
-        points.append(pt)
-        progress(f"    готово за {_time.monotonic() - t0:.0f} c")
+    points: list[TrendPoint | None] = [None] * len(files)
+
+    if jobs <= 1 or len(files) < 2:
+        for i, f in enumerate(files, 1):
+            progress(f"[{i}/{len(files)}] {f.name} …")
+            pt, dt = _analyze_file(branch, f, cfg, tshark_bin)
+            points[i - 1] = pt
+            progress(f"    готово за {dt:.0f} c")
+    else:
+        done = 0
+        workers = min(jobs, len(files))
+        progress(f"Параллельная обработка: {workers} потоков…")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_analyze_file, type(branch)(), f, cfg,
+                              tshark_bin): i
+                    for i, f in enumerate(files)}
+            try:
+                for fut in as_completed(futs):
+                    i = futs[fut]
+                    points[i], _dt = fut.result()
+                    done += 1
+                    progress(f"[{done}/{len(files)}] готово: "
+                             f"{files[i].name}")
+            except BaseException:
+                for fu in futs:
+                    fu.cancel()
+                raise
+
     return points, _time.monotonic() - t_all

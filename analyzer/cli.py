@@ -67,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="путь к итоговому HTML (по умолчанию trend.html)")
     p_tr.add_argument("--tshark-bin", default=None,
                       help="путь к tshark (иначе TSHARK_BIN или PATH)")
+    p_tr.add_argument("--jobs", type=int, default=1, metavar="N",
+                      help="параллельно анализировать N файлов серии "
+                           "(по умолчанию 1)")
     p_tr.add_argument("--config", default=None,
                       help="TOML-файл с порогами правил "
                            "(ключи как в analyzer/config.py)")
@@ -87,6 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="путь к итоговому HTML (по умолчанию diff.html)")
     p_df.add_argument("--tshark-bin", default=None,
                       help="путь к tshark (иначе TSHARK_BIN или PATH)")
+    p_df.add_argument("--jobs", type=int, default=1, metavar="N",
+                      help="параллельно анализировать N файлов серии "
+                           "(по умолчанию 1)")
     p_df.add_argument("--config", default=None,
                       help="TOML-файл с порогами правил "
                            "(ключи как в analyzer/config.py)")
@@ -223,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
             points, took = build_trend(
                 files, branch, cfg,
                 progress=lambda m, pct=None: _progress(m),
-                tshark_bin=args.tshark_bin)
+                tshark_bin=args.tshark_bin,
+                jobs=max(1, getattr(args, "jobs", 1)))
         except TsharkError as e:
             print(f"Ошибка: {e}", file=sys.stderr)
             return 1
@@ -258,11 +265,13 @@ def main(argv: list[str] | None = None) -> int:
         _progress("Период «до»…")
         points_a, ta = build_trend(files_a, branch, cfg,
                                    progress=prog,
-                                   tshark_bin=args.tshark_bin)
+                                   tshark_bin=args.tshark_bin,
+                                   jobs=max(1, args.jobs))
         _progress("Период «после»…")
         points_b, tb = build_trend(files_b, branch, cfg,
                                    progress=prog,
-                                   tshark_bin=args.tshark_bin)
+                                   tshark_bin=args.tshark_bin,
+                                   jobs=max(1, args.jobs))
         out = _Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(render_diff_html(points_a, points_b,
