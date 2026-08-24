@@ -64,6 +64,8 @@ class Config:
     s7_setup_comm_warn: int = 5            # повторных установок связи для рекомендации
     s7_single_read_min: int = 50           # минимум чтений Read Var для совета о группировке
     s7_single_read_pct: float = 80.0       # доля запросов с одним элементом, %
+    s7_no_response_warn_pct: float = 10.0  # доля Job без Ack_Data для warning, %
+    s7_dead_min_syns: int = 5              # SYN к «молчащему» узлу :102 для рекомендации
 
     # --- Прочее ---------------------------------------------------------------
     top_registers_limit: int = 20          # топ-N регистров в отчёте

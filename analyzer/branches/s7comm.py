@@ -219,7 +219,7 @@ class S7CommAnalyzer(BaseBranch):
 
     FIELDS_GENERAL = [
         "frame.time_epoch", "frame.len", "ip.src", "ip.dst",
-        "tcp.stream", "tcp.srcport", "tcp.dstport",
+        "tcp.stream", "tcp.srcport", "tcp.dstport", "tcp.len",
         "tcp.flags.syn", "tcp.flags.ack", "tcp.flags.reset", "tcp.flags.fin",
     ]
 
@@ -261,8 +261,16 @@ class S7CommAnalyzer(BaseBranch):
                     client, server = self._roles(sport, dport, src, dst)
                     info = g.streams102.setdefault(
                         st, {"client": client, "server": server,
-                             "first": ts, "last": ts}
+                             "first": ts, "last": ts,
+                             # полезная нагрузка в сторону PLC и обратно —
+                             # для поиска «пустых» подключений без обмена
+                             "req_bytes": 0, "resp_bytes": 0}
                     )
+                    tlen = to_int(r.get("tcp.len"), 0)
+                    if sport == PORT:
+                        info["resp_bytes"] += max(tlen, 0)
+                    else:
+                        info["req_bytes"] += max(tlen, 0)
                     if ts is not None:
                         if info["first"] is None or ts < info["first"]:
                             info["first"] = ts
@@ -296,11 +304,14 @@ class S7CommAnalyzer(BaseBranch):
             "setup_comms": 0,
             "pairs": {},                  # (client, plc) -> PairStats
             "fcodes_all": Counter(),      # func -> число сообщений
-            "areas": Counter(),           # (area, db) -> число чтений элементов
+            "areas_r": Counter(),         # (area, db) -> элементы чтения
+            "areas_w": Counter(),         # (area, db) -> элементы записи
+            "itemcnt_hist": Counter(),    # число элементов запроса -> запросов
             "retcodes": Counter(),       # код возврата -> число элементов
             "timeline": {},               # bucket -> [reqs, errs]
             "pending": {},                # (stream, pduref) -> [Req, ...]
             "stream_reqs": Counter(),
+            "s7_streams": set(),          # потоки, где был хоть один PDU S7
         }
         rows = stream_fields(self.tshark, self.pcap_str, self.FIELDS_S7,
                              display_filter="s7comm")
@@ -328,6 +339,7 @@ class S7CommAnalyzer(BaseBranch):
             ps.bytes_ += to_int(r.get("frame.len"), 0)
             if st != "":
                 ps.streams.add(st)
+                s7["s7_streams"].add(st)
 
             errcls = _first(r.get("s7comm.header.errcls"))
 
@@ -344,10 +356,14 @@ class S7CommAnalyzer(BaseBranch):
                 ps.items += max(itemcnt, 0)
                 if itemcnt <= 1:
                     ps.single_item_reqs += 1
+                if itemcnt > 0:
+                    s7["itemcnt_hist"][itemcnt] += 1
                 area = _first(r.get("s7comm.param.item.area"))
                 if area:
                     db = _first(r.get("s7comm.param.item.db"))
-                    s7["areas"][(area, db)] += max(itemcnt, 1)
+                    bucket = (s7["areas_w"] if func == "0x05"
+                              else s7["areas_r"])
+                    bucket[(area, db)] += max(itemcnt, 1)
                 if ts is not None and st != "":
                     s7.setdefault("pending", {}).setdefault(
                         (st, pduref), []).append(Req(ts, st, key))
@@ -414,6 +430,9 @@ class S7CommAnalyzer(BaseBranch):
                     f"SYN-попыток: {len(gen.syn102)}"),
             KpiItem("S7-запросов (Job)", C.fmt_int(s7["req_total"]),
                     f"ответов: {C.fmt_int(s7['resp_total'])}"),
+            KpiItem("Запросов без ответа", C.fmt_int(no_resp),
+                    C.fmt_pct(no_resp, s7["req_total"]) + " от запросов"
+                    if s7["req_total"] else ""),
             KpiItem("Сообщений Userdata", C.fmt_int(s7["userdata_total"]),
                     "диагностика/SZL и пр."),
             KpiItem("Ошибок в ответах", C.fmt_int(s7["err_total"]),
@@ -532,10 +551,15 @@ class S7CommAnalyzer(BaseBranch):
                 f"{FUNC_NAMES.get(f, f)}<span class='note'>×{n}</span>"
                 for f, n in ps.fcodes.most_common(3)
             )
+            no_resp_cell = f'<span class="num">{C.fmt_int(ps.no_resp)}</span>'
+            if ps.reqs and 100.0 * ps.no_resp / ps.reqs >= \
+                    self.cfg.s7_no_response_warn_pct:
+                no_resp_cell = (no_resp_cell, "cell-hot")
             rows.append([
                 f"<strong>{C.esc(cl)}</strong>", self._srv_cell(sv),
                 f'<span class="num">{C.fmt_int(ps.reqs)}</span>',
                 f'<span class="num">{C.fmt_int(ps.resps)}</span>',
+                no_resp_cell,
                 f'<span class="num">{C.fmt_int(ps.errors)}</span>',
                 f'<span class="num">{C.fmt_int(ps.items)}</span>',
                 f'<span class="num">{C.fmt_ms(p50)}</span>',
@@ -544,7 +568,7 @@ class S7CommAnalyzer(BaseBranch):
             ])
         body = (
             C.table_html(
-                ["Клиент", "PLC", "Запросы", "Ответы", "Ошибки",
+                ["Клиент", "PLC", "Запросы", "Ответы", "Нет отв.", "Ошибки",
                  "Элементов", "p50, мс", "p95, мс", "Байты",
                  "Основные функции"],
                 rows, cls="pairs")
@@ -553,7 +577,10 @@ class S7CommAnalyzer(BaseBranch):
               "<strong>p95</strong> — 95% запросов уложились в это время, лишь 5% "
               "были медленнее: если p50 маленький, а p95 большой, отклик обычно "
               "быстрый, но иногда «подвисает». «Элементов» — суммарное число "
-              "переменных (элементов Read/Write Var) в запросах.</p>"
+              "переменных (элементов Read/Write Var) в запросах. "
+              "<strong>Нет отв.</strong> — Job без сопоставленного Ack_Data до "
+              "конца захвата: при переподключениях транзакции теряются вместе с "
+              "соединением, высокая доля подсвечена розовым.</p>"
         )
         cmds = [
             ("Диалоги клиент-PLC", self._cmd("-q -z conv,tcp")),
@@ -651,7 +678,41 @@ class S7CommAnalyzer(BaseBranch):
             tbl = ('<h3 class="subhead">Самые долгие соединения</h3>'
                    + C.table_html(["Поток", "Направление", "Старт",
                                    "Длительность"], st_rows))
-        body = head + detail + tbl + (
+        # Цели :102: где поднимали соединения и был ли в них хоть какой-то
+        # обмен. Поток «молчит», если от PLC не пришло ни байта полезной
+        # нагрузки, — признак недоступного или резервного устройства.
+        tgt_rows = []
+        targets = sorted({info["server"] for info in gen.streams102.values()}
+                         | {s for _t, _c, s in gen.syn102})
+        for srv in targets:
+            streams = {n: i for n, i in gen.streams102.items()
+                       if i["server"] == srv}
+            syn_n = sum(1 for _t, _c, s in gen.syn102 if s == srv)
+            with_s7 = sum(1 for n in streams if n in s7["s7_streams"])
+            dead = sum(1 for i in streams.values() if not i["resp_bytes"])
+            tgt_rows.append([
+                self._srv_cell(srv),
+                f'<span class="num">{C.fmt_int(syn_n)}</span>',
+                f'<span class="num">{C.fmt_int(len(streams))}</span>',
+                f'<span class="num">{C.fmt_int(with_s7)}</span>',
+                (f'<span class="num">{C.fmt_int(dead)}</span>', "cell-hot")
+                if dead and dead >= len(streams) and syn_n >= 2 else
+                f'<span class="num">{C.fmt_int(dead)}</span>',
+            ])
+        targets_tbl = ""
+        if tgt_rows:
+            targets_tbl = (
+                '<h3 class="subhead">Цели на порту 102: обмен по соединениям</h3>'
+                + C.table_html(
+                    ["Узел", "SYN", "Потоков", "С S7-обменом", "Молчат"],
+                    tgt_rows)
+                + '<p class="note"><strong>Молчат</strong> — соединения, в '
+                  'которых от узла не пришло ни одного байта полезной нагрузки: '
+                  'клиенты регулярно подключаются, но контроллер не отвечает '
+                  '(устройство обесточено/в резерве, блокировка по IP или '
+                  'ограничение числа TSAP). Розовым отмечены узлы, где молчат '
+                  'все наблюдаемые потоки.</p>')
+        body = head + detail + targets_tbl + tbl + (
             '<p class="note">Для S7comm нормой считается одно долгоживущее '
             "соединение на пару клиент-PLC. Частые SYN — признак пересоздания "
             "соединений, нестабильной сети или агрессивного таймаута HMI.</p>"
@@ -751,6 +812,28 @@ class S7CommAnalyzer(BaseBranch):
               "команды управления; <strong>Setup communication</strong> при "
               "многих соединениях — признак постоянных переподключений.</p>"
         )
+        # Сколько переменных запрашивают за один Job: много одиночных
+        # запросов — кандидат на группировку в один Read Var.
+        hist_html = ""
+        if s7["itemcnt_hist"]:
+            hist = sorted(s7["itemcnt_hist"].items())[:12]
+            bars = [(f"{n} эл.", cnt) for n, cnt in hist]
+            svg = C.vbar_svg(bars, color=C.PALETTE[5]) if len(bars) > 1 else ""
+            total_jobs = sum(s7["itemcnt_hist"].values())
+            single = s7["itemcnt_hist"].get(1, 0)
+            top_line = (
+                f"<p>Запросов с одним элементом: <strong>{C.fmt_int(single)}</strong> "
+                f"из {C.fmt_int(total_jobs)} ({C.fmt_pct(single, total_jobs)}).</p>")
+            hist_html = (
+                '<h3 class="subhead">Сколько элементов в одном запросе</h3>'
+                + (f'<div class="chart-box">{svg}</div>' if svg else "")
+                + top_line
+                + '<p class="note">Один элемент Read Var читает непрерывный '
+                  'участок до ~480 байт; соседние переменные выгодно собирать '
+                  'в один Job — меньше пакетов на цикл и меньше загрузка PLC. '
+                  'Пик на «1 эл.» при большом числе запросов — признак '
+                  'поэлементного опроса.</p>')
+        body += hist_html
         cmds = [
             ("Распределение функций",
              self._cmd("-Y s7comm -T fields -e s7comm.param.func "
@@ -763,22 +846,32 @@ class S7CommAnalyzer(BaseBranch):
         return Section("functions", "Функции S7comm", body, cmds)
 
     def _sec_areas(self, s7: dict) -> Section:
+        keys = (set(s7["areas_r"]) | set(s7["areas_w"]))
+        ranked = sorted(keys, key=lambda k: s7["areas_r"][k] + s7["areas_w"][k],
+                        reverse=True)
         rows = []
-        for (area, db), cnt in s7["areas"].most_common(
-                self.cfg.top_registers_limit):
+        for area, db in ranked[: self.cfg.top_registers_limit]:
             name = AREA_NAMES.get(area, f"Область {area}")
             label = f"{name}, №{int(db, 16)}" if area == "0x84" and db else name
+            rd = s7["areas_r"][(area, db)]
+            wr = s7["areas_w"][(area, db)]
             rows.append([
                 f"<code class=\"inline\">{C.esc(area)}</code>",
                 C.esc(label),
-                f'<span class="num">{C.fmt_int(cnt)}</span>',
+                f'<span class="num">{C.fmt_int(rd)}</span>',
+                f'<span class="num">{C.fmt_int(wr)}</span>',
+                f'<span class="num">{C.fmt_pct(wr, rd + wr)}</span>',
             ])
         body = (
-            "<p>Какие области памяти читаются чаще всего:</p>"
-            + C.table_html(["Код", "Область", "Обращений"], rows)
+            "<p>Какие области памяти читаются и пишутся чаще всего "
+            "(элементы в запросах):</p>"
+            + C.table_html(["Код", "Область", "Чтений", "Записей",
+                            "Доля записей"], rows)
             + '<p class="note">Для области DB указан номер блока. Много мелких '
               "чтений одного блока — кандидат на объединение: S7 позволяет "
-              "запрашивать до ~480 байт за один элемент Read Var.</p>"
+              "запрашивать до ~480 байт за один элемент Read Var. Высокая доля "
+              "записей в DB — повод проверить циклы обмена с уставками: запись "
+              "тяжелее чтения и может блокировать области на время транзакции.</p>"
         )
         cmds = [
             ("Обращения к областям памяти",
@@ -878,14 +971,58 @@ class S7CommAnalyzer(BaseBranch):
                     "-e frame.number -e s7comm.data.returncode "
                     "-e s7comm.param.item.db")])
 
-        # 3. Запросы без ответа
-        pending_cnt = len(s7.get("pending", {}))
+        # 3. Запросы без ответа: считаем ВСЕ зависшие транзакции, а не
+        # только ключи словаря; при высокой доле — эскалация до warning
+        pending_cnt = sum(len(v) for v in s7.get("pending", {}).values())
         if pending_cnt:
-            add("s7-unanswered", "info",
-                "Есть запросы без сопоставленного ответа",
-                f"Не дождались Ack_Data: {pending_cnt}.",
-                "Возможны обрывы соединения или ретрансмиссии; проверьте "
-                "стабильность канала до PLC.")
+            rate = 100.0 * pending_cnt / s7["req_total"] if s7["req_total"] else 0.0
+            sev = ("warning" if rate >= self.cfg.s7_no_response_warn_pct
+                   else "info")
+            worst = sorted(s7["pairs"].items(),
+                           key=lambda kv: kv[1].no_resp, reverse=True)[:3]
+            ev = [f"{cl} → {p}: {ps.no_resp} без ответа из {ps.reqs}"
+                  for (cl, p), ps in worst if ps.no_resp]
+            add("s7-unanswered", sev,
+                "Запросы остаются без ответа PLC",
+                f"Не дождались Ack_Data: {pending_cnt} "
+                f"({rate:.1f}% от всех Job).",
+                "Транзакции теряются вместе с соединением при "
+                "переподключениях либо PLC не успевает отвечать в таймаут "
+                "клиента. Сопоставьте моменты пропадания ответов с разрывами "
+                "TCP; для виновника проверьте длину цикла PLC и число "
+                "одновременных соединений.",
+                evidence=ev,
+                commands=[self._cmd(
+                    '-Y "s7comm.header.rosctr==1 && !s7comm.header.pduref" '
+                    "-c 5")])
+
+        # 3b. «Молчащие» цели :102 — подключения без единого байта ответа
+        dead_ev = []
+        for srv in sorted({i["server"] for i in gen.streams102.values()}):
+            streams = [i for i in gen.streams102.values()
+                       if i["server"] == srv]
+            if not streams:
+                continue
+            syn_n = sum(1 for _t, _c, s in gen.syn102 if s == srv)
+            dead = sum(1 for i in streams if not i["resp_bytes"])
+            if dead and dead == len(streams) \
+                    and syn_n >= self.cfg.s7_dead_min_syns:
+                dead_ev.append(
+                    f"{srv}: {syn_n} подключений, ни одного байта ответа")
+        if dead_ev:
+            add("s7-dead-target", "warning",
+                "Подключения к узлу :102 без какого-либо ответа",
+                f"Молчащих узлов: {len(dead_ev)}.",
+                "Клиент регулярно открывает TCP-соединения, но контроллер не "
+                "отвечает даже handshake-данными: устройство обесточено или в "
+                "резерве, занято лимитом соединений, либо фильтрует адрес "
+                "клиента. Лишние попытки создают нагрузку и шум; уберите "
+                "узел из конфигурации опроса или верните его в работу.",
+                evidence=dead_ev[:6],
+                commands=[self._cmd(
+                    '-Y "tcp.dstport==102 && tcp.flags.syn==1 && '
+                    'tcp.flags.ack==0" -T fields -e ip.dst | '
+                    "sort | uniq -c | sort -rn")])
 
         # 4. Частые переподключения
         dur = gen.duration
