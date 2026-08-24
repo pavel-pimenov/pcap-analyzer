@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
+from collections import deque
 from typing import Iterable, Iterator, Sequence
 
 # Разделители вывода tshark -T fields
@@ -69,11 +71,27 @@ def stream_fields(
         errors="replace",
     )
     assert proc.stdout is not None
+
+    # stderr обязан сливаться непрерывно: если tshark завалит пайп stderr
+    # предупреждениями (битые пакеты, экспериментальные диссекторы), он
+    # заблокируется на записи и никогда не завершится. Читаем в фоновом
+    # потоке; для диагностики хватает последних строк.
+    err_tail: deque[str] = deque(maxlen=50)
+
+    def _drain_stderr() -> None:
+        try:
+            for line in proc.stderr:            # type: ignore[union-attr]
+                err_tail.append(line)
+        except (ValueError, OSError):
+            pass                                # пайп закрыт при kill — штатно
+
+    err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    err_thread.start()
     try:
         header_line = proc.stdout.readline()
         if not header_line:
             # Возможна ошибка запуска — проверим stderr
-            _raise_from_process(proc)
+            _raise_from_process(proc, err_tail)
         columns = [c.strip() for c in header_line.rstrip("\n").split(FIELD_SEPARATOR)]
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -87,11 +105,12 @@ def stream_fields(
         proc.stdout.close()
         code = proc.wait()
         if code != 0:
-            err = proc.stderr.read() if proc.stderr else ""
+            err = "".join(err_tail)
             raise TsharkError(f"tshark завершился с кодом {code}: {err.strip()[:2000]}")
     finally:
         if proc.poll() is None:
             proc.kill()
+        proc.wait()
         if proc.stderr is not None:
             proc.stderr.close()
 
@@ -110,8 +129,8 @@ def run_list(tshark_bin: str, args: Sequence[str]) -> str:
     return result.stdout
 
 
-def _raise_from_process(proc: subprocess.Popen) -> None:
+def _raise_from_process(proc: subprocess.Popen, err_tail: deque) -> None:
     """Если tshark не выдал заголовок — завершить процесс и бросить ошибку."""
-    err = proc.stderr.read() if proc.stderr else ""
     code = proc.wait()
+    err = "".join(err_tail)
     raise TsharkError(f"tshark не вернул данных (код {code}): {err.strip()[:2000]}")
