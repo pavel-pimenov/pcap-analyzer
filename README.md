@@ -167,7 +167,8 @@ pcap-analyzer/
     └── branches/
         ├── base.py           # интерфейс ветки (Section, Recommendation, …)
         ├── __init__.py       # реестр веток BRANCHES
-        └── modbus_tcp.py     # ветка Modbus/TCP
+        ├── modbus_tcp.py     # ветка Modbus/TCP
+        └── s7comm.py         # ветка S7comm (Siemens, порт 102)
 ```
 
 ## Как это работает

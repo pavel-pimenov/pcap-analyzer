@@ -64,9 +64,11 @@ analyzer/
 │   ├── server.py         # http.server: загрузка, очередь анализа, /view, /export
 │   └── page.py           # одностраничный интерфейс (всё инлайном)
 └── branches/
-    ├── base.py           # BaseBranch, BranchResult, Section, Recommendation, KpiItem
-    ├── __init__.py       # BRANCHES = {"modbus": ModbusTcpAnalyzer}, get_branch()
-    └── modbus_tcp.py     # два прохода по pcap + правила рекомендаций
+    ├── base.py           # BaseBranch, BranchResult, Section, Recommendation, KpiItem,
+    │                     # Reservoir, общие утилиты (to_int/percentile/…), Гант-хелперы
+    ├── __init__.py       # BRANCHES = {"modbus": ModbusTcpAnalyzer, "s7comm": S7CommAnalyzer}
+    ├── modbus_tcp.py     # два прохода по pcap + правила рекомендаций
+    └── s7comm.py         # ветка S7comm (Siemens, порт 102)
 ```
 
 ## Как проверять изменения
