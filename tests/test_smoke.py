@@ -195,12 +195,23 @@ class ModbusAnalyzeTest(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
 class S7commAnalyzeTest(unittest.TestCase):
-    """s7comm на одноимённом образце, если он есть."""
+    """s7comm на первом образце, где такой трафик есть."""
 
     def runTest(self):  # noqa: N802 — динамический skip внутри
-        pcap = _pick_sample("s7")
+        pcap = None
+        pcaps = sorted(p for p in SAMPLES.iterdir()
+                       if p.suffix.lower() in {".pcap", ".pcapng", ".cap"}
+                       ) if SAMPLES.is_dir() else []
+        for p in pcaps:
+            probe = subprocess.run(
+                ["tshark", "-r", str(p), "-Y", "s7comm", "-c", "1",
+                 "-T", "fields", "-e", "frame.number"],
+                capture_output=True, text=True, timeout=600)
+            if any(ln.strip() for ln in probe.stdout.splitlines()):
+                pcap = p
+                break
         if pcap is None:
-            self.skipTest("нет s7comm-образца")
+            self.skipTest("нет образца с S7comm-трафиком")
         from analyzer.tshark_runner import find_tshark
         result = get_branch("s7comm").analyze(
             pcap, DEFAULT_CONFIG, progress=lambda m, pct=None: None,

@@ -75,15 +75,25 @@ def stream_fields(
     # stderr обязан сливаться непрерывно: если tshark завалит пайп stderr
     # предупреждениями (битые пакеты, экспериментальные диссекторы), он
     # заблокируется на записи и никогда не завершится. Читаем в фоновом
-    # потоке; для диагностики хватает последних строк.
+    # потоке через ДУБЛИКАТ дескриптора (свой файловый объект): закрытие
+    # proc.stderr из основного потока не заденет читающий поток и не
+    # устроит гонку на внутреннем замке BufferedReader. Для диагностики
+    # хватает последних строк.
     err_tail: deque[str] = deque(maxlen=50)
+    err_stream = os.fdopen(os.dup(proc.stderr.fileno()),
+                           "r", encoding="utf-8", errors="replace")
 
     def _drain_stderr() -> None:
         try:
-            for line in proc.stderr:            # type: ignore[union-attr]
+            for line in err_stream:
                 err_tail.append(line)
         except (ValueError, OSError):
             pass                                # пайп закрыт при kill — штатно
+        finally:
+            try:
+                err_stream.close()
+            except OSError:
+                pass
 
     err_thread = threading.Thread(target=_drain_stderr, daemon=True)
     err_thread.start()
@@ -110,9 +120,18 @@ def stream_fields(
     finally:
         if proc.poll() is None:
             proc.kill()
-        proc.wait()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if proc.stdout is not None:
+            proc.stdout.close()
         if proc.stderr is not None:
             proc.stderr.close()
+        # после kill пайп достигает EOF, поток заканчивается сам; ждём
+        # ограниченно, чтобы не оставить чтение «наперегонки» с финализацией
+        if err_thread.is_alive():
+            err_thread.join(timeout=2)
 
 
 def run_list(tshark_bin: str, args: Sequence[str]) -> str:
