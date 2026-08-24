@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 
 from ..config import Config
 from ..tshark_runner import find_tshark, stream_fields
@@ -101,15 +102,58 @@ def _first(value: str) -> str:
     return (value or "").split(",")[0].strip().lower()
 
 
+def _split_field(value: str) -> list[str]:
+    """Разбить агрегированное поле tshark на список значений."""
+    return [x.strip().lower()
+            for x in (value or "").split(",") if x.strip()]
+
+
+def _to_int_auto(value: str) -> int | None:
+    """Целое с автоопределением основания (tshark даёт «0x1f» и «31»)."""
+    try:
+        return int(value, 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_labels(r: dict) -> tuple[str, ...]:
+    """Читаемая метка каждого элемента запроса: «DB123@100..107», «M@5».
+
+    Поля tshark агрегированы через запятую по позициям элементов —
+    склеиваем их попарно.
+    """
+    areas = _split_field(r.get("s7comm.param.item.area"))
+    dbs = _split_field(r.get("s7comm.param.item.db"))
+    addrs = _split_field(r.get("s7comm.param.item.address.byte"))
+    lens = _split_field(r.get("s7comm.param.item.length"))
+    out = []
+    for i, area in enumerate(areas):
+        db = dbs[i] if i < len(dbs) else ""
+        base = (f"DB{int(db, 16)}" if area == "0x84" and db
+                else AREA_NAMES.get(area, f"область {area}"))
+        addr = _to_int_auto(addrs[i]) if i < len(addrs) else None
+        ln = _to_int_auto(lens[i]) if i < len(lens) else None
+        suffix = ""
+        if addr is not None:
+            if ln and ln > 1:
+                suffix = f"@{addr}..{addr + ln - 1}"
+            else:
+                suffix = f"@{addr}"
+        out.append(base + suffix)
+    return tuple(out)
+
+
 class Req:
     """Запрос Job (rosctr=1) в ожидании Ack_Data."""
 
-    __slots__ = ("ts", "stream", "pair")
+    __slots__ = ("ts", "stream", "pair", "func", "items")
 
-    def __init__(self, ts, stream, pair):
+    def __init__(self, ts, stream, pair, func: str = "", items=()):
         self.ts = ts
         self.stream = stream
         self.pair = pair          # (client, plc)
+        self.func = func          # код функции параметра («0x04» и т.п.)
+        self.items = items        # метки элементов запроса («DB1@0»…)
 
 
 @dataclass
@@ -291,6 +335,7 @@ class S7CommAnalyzer(BaseBranch):
         "s7comm.header.errcls", "s7comm.header.errcod",
         "s7comm.param.func", "s7comm.param.itemcount",
         "s7comm.param.item.area", "s7comm.param.item.db",
+        "s7comm.param.item.address.byte", "s7comm.param.item.length",
         "s7comm.data.returncode", "s7comm.data.length",
     ]
 
@@ -314,6 +359,9 @@ class S7CommAnalyzer(BaseBranch):
             "s7_streams": set(),          # потоки, где был хоть один PDU S7
             "stale_dropped": 0,           # Job вытеснен переполненной очередью pduref
             "stale_matched": 0,           # ответ «сцепился» с давно зависшим Job
+            "err_pairs": {},              # (client, plc) -> ответов с ошибками
+            # (client, plc, объект) -> {"codes": Counter, "read": n, "write": n}
+            "err_targets": {},
         }
         rows = stream_fields(self.tshark, self.pcap_str, self.FIELDS_S7,
                              display_filter="s7comm")
@@ -369,7 +417,8 @@ class S7CommAnalyzer(BaseBranch):
                 if ts is not None and st != "":
                     q = s7.setdefault("pending", {}).setdefault(
                         (st, pduref), [])
-                    q.append(Req(ts, st, key))
+                    q.append(Req(ts, st, key, func=func,
+                                 items=_item_labels(r)))
                     # pduref циклически переиспользуется на долгоживущем
                     # потоке: если старые Job так и не получили ответ,
                     # ограничиваем очередь, иначе каждый новый ответ
@@ -388,6 +437,7 @@ class S7CommAnalyzer(BaseBranch):
                 # Ответ Ack_Data
                 s7["resp_total"] += 1
                 ps.resps += 1
+                req = None
                 waiters = s7.get("pending", {}).get((st, pduref))
                 if waiters:
                     req = waiters.pop(0)
@@ -416,6 +466,19 @@ class S7CommAnalyzer(BaseBranch):
                     s7["err_total"] += 1
                     b = int((ts or first_ts) - first_ts) // bucket_sec
                     s7["timeline"].setdefault(b, [0, 0])[1] += 1
+                # привязываем ошибки к паре и к объектам запроса: позиции
+                # кодов возврата соответствуют позициям элементов запроса
+                if bad_rets:
+                    s7["err_pairs"][key] = s7["err_pairs"].get(key, 0) + 1
+                    is_write = bool(req and req.func == "0x05")
+                    items = (req.items or ()) if req is not None else ()
+                    for i, code in enumerate(bad_rets):
+                        label = items[i] if i < len(items) else "?"
+                        d = s7["err_targets"].setdefault(
+                            (key[0], key[1], label),
+                            {"codes": Counter(), "read": 0, "write": 0})
+                        d["codes"][code] += 1
+                        d["write" if is_write else "read"] += 1
 
             elif rosctr == "7":
                 s7["userdata_total"] += 1
@@ -475,6 +538,9 @@ class S7CommAnalyzer(BaseBranch):
             sections.append(self._sec_functions(s7))
             sections.append(self._sec_areas(s7))
             sections.append(self._sec_errors(s7))
+            err_sec = self._sec_item_errors(s7)
+            if err_sec:
+                sections.append(err_sec)
         else:
             sections.append(Section(
                 "nos7", "S7comm не обнаружен",
@@ -905,6 +971,82 @@ class S7CommAnalyzer(BaseBranch):
         ]
         return Section("areas", "Области памяти PLC", body, cmds)
 
+    def _sec_item_errors(self, s7: dict) -> Section | None:
+        """Кто и какие именно переменные опрашивает «мимо» (ошибки элементов)."""
+        if not s7["err_targets"] and not s7["err_pairs"]:
+            return None
+        # Таблица 1: по парам клиент → PLC
+        pair_rows = []
+        for (cl, plc), cnt in sorted(s7["err_pairs"].items(),
+                                     key=lambda kv: kv[1], reverse=True):
+            ps = s7["pairs"].get((cl, plc))
+            reqs = ps.reqs if ps else 0
+            pct = C.fmt_pct(cnt, reqs) if reqs else "&mdash;"
+            cell = f'<span class="num">{C.fmt_int(cnt)}</span>'
+            if reqs and 100.0 * cnt / reqs >= self.cfg.s7_no_response_warn_pct:
+                cell = (cell, "cell-hot")
+            pair_rows.append([
+                f"<strong>{C.esc(cl)}</strong>", self._srv_cell(plc),
+                cell,
+                f'<span class="num">{C.fmt_int(reqs)}</span>',
+                pct,
+            ])
+        html = (
+            '<h3 class="subhead">Кто получает ошибки</h3>'
+            + C.table_html(
+                ["Клиент", "PLC", "Ответов с ошибками", "Всего запросов",
+                 "Доля"], pair_rows))
+        # Таблица 2: конкретные объекты с ошибками
+        ranked = sorted(
+            s7["err_targets"].items(),
+            key=lambda kv: sum(kv[1]["codes"].values()), reverse=True)
+        obj_rows = []
+        for (cl, plc, label), d in ranked[: self.cfg.max_rows_per_table]:
+            total = sum(d["codes"].values())
+            codes = ", ".join(
+                f"{C.esc(code)}×{n}" for code, n in
+                sorted(d["codes"].items(), key=lambda kv: kv[1],
+                       reverse=True))
+            obj_rows.append([
+                f"<strong>{C.esc(cl)}</strong>",
+                self._srv_cell(plc),
+                f"<code class=\"inline\">{C.esc(label)}</code>",
+                "запись" if d["write"] > d["read"] else "чтение",
+                f'<span class="num">{C.fmt_int(total)}</span>',
+                codes,
+            ])
+        html += (
+            '<h3 class="subhead">Какие объекты отвечают ошибкой</h3>'
+            + C.table_html(
+                ["Клиент", "PLC", "Объект запроса", "Операция",
+                 "Ошибок", "Коды"], obj_rows)
+            + '<p class="note"><strong>Объект</strong> восстановлен из '
+              'элемента запроса, позиция которого совпадает с позицией '
+              'кода возврата в ответе. Частые коды: <strong>0x0a</strong> — '
+              'объекта не существует (тег удалён/переименован в программе '
+              'PLC); <strong>0x05</strong> — адрес вне диапазона (границы DB '
+              'меньше запрашиваемых); <strong>0x07/0x06</strong> — тип данных '
+              'не поддерживается/не разрешён. Каждая такая транзакция — '
+              'бесполезный цикл обмена: PLC тратит время и отвечает пустым '
+              'результатом. Исправьте привязку тегов на стороне HMI/SCADA '
+              'или верните переменную в программу.</p>')
+        cmds = []
+        if ranked:
+            (cl, plc, label), d = ranked[0]
+            db_m = re.match(r"DB(\d+)", label)
+            db_filter = (f" && s7comm.param.item.db == 0x{int(db_m.group(1)):x}"
+                         if db_m else "")
+            cmds.append((
+                f"Все ошибочные обращения к {label} от {cl}",
+                self._cmd(f'-Y "s7comm.data.returncode != 0xff && '
+                          f"ip.src=={cl}{db_filter}\" -T fields "
+                          "-e frame.number -e frame.time "
+                          "-e s7comm.data.returncode "
+                          "-e s7comm.param.item.address.byte")))
+        return Section("item-errors",
+                       "Ошибки доступа к переменным: кто и что",
+                       html, cmds)
+
     def _sec_errors(self, s7: dict) -> Section:
         rows = []
         for code, cnt in s7["retcodes"].most_common():
@@ -975,22 +1117,38 @@ class S7CommAnalyzer(BaseBranch):
         resp_total = s7["resp_total"]
         err_rate = (s7["err_total"] / resp_total * 100.0) if resp_total else 0.0
         if resp_total and err_rate >= self.cfg.s7_item_error_pct:
-            hot_codes = [c for c, _n in s7["retcodes"].most_common()
-                         if c not in ("0xff", "0x00")][:3]
-            ev = [f"{RETCODE_NAMES.get(c, c)} ({c})"
-                  for c in hot_codes]
+            # виновники: пары с наибольшим числом ошибочных ответов
+            pair_ev = [f"{cl} → {p}: {n} ответов с ошибками"
+                       for (cl, p), n in
+                       sorted(s7["err_pairs"].items(), key=lambda kv: kv[1],
+                              reverse=True)[:3]]
+            # конкретные объекты, отвечающие ошибкой
+            obj_ev = []
+            for (cl, plc_ip, label), d in sorted(
+                    s7["err_targets"].items(),
+                    key=lambda kv: sum(kv[1]["codes"].values()),
+                    reverse=True)[:5]:
+                total = sum(d["codes"].values())
+                top_code, top_n = d["codes"].most_common(1)[0]
+                obj_ev.append(
+                    f"{cl} → {plc_ip} {label}: {total}× "
+                    f"({RETCODE_NAMES.get(top_code, top_code)})")
             add("s7-item-errors", "warning",
                 "Часть ответов содержит ошибки доступа к переменным",
                 f"Ошибочные ответы: {C.fmt_int(s7['err_total'])} из "
                 f"{C.fmt_int(resp_total)} ({C.fmt_pct(s7['err_total'], resp_total)}).",
-                "Сверьте список тегов HMI/SCADA с реальными переменными PLC: "
-                "ошибки адресации означают устаревшую привязку тегов после "
-                "изменения программы.",
-                evidence=ev,
+                "Сверьте перечисленные объекты со списком тегов HMI/SCADA и "
+                "актуальной программой PLC: «объект не существует» (0x0a) — "
+                "тег удалён или переименован; «адрес вне диапазона» (0x05) — "
+                "запрос выходит за границы DB. Каждая такая транзакция тратит "
+                "цикл контроллера впустую; исправьте привязку тегов или верните "
+                "переменные в программу.",
+                evidence=obj_ev + pair_ev,
                 commands=[self._cmd(
                     '-Y "s7comm.data.returncode != 0xff" -T fields '
-                    "-e frame.number -e s7comm.data.returncode "
-                    "-e s7comm.param.item.db")])
+                    "-e frame.number -e ip.src -e s7comm.param.item.db "
+                    "-e s7comm.param.item.address.byte "
+                    "-e s7comm.data.returncode | head -40")])
 
         # 3. Запросы без ответа: считаем ВСЕ зависшие транзакции, а не
         # только ключи словаря; при высокой доле — эскалация до warning
