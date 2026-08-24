@@ -109,6 +109,8 @@ class BranchResult:
     capture_start_ts: float | None = None
     # ip сервера (PLC) -> (светлый фон, насыщенный цвет); для легенды в шапке
     server_colors: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # компактные числовые метрики для трендового режима (ключ -> значение)
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 class BaseBranch(ABC):

@@ -255,6 +255,36 @@ class ServicesAnalyzeTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
+class TrendSeriesTest(unittest.TestCase):
+    """Тренд по серии из трёх сгенерированных дампов с шагом 5 минут."""
+
+    def runTest(self):  # noqa: N802
+        import tempfile
+        from tests import pcapgen
+        from analyzer.branches import get_branch
+        from analyzer.config import DEFAULT_CONFIG
+        from analyzer.trend import build_trend
+        from analyzer.report import render_trend_html
+
+        tmp = Path(tempfile.mkdtemp(prefix="trend-"))
+        paths = []
+        for i, ts in enumerate((1735000000, 1735000300, 1735000600)):
+            p = tmp / f"series_{i}.pcap"
+            pcapgen.write_modbus_pcap(p, base_ts=ts)
+            paths.append(p)
+        branch = get_branch("modbus")
+        points, took = build_trend(paths, branch, DEFAULT_CONFIG,
+                                   progress=lambda m, pct=None: None)
+        self.assertEqual(len(points), 3)
+        for pt in points:
+            self.assertGreater(pt.metrics.get("reqs", 0), 100)
+            self.assertIsNotNone(pt.start_ts)
+        html = render_trend_html(points, branch.title, str(tmp / "*.pcap"))
+        self.assertIn("Тренды по серии дампов", html)
+        self.assertGreaterEqual(html.count('id="m-reqs"'), 1)
+
+
+@unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
 class S7commAnalyzeTest(unittest.TestCase):
     """s7comm на первом образце, где такой трафик есть."""
 

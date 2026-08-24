@@ -131,9 +131,12 @@ python3 -m analyzer analyze pcap-sample/<файл>.pcap -o report.html -f both
 ```
 python -m analyzer analyze <pcap> [-o OUT] [-f html|pdf|both] [-b BRANCH] [--tshark-bin PATH]
 python -m analyzer serve [--host H] [--port P] [--data-dir D] [--samples-dir S]
+python -m analyzer trend "pcap-sample/plc_cgn_*.pcap" -b s7comm -o trend.html
 python -m analyzer branches
 python -m analyzer --version
 ```
+
+| `trend` | тренды по серии дампов: динамика метрик (RTT, ошибки, SYN, ARP) и матрица сработавших правил по файлам; маска в кавычках |
 
 | Аргумент | Описание |
 |---|---|

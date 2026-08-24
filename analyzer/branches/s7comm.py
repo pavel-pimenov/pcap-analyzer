@@ -251,11 +251,31 @@ class S7CommAnalyzer(BaseBranch):
         # окна для диаграмм Ганта (общий хелпер BaseBranch; есть что
         # показывать — только при наличии S7-трафика)
         self._threads = []
-        if s7["req_total"] and gen.duration > 0:
+        if s7["req_total"] and gen.duration > 0 and not cfg.skip_gantt:
             progress("Проход 3/3: подбор окон активности…", pct=83)
             self._threads = self._thread_windows(
                 "s7comm && tcp.dstport==102", gen.first_ts, gen.duration)
 
+        pending_cnt = sum(len(v) for v in s7.get("pending", {}).values()) \
+            + s7.get("stale_dropped", 0) + s7.get("stale_matched", 0)
+        all_rtts = sorted(t for ps in s7["pairs"].values() for t in ps.rtts)
+        med_rtt = percentile(all_rtts, 50)
+        p95_rtt = percentile(all_rtts, 95)
+        silent = sum(1 for i in gen.streams102.values() if not i["resp_bytes"])
+        result.metrics = {
+            "jobs": float(s7["req_total"]),
+            "acks": float(s7["resp_total"]),
+            "unans_pct": (100.0 * pending_cnt / s7["req_total"]
+                          if s7["req_total"] else 0.0),
+            "err_pct": (100.0 * s7["err_total"] / s7["resp_total"]
+                        if s7["resp_total"] else 0.0),
+            "rtt_med_ms": med_rtt * 1000.0 if med_rtt is not None else 0.0,
+            "rtt_p95_ms": p95_rtt * 1000.0 if p95_rtt is not None else 0.0,
+            "syn": float(len(gen.syn102)),
+            "silent_streams": float(silent),
+            "clients": float(len({c for (c, _p) in s7["pairs"]})),
+            "plcs": float(len({p for (_c, p) in s7["pairs"]})),
+        }
         result.kpi = self._build_kpi(gen, s7)
         result.sections = self._build_sections(gen, s7)
         result.recommendations = self._build_recommendations(gen, s7)

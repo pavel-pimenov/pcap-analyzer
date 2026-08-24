@@ -396,5 +396,29 @@ class ConnectionsTableTest(unittest.TestCase):
         self.assertIn("RST от сервера", html)
 
 
+class TrendRenderTest(unittest.TestCase):
+    """Трендовый отчёт строится из точек без tshark."""
+
+    def test_render_structure(self):
+        from analyzer.report import TrendPoint, render_trend_html
+        pts = []
+        for i, ts in enumerate((1735000000, 1735000300, 1735000600)):
+            pt = TrendPoint(
+                path=Path(f"/tmp/fake_{i}.pcap"), start_ts=float(ts),
+                metrics={"reqs": 100.0 + i, "rtt_med_ms": 20.0 + i},
+                took_s=1.0)
+            if i == 1:
+                pt.rec_ids.add("conn-churn")
+                pt.rule_info["conn-churn"] = ("warning", "Частые переподключения")
+            pts.append(pt)
+        html = render_trend_html(pts, "Анализ Modbus/TCP", "/tmp/fake_*.pcap")
+        self.assertIn("Тренды по серии дампов", html)
+        self.assertEqual(html.count('<section class="card" id="m-'), 2)
+        self.assertIn("conn-churn", html)
+        self.assertIn("Частые переподключения", html)
+        # матрица: три колонки файлов
+        self.assertIn("<th>Правило</th><th>1</th><th>2</th><th>3</th>", html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

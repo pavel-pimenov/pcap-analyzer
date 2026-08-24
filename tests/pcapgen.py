@@ -118,10 +118,10 @@ def write_arp_noise(cap: "Capture", count: int, base_ts: float,
             src_mac, src_ip, dst_ip))
 
 
-def build_modbus_scenario() -> Capture:
+def build_modbus_scenario(base_ts: float = BASE_TS) -> Capture:
     """Трафик одного клиента с одним сервером (см. докстринг модуля)."""
     cap = Capture()
-    t = BASE_TS
+    t = base_ts
 
     # Фаза A: 30 мелких чтений (1 регистр) в пределах одного окна ~0,9 с —
     # кандидат на объединение в пакетный запрос; значения чередуются.
@@ -214,14 +214,16 @@ def write_pcap(path: Path, cap: Capture) -> int:
     return written
 
 
-def write_modbus_pcap(path: Path, arp_noise: int = 0) -> int:
+def write_modbus_pcap(path: Path, arp_noise: int = 0,
+                      base_ts: float = BASE_TS) -> int:
     """Полный сценарий: SYN к порту 502 + обмен; вернуть число кадров.
 
-    arp_noise > 0 — дополнительно дописать серию ARP-запросов без ответов.
+    arp_noise > 0 — дополнительно дописать серию ARP-запросов без ответов;
+    base_ts — момент начала захвата (для серий трендового режима).
     """
     cap = Capture()
-    cap.raw(BASE_TS, True, b"", flags=FLAG_SYN)     # попытка подключения
-    cap.frames.extend(build_modbus_scenario().frames)
+    cap.raw(base_ts, True, b"", flags=FLAG_SYN)     # попытка подключения
+    cap.frames.extend(build_modbus_scenario(base_ts).frames)
     n = write_pcap(path, cap)
     if arp_noise > 0:
         tail = Capture()

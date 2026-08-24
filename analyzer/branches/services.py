@@ -156,6 +156,21 @@ class ServicesAnalyzer(BaseBranch):
 
         progress("Проход 2/2: агрегация сервисов…", pct=70)
 
+        tcp_all = list(self._tcp_services.values())
+        msgs = sum(v.req_pkts + v.resp_pkts for v in tcp_all)
+        retrans = sum(v.retrans for v in tcp_all)
+        result.metrics = {
+            "frames": float(gen.total_packets),
+            "arp_per_min": (gen.proto_frames.get("arp", 0) /
+                            (gen.duration / 60) if gen.duration else 0.0),
+            "retrans_pct": (100.0 * retrans / msgs if msgs else 0.0),
+            "syn": float(gen.syn_total),
+            "tcp_services": float(len(self._tcp_services)),
+            "silent_streams": float(sum(v.silent_streams for v in tcp_all)),
+            "noise_frames": float(sum(
+                cnt for fam, cnt in gen.proto_frames.items()
+                if fam in ("arp", "stp", "lldp", "igmp"))),
+        }
         result.kpi = self._build_kpi(gen)
         result.sections = self._build_sections(gen)
         result.recommendations = self._build_recommendations(gen)

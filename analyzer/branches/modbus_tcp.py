@@ -202,7 +202,7 @@ class ModbusTcpAnalyzer(BaseBranch):
 
         # окна для диаграмм Ганта (только если есть что показывать)
         self._threads = []
-        if mb["req_total"] and gen.duration > 0:
+        if mb["req_total"] and gen.duration > 0 and not cfg.skip_gantt:
             progress("Проход 3/3: подбор окон активности…", pct=83)
             self._threads = self._thread_windows(
                 "mbtcp && tcp.dstport==502", gen.first_ts, gen.duration)
@@ -212,6 +212,24 @@ class ModbusTcpAnalyzer(BaseBranch):
         sections = self._build_sections(gen, mb)
         recs = self._build_recommendations(gen, mb)
 
+        no_resp_total = sum(p.no_resp for p in mb["pairs"].values())
+        rtts_all = sorted(r for ps in mb["pairs"].values() for r in ps.rtts)
+        med_rtt = percentile(rtts_all, 50)
+        clients_n = len({c for (c, _s) in mb["pairs"]})
+        servers_n = len({s for (_c, s) in mb["pairs"]})
+        result.metrics = {
+            "reqs": float(mb["req_total"]),
+            "resps": float(mb["resp_total"]),
+            "no_resp_pct": (100.0 * no_resp_total / mb["req_total"]
+                            if mb["req_total"] else 0.0),
+            "exc_pct": (100.0 * mb["exc_total"] / mb["resp_total"]
+                        if mb["resp_total"] else 0.0),
+            "rtt_med_ms": med_rtt * 1000.0 if med_rtt is not None else 0.0,
+            "syn": float(len(gen.syn502)),
+            "conns": float(len(gen.streams502)),
+            "clients": float(clients_n),
+            "servers": float(servers_n),
+        }
         result.kpi = kpi
         result.sections = sections
         result.recommendations = recs

@@ -47,6 +47,21 @@ def build_parser() -> argparse.ArgumentParser:
     # --- branches --------------------------------------------------------------
     sub.add_parser("branches", help="список доступных веток анализа")
 
+    # --- trend -----------------------------------------------------------------
+    p_tr = sub.add_parser(
+        "trend",
+        help="тренды по серии дампов (динамика метрик и правил)")
+    p_tr.add_argument("pattern",
+                      help="маска файлов серии, например "
+                           "\"pcap-sample/plc_cgn_*.pcap\"")
+    p_tr.add_argument("-b", "--branch", default=DEFAULT_BRANCH,
+                      choices=sorted(BRANCHES),
+                      help="ветка анализа (по умолчанию: %(default)s)")
+    p_tr.add_argument("-o", "--output", default="trend.html",
+                      help="путь к итоговому HTML (по умолчанию trend.html)")
+    p_tr.add_argument("--tshark-bin", default=None,
+                      help="путь к tshark (иначе TSHARK_BIN или PATH)")
+
     # --- serve -----------------------------------------------------------------
     p_sv = sub.add_parser(
         "serve",
@@ -135,6 +150,35 @@ def main(argv: list[str] | None = None) -> int:
             + ")"
         )
         print("\n".join(str(p) for p in written))
+        return 0
+
+    if args.command == "trend":
+        from pathlib import Path as _Path
+
+        from .trend import build_trend, expand_series
+
+        files = expand_series(args.pattern)
+        if not files:
+            print(f"Ошибка: по маске не найдено файлов: {args.pattern}",
+                  file=sys.stderr)
+            return 2
+        branch = get_branch(args.branch)
+        try:
+            points, took = build_trend(
+                files, branch, DEFAULT_CONFIG,
+                progress=lambda m, pct=None: _progress(m),
+                tshark_bin=args.tshark_bin)
+        except TsharkError as e:
+            print(f"Ошибка: {e}", file=sys.stderr)
+            return 1
+        out = _Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        from .report import render_trend_html
+        out.write_text(render_trend_html(points, branch.title, args.pattern),
+                       encoding="utf-8")
+        _progress(f"[pcap-analyzer] Серия из {len(points)} файлов обработана "
+                  f"за {took:.0f} c → {out}")
+        print(str(out))
         return 0
 
     if args.command == "serve":
