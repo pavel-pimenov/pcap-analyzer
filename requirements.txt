@@ -1,4 +1,4 @@
 # Единственная внешняя зависимость — генерация PDF из HTML-отчёта.
 # Кроме неё нужны системные библиотеки Pango и шрифты (см. Dockerfile):
 # apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 fonts-dejavu-core
-weasyprint>=62
+weasyprint==69.0
