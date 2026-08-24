@@ -194,6 +194,48 @@ class ModbusAnalyzeTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
+class ServicesAnalyzeTest(unittest.TestCase):
+    """Ветка services: сервисы и направления на синтетическом дампе Modbus."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tests import pcapgen
+        cls.pcap = Path(os.environ.get("PCAPGEN_OUT", "/tmp/services_fix.pcap"))
+        pcapgen.write_modbus_pcap(cls.pcap)
+        from analyzer.tshark_runner import find_tshark
+        cls.tshark = find_tshark(None)
+
+    def test_service_502_bidirectional(self):
+        from analyzer.branches.services import ServicesAnalyzer
+        b = ServicesAnalyzer()
+        b.cfg = DEFAULT_CONFIG
+        b.tshark = self.tshark
+        b.pcap_str = str(self.pcap)
+        b.progress = lambda m, pct=None: None
+        b._pass_general()
+        svc = b._tcp_services.get(("10.0.0.1", 502))
+        self.assertIsNotNone(svc, "сервис :502 не найден на дампе Modbus")
+        # клиент .10 -> сервер .1; обе стороны передают полезную нагрузку
+        self.assertEqual(svc.req_pkts, 110)
+        self.assertGreater(svc.resp_pkts, 0)
+        self.assertEqual(svc.silent_streams, 0)
+        self.assertFalse(svc.one_way_streams)
+        # строгий цикл фазы C даёт периодику
+        self.assertGreater(len(svc.intervals), 50)
+
+    def test_reports_render(self):
+        from analyzer.branches.services import ServicesAnalyzer
+        from analyzer.report import render_document
+        b = ServicesAnalyzer()
+        b.cfg = DEFAULT_CONFIG
+        result = b.analyze(self.pcap, DEFAULT_CONFIG,
+                           progress=lambda m, pct=None: None,
+                           tshark_bin=self.tshark)
+        html = render_document(result)
+        self.assertTrue(_balanced_html(html))
+
+
+@unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
 class S7commAnalyzeTest(unittest.TestCase):
     """s7comm на первом образце, где такой трафик есть."""
 

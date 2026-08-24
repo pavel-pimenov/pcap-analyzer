@@ -68,7 +68,8 @@ analyzer/
     │                     # Reservoir, общие утилиты (to_int/percentile/…), Гант-хелперы
     ├── __init__.py       # BRANCHES = {"modbus": ModbusTcpAnalyzer, "s7comm": S7CommAnalyzer}
     ├── modbus_tcp.py     # два прохода по pcap + правила рекомендаций
-    └── s7comm.py         # ветка S7comm (Siemens, порт 102)
+    ├── s7comm.py         # ветка S7comm (Siemens, порт 102)
+    └── services.py       # ветка TCP/UDP-сервисов без дизассемблера
 ```
 
 ## Как проверять изменения

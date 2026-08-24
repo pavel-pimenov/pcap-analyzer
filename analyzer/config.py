@@ -69,6 +69,16 @@ class Config:
     s7_max_pending_per_ref: int = 8        # очередь Job на один (поток, pduref)
     s7_rtt_sanity_max_sec: float = 30.0    # RTT выше — считаем транзакцию потерянной
 
+    # --- Ветка сервисов (TCP/UDP) ---------------------------------------------
+    svc_heartbeat_max_bytes: int = 16      # нагрузка ≤N байт — «сердцебиение»
+    svc_cyclic_cv_strict: float = 0.25     # CV ниже — строгий цикл опроса
+    svc_cyclic_cv_moderate: float = 0.60   # CV ниже — умеренная регулярность
+    svc_min_msgs_for_period: int = 20      # минимум сообщений для оценки периодики
+    svc_retrans_warn_pct: float = 5.0      # доля ретрансляций для предупреждения, %
+    svc_one_way_pct: float = 99.0          # перекос направления потока, %
+    svc_one_way_min_kb: int = 64           # минимальный объём одностороннего потока, КБ
+    arp_storm_per_min: float = 30.0        # ARP-кадров в минуту для предупреждения
+
     # --- Прочее ---------------------------------------------------------------
     top_registers_limit: int = 20          # топ-N регистров в отчёте
 
