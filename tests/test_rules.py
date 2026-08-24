@@ -356,5 +356,45 @@ class MultipartParserTest(unittest.TestCase):
             self._parse(_multipart_body(payload), limit=50_000)
 
 
+class ConnectionsTableTest(unittest.TestCase):
+    """Таблица соединений: RST показывается независимо от «кто закрыл первым»."""
+
+    def _modbus_html(self):
+        b = _branch()
+        gen = GeneralStats()
+        gen.first_ts, gen.last_ts = 0.0, 600.0
+        gen.syn502 = [(1.0, "10.0.0.9", "10.0.0.1")]
+        gen.streams502 = {"0": {
+            "client": "10.0.0.9", "server": "10.0.0.1", "sport": 49152,
+            "first": 1.0, "last": 60.0,
+            "closed_by": "10.0.0.9",          # первым закрыл клиент (FIN)
+            "rst_srv": True, "rst_cli": False,  # но RST пришёл от сервера
+        }}
+        return b._sec_connections(gen, {"stream_reqs": {}}).body_html
+
+    def test_rst_column_present_despite_client_first_close(self):
+        html = self._modbus_html()
+        self.assertIn("RST от сервера", html)
+        self.assertIn("Первым закрыл: клиент", html)
+
+    def test_s7_rst_column_present(self):
+        from analyzer.branches.s7comm import S7CommAnalyzer, GeneralStats as G7
+        b = S7CommAnalyzer()
+        b.cfg = Config()
+        b.pcap = Path("sample.pcap")
+        gen = G7()
+        gen.first_ts, gen.last_ts = 0.0, 600.0
+        gen.syn102 = [(1.0, "10.0.0.9", "10.0.0.1")]
+        gen.streams102 = {"0": {
+            "client": "10.0.0.9", "server": "10.0.0.1",
+            "first": 1.0, "last": 60.0,
+            "req_bytes": 100, "resp_bytes": 200,
+            "closed_by": "10.0.0.9",
+            "rst_srv": True, "rst_cli": False,
+        }}
+        html = b._sec_connections(gen, {"s7_streams": {"0"}}).body_html
+        self.assertIn("RST от сервера", html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

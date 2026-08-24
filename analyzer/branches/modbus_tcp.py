@@ -285,7 +285,8 @@ class ModbusTcpAnalyzer(BaseBranch):
                              "server": src if sport == 502 else dst,
                              # эфемерный порт стороны клиента — различает потоки
                              "sport": dport if sport == 502 else sport,
-                             "first": ts, "last": ts}
+                             "first": ts, "last": ts,
+                             "rst_srv": False, "rst_cli": False}
                     )
                     if ts is not None:
                         if info["first"] is None or ts < info["first"]:
@@ -297,6 +298,13 @@ class ModbusTcpAnalyzer(BaseBranch):
                             truthy(r.get("tcp.flags.fin", ""))
                             or truthy(r.get("tcp.flags.reset", ""))):
                         info["closed_by"] = src
+                    # факт наличия RST с каждой стороны — независимо от того,
+                    # кто закрыл соединение первым (RST часто идёт после FIN)
+                    if truthy(r.get("tcp.flags.reset", "")):
+                        if sport == 502:
+                            info["rst_srv"] = True
+                        else:
+                            info["rst_cli"] = True
             if (i + 1) % 100000 == 0:
                 self.progress(f"  обработано {i + 1} пакетов…", pct=17)
         return g
@@ -755,18 +763,24 @@ class ModbusTcpAnalyzer(BaseBranch):
             # подключения и разрывы по парам клиент → сервер
             per_pair = Counter((c, s) for _t, c, s in gen.syn502)
             close_by_srv, close_by_cli = Counter(), Counter()
+            rst_by_srv, rst_by_cli = Counter(), Counter()
             for info in gen.streams502.values():
-                cb = info.get("closed_by")
-                if not cb:
-                    continue
                 key = (info["client"], info["server"])
+                cb = info.get("closed_by")
                 if cb == info["server"]:
                     close_by_srv[key] += 1
                 elif cb == info["client"]:
                     close_by_cli[key] += 1
+                # RST считаем независимо от «кто закрыл первым»:
+                # сброс часто идёт уже после чужого FIN
+                if info.get("rst_srv"):
+                    rst_by_srv[key] += 1
+                if info.get("rst_cli"):
+                    rst_by_cli[key] += 1
             total_syn = len(gen.syn502)
             pair_rows = []
-            keys = set(per_pair) | {k for k in close_by_srv} | {k for k in close_by_cli}
+            keys = (set(per_pair) | set(close_by_srv) | set(close_by_cli)
+                    | set(rst_by_srv) | set(rst_by_cli))
             for (c, s) in sorted(keys, key=lambda k: per_pair.get(k, 0),
                                  reverse=True)[: self.cfg.max_rows_per_table]:
                 n = per_pair.get((c, s), 0)
@@ -781,6 +795,8 @@ class ModbusTcpAnalyzer(BaseBranch):
                     _cell(n, True),
                     _cell(close_by_srv.get((c, s), 0), True),
                     _cell(close_by_cli.get((c, s), 0), True),
+                    _cell(rst_by_srv.get((c, s), 0), True),
+                    _cell(rst_by_cli.get((c, s), 0), True),
                     f'<span class="num">{C.fmt_pct(n, total_syn)}</span>',
                 ])
             syn_examples = "; ".join(
@@ -790,18 +806,22 @@ class ModbusTcpAnalyzer(BaseBranch):
             syn_detail = (
                 '<h3 class="subhead">Подключения и разрывы по парам клиент &rarr; сервер</h3>'
                 + C.table_html(
-                    ["Клиент", "Сервер", "Подключений", "Разрывов сервером",
-                     "Разрывов клиентом", "Доля подключений"],
+                    ["Клиент", "Сервер", "Подключений",
+                     "Первым закрыл: сервер", "Первым закрыл: клиент",
+                     "RST от сервера", "RST от клиента", "Доля подключений"],
                     pair_rows)
                 + '<p class="note"><strong>Подключений</strong> — сколько раз клиент '
                   'устанавливал TCP-соединение с сервером (SYN к порту 502); больше 1 '
                   '<span class="hot-legend">подсвечено розовым</span>: соединение '
                   'пересоздавалось, для Modbus/TCP нормой считается одно долгоживущее '
-                  '(keep-alive) соединение на пару. <strong>Разрывов сервером / '
-                  'клиентом</strong> — кто первым послал FIN или RST при закрытии; '
-                  'розовым отмечены любые значения больше нуля. Разрывы по инициативе '
-                  'сервера (особенно RST) — повод проверить таймауты простоя на '
-                  'сервере и сетевых устройствах (NAT, межсетевые экраны).'
+                  '(keep-alive) соединение на пару. <strong>Первым закрыл</strong> — кто '
+                  'послал первый FIN или RST. <strong>RST от сервера / от клиента</strong> — '
+                  'число потоков со сбросом с этой стороны независимо от того, кто закрыл '
+                  'соединение первым: частый рисунок «клиент закрыл FIN-ом, но RST от '
+                  'сервера есть» означает, что сервер отвечает на полузакрытие сбросом; '
+                  'одиночные такие RST обычно безвредны, а массовые сбросы вне процедуры '
+                  'закрытия — повод проверить таймауты простоя на сервере и сетевых '
+                  'устройствах (NAT, межсетевые экраны).'
                   + (f'</p><p class="note">Первые SYN: {syn_examples}.</p>'
                      if syn_examples else '</p>')
             )

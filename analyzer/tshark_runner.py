@@ -129,9 +129,13 @@ def stream_fields(
         if proc.stderr is not None:
             proc.stderr.close()
         # после kill пайп достигает EOF, поток заканчивается сам; ждём
-        # ограниченно, чтобы не оставить чтение «наперегонки» с финализацией
+        # ограниченно. Если генератор закрывается при финализации
+        # интерпретатора, join запрещён — глушим RuntimeError.
         if err_thread.is_alive():
-            err_thread.join(timeout=2)
+            try:
+                err_thread.join(timeout=2)
+            except RuntimeError:
+                pass
 
 
 def run_list(tshark_bin: str, args: Sequence[str]) -> str:

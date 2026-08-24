@@ -320,7 +320,8 @@ class S7CommAnalyzer(BaseBranch):
                              "first": ts, "last": ts,
                              # полезная нагрузка в сторону PLC и обратно —
                              # для поиска «пустых» подключений без обмена
-                             "req_bytes": 0, "resp_bytes": 0}
+                             "req_bytes": 0, "resp_bytes": 0,
+                             "rst_srv": False, "rst_cli": False}
                     )
                     tlen = to_int(r.get("tcp.len"), 0)
                     if sport == PORT:
@@ -336,6 +337,13 @@ class S7CommAnalyzer(BaseBranch):
                             truthy(r.get("tcp.flags.fin", ""))
                             or truthy(r.get("tcp.flags.reset", ""))):
                         info["closed_by"] = src
+                    # факт RST с каждой стороны — независимо от того, кто
+                    # закрыл соединение первым
+                    if truthy(r.get("tcp.flags.reset", "")):
+                        if sport == PORT:
+                            info["rst_srv"] = True
+                        else:
+                            info["rst_cli"] = True
         return g
 
     # -- Проход 2: S7comm -----------------------------------------------------
@@ -823,16 +831,21 @@ class S7CommAnalyzer(BaseBranch):
         per_pair = Counter((c, s) for _t, c, s in gen.syn102)
         close_by_srv: Counter = Counter()
         close_by_cli: Counter = Counter()
+        rst_by_srv: Counter = Counter()
+        rst_by_cli: Counter = Counter()
         for info in gen.streams102.values():
-            cb = info.get("closed_by")
-            if not cb:
-                continue
             k = (info["client"], info["server"])
+            cb = info.get("closed_by")
             if cb == info["server"]:
                 close_by_srv[k] += 1
             elif cb == info["client"]:
                 close_by_cli[k] += 1
-        keys = set(per_pair) | set(close_by_srv) | set(close_by_cli)
+            if info.get("rst_srv"):
+                rst_by_srv[k] += 1
+            if info.get("rst_cli"):
+                rst_by_cli[k] += 1
+        keys = (set(per_pair) | set(close_by_srv) | set(close_by_cli)
+                | set(rst_by_srv) | set(rst_by_cli))
         if keys:
             total_syn = len(gen.syn102)
             pair_rows = []
@@ -849,6 +862,8 @@ class S7CommAnalyzer(BaseBranch):
                     cell(n, True),
                     cell(close_by_srv.get((c, s), 0), True),
                     cell(close_by_cli.get((c, s), 0), True),
+                    cell(rst_by_srv.get((c, s), 0), True),
+                    cell(rst_by_cli.get((c, s), 0), True),
                     f'<span class="num">'
                     f'{C.fmt_pct(n, total_syn) if total_syn else "—"}</span>',
                 ])
@@ -856,18 +871,22 @@ class S7CommAnalyzer(BaseBranch):
                 '<h3 class="subhead">Подключения и разрывы по парам '
                 "клиент &rarr; PLC</h3>"
                 + C.table_html(
-                    ["Клиент", "PLC", "Подключений", "Разрывов сервером",
-                     "Разрывов клиентом", "Доля подключений"],
+                    ["Клиент", "PLC", "Подключений",
+                     "Первым закрыл: сервер", "Первым закрыл: клиент",
+                     "RST от сервера", "RST от клиента", "Доля подключений"],
                     pair_rows)
                 + '<p class="note"><strong>Подключений</strong> — сколько раз '
                   "клиент устанавливал TCP-соединение с PLC (SYN к порту 102); "
                   'больше 1 <span class="hot-legend">подсвечено розовым</span>: '
                   "соединение пересоздавалось, нормой считается одно долгоживущее "
-                  "(keep-alive) соединение на пару. <strong>Разрывов сервером/"
-                  "клиентом</strong> — кто первым послал FIN или RST; розовым "
-                  "отмечены значения больше нуля. Разрывы со стороны PLC — повод "
-                  "проверить таймауты простоя на контроллере и сетевом "
-                  "оборудовании (NAT, межсетевые экраны).</p>"
+                  "(keep-alive) соединение на пару. <strong>Первым закрыл</strong> — "
+                  "кто послал первый FIN или RST. <strong>RST от сервера / от "
+                  "клиента</strong> — потоки со сбросом с этой стороны независимо от "
+                  "того, кто закрыл первым: рисунок «клиент закрыл FIN-ом, но RST от "
+                  "PLC есть» означает сброс вместо корректной обработки полузакрытия; "
+                  "массовые сбросы вне процедуры закрытия — повод проверить таймауты "
+                  "простоя на контроллере и сетевом оборудовании (NAT, межсетевые "
+                  "экраны).</p>"
             )
         tbl = ""
         if st_rows:
