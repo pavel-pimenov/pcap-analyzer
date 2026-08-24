@@ -420,6 +420,16 @@ class TrendRenderTest(unittest.TestCase):
         self.assertIn("<th>Правило</th><th>1</th><th>2</th><th>3</th>", html)
 
 
+class VersionSyncTest(unittest.TestCase):
+    """Версия в pyproject.toml совпадает с analyzer.__version__."""
+
+    def test_versions_match(self):
+        import tomllib
+        import analyzer
+        data = tomllib.load(open(ROOT / "pyproject.toml", "rb"))
+        self.assertEqual(data["project"]["version"], analyzer.__version__)
+
+
 class CsvButtonTest(unittest.TestCase):
     """Кнопка CSV есть в HTML и скрыта печатной таблицей стилей."""
 
