@@ -109,7 +109,7 @@ class PairStats:
     bytes_: int = 0
     streams: set = field(default_factory=set)
     fcodes: Counter = field(default_factory=Counter)
-    rtts: Reservoir = field(default_factory=Reservoir)
+    rtts: Reservoir = field(default_factory=lambda: Reservoir(0))
     first_ts: float | None = None
     last_ts: float | None = None
 
@@ -126,7 +126,7 @@ class PollTarget:
     cnt: int
     n_req: int = 0
     last_ts: float | None = None
-    intervals: Reservoir = field(default_factory=Reservoir)
+    intervals: Reservoir = field(default_factory=lambda: Reservoir(0))
 
 
 @dataclass

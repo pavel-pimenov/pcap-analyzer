@@ -1,0 +1,34 @@
+# CI pcap-analyzer: юнит- и smoke-тесты на каждый push/PR.
+# Бинарные образцы в репозиторий не коммитятся (*.pcap в .gitignore),
+# поэтому интеграционные тесты идут на синтетическом дампе, который
+# генерируется tests/pcapgen.py (нужен только tshark из apt).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Установить tshark
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tshark
+
+      - name: Сгенерировать синтетический дамп Modbus
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixtures"
+          python tests/pcapgen.py "$RUNNER_TEMP/fixtures/modbus_smoke.pcap"
+
+      - name: Тесты (unittest)
+        env:
+          PCAP_SAMPLES: ${{ runner.temp }}/fixtures
+        run: python -m unittest discover -s tests -t . -v

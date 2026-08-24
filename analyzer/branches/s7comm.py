@@ -159,7 +159,7 @@ class PairStats:
     bytes_: int = 0
     streams: set = field(default_factory=set)
     fcodes: Counter = field(default_factory=Counter)
-    rtts: Reservoir = field(default_factory=Reservoir)
+    rtts: Reservoir = field(default_factory=lambda: Reservoir(0))
     items: int = 0           # всего элементов в запросах
     single_item_reqs: int = 0
 
