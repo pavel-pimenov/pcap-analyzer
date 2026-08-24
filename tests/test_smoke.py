@@ -234,6 +234,25 @@ class ServicesAnalyzeTest(unittest.TestCase):
         html = render_document(result)
         self.assertTrue(_balanced_html(html))
 
+    def test_arp_noise_detected_and_reported(self):
+        from tests import pcapgen
+        from analyzer.branches.services import ServicesAnalyzer
+        pcap2 = self.pcap.with_name("services_fix_arp.pcap")
+        pcapgen.write_modbus_pcap(pcap2, arp_noise=150)
+        b = ServicesAnalyzer()
+        b.cfg = DEFAULT_CONFIG
+        result = b.analyze(pcap2, DEFAULT_CONFIG,
+                           progress=lambda m, pct=None: None,
+                           tshark_bin=self.tshark)
+        self.assertEqual(b._arp["req"], 150)
+        self.assertEqual(b._arp["targets"]["10.9.9.9"], 150)
+        ids = {r.id for r in result.recommendations}
+        self.assertIn("svc-arp-storm", ids)          # 150 кадров за ~2 с
+        self.assertIn("svc-arp-unanswered", ids)     # ответов нет вовсе
+        # виновник с целями попал в evidence шторма
+        storm = next(r for r in result.recommendations if r.id == "svc-arp-storm")
+        self.assertTrue(any("aa:00:bb:00:cc:01" in e for e in storm.evidence))
+
 
 @unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
 class S7commAnalyzeTest(unittest.TestCase):

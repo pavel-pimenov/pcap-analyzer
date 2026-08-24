@@ -162,6 +162,30 @@ class ServicesAnalyzer(BaseBranch):
         result.server_colors = dict(self._srv_colors)
         return result
 
+    def _arp_account(self, r: dict) -> None:
+        """Накопить статистику одного ARP-кадра: кто, что и сколько."""
+        a = self._arp
+        a["total"] += 1
+        mac = (r.get("eth.src") or "?").lower()
+        op = to_int(r.get("arp.opcode"), 0)
+        rec = a["by_mac"].setdefault(
+            mac, {"req": 0, "rep": 0, "grat": 0, "ips": set()})
+        spa = r.get("arp.src.proto_ipv4") or ""
+        if spa and spa not in ("0.0.0.0",):
+            rec["ips"].add(spa)
+        if truthy(r.get("arp.isgratuitous", "")):
+            rec["grat"] += 1
+            a["grat"] += 1
+        if op == 2:
+            rec["rep"] += 1
+            a["rep"] += 1
+        else:
+            rec["req"] += 1
+            a["req"] += 1
+            tgt = r.get("arp.dst.proto_ipv4") or ""
+            if tgt:
+                a["targets"][tgt] += 1
+
     # -- Проход 1: всё за один проход ----------------------------------------
 
     FIELDS_GENERAL = [
@@ -171,6 +195,9 @@ class ServicesAnalyzer(BaseBranch):
         "tcp.flags.syn", "tcp.flags.ack", "tcp.flags.reset", "tcp.flags.fin",
         "tcp.analysis.retransmission",
         "udp.srcport", "udp.dstport",
+        # детали ARP: у ARP-кадров поля ip.* пустые, нужен eth.src
+        "eth.src", "arp.opcode", "arp.src.proto_ipv4",
+        "arp.dst.proto_ipv4", "arp.isgratuitous",
     ]
 
     def _pass_general(self) -> GeneralStats:
@@ -180,6 +207,9 @@ class ServicesAnalyzer(BaseBranch):
         udp_last: dict[tuple, float] = {}
         self._tcp_services: dict[tuple, ServiceStats] = {}
         self._udp_services: dict[tuple, ServiceStats] = {}
+        self._arp = {"total": 0, "req": 0, "rep": 0, "grat": 0,
+                     "by_mac": {},          # mac -> {req,rep,grat,ips}
+                     "targets": Counter()}  # запрашиваемый IP -> раз
         tcp_svcs = self._tcp_services
         udp_svcs = self._udp_services
         tiny_max = self.cfg.svc_heartbeat_max_bytes
@@ -222,6 +252,8 @@ class ServicesAnalyzer(BaseBranch):
             protos = set((r.get("frame.protocols") or "").lower().split(":"))
             for fam in protos & watch:
                 g.proto_frames[fam] += 1
+                if fam == "arp":
+                    self._arp_account(r)
 
             sport = to_int(r.get("tcp.srcport"), -1)
             dport = to_int(r.get("tcp.dstport"), -1)
@@ -596,20 +628,79 @@ class ServicesAnalyzer(BaseBranch):
             ])
         body = (
             C.table_html(["Семейство", "Идентификатор", "Кадров", "кадров/мин"],
-                         rows)
-            + '<p class="note">Это фоновые протоколы уровня канала и '
-              'администрирования. Единичные ARP/STP/LLDP — норма. Массовый '
-              'ARP-поток (сотни кадров в минуту) означает шторм запросов или '
-              'сканирование; всплески NetBIOS/Browser характерны для Windows- '
-              'сетей и обычно вреда АСУ ТП не наносят, но засоряют канал.</p>'
+                         rows))
+        body += self._arp_tables(gen)
+        body += (
+            '<p class="note">Это фоновые протоколы уровня канала и '
+            'администрирования. Единичные ARP/STP/LLDP — норма. Массовый '
+            'ARP-поток (сотни кадров в минуту) означает шторм запросов или '
+            'сканирование; всплески NetBIOS/Browser характерны для Windows- '
+            'сетей и обычно вреда АСУ ТП не наносят, но засоряют канал.</p>'
         )
         cmds = [("Все ARP-кадры",
                  self._cmd("-Y arp -T fields -e frame.time -e arp.opcode "
-                           "-e ip.src -e ip.dst | head -40")),
+                           "-e eth.src -e ip.src -e ip.dst | head -40")),
                 ("Кто рассылает LLDP",
                  self._cmd('-Y lldp -T fields -e lldp.chassis.id '
                            "| sort | uniq -c | sort -rn"))]
         return Section("noise", "Служебный трафик", body, cmds)
+
+    def _arp_tables(self, gen: GeneralStats) -> str:
+        a = self._arp
+        if not a["total"]:
+            return ""
+        dur_min = max(gen.duration / 60.0, 1e-9)
+
+        def per_min(n: float) -> str:
+            return f"{n / dur_min:.1f}"
+
+        senders = sorted(a["by_mac"].items(),
+                         key=lambda kv: kv[1]["req"] + kv[1]["rep"]
+                         + kv[1]["grat"], reverse=True)[:10]
+        mac_rows = []
+        for mac, rec in senders:
+            ips = ", ".join(sorted(rec["ips"])) or "&mdash;"
+            hot = rec["req"] + rec["grat"] > 0 and rec["rep"] == 0 \
+                and (rec["req"] + rec["grat"]) / dur_min >= 5
+            cells = [
+                f"<code class=\"inline\">{C.esc(mac)}</code>",
+                C.esc(ips),
+                f'<span class="num">{C.fmt_int(rec["req"])}</span>',
+                f'<span class="num">{C.fmt_int(rec["rep"])}</span>',
+                f'<span class="num">{C.fmt_int(rec["grat"])}</span>',
+                f'<span class="num">'
+                f'{per_min(rec["req"] + rec["grat"])}</span>',
+            ]
+            if hot:
+                cells[-1] = (cells[-1], "cell-hot")
+            mac_rows.append(cells)
+        html = ('<h3 class="subhead">ARP: активные отправители</h3>'
+                + C.table_html(
+                    ["MAC", "Заявленные IP", "Запросов", "Ответов",
+                     "Gratuitous", "кадров/мин"], mac_rows))
+        if a["targets"]:
+            tgt_rows = []
+            for tgt, cnt in a["targets"].most_common(8):
+                tgt_rows.append([
+                    f"<code class=\"inline\">{C.esc(tgt)}</code>",
+                    f'<span class="num">{C.fmt_int(cnt)}</span>',
+                    f'<span class="num">{per_min(cnt)}</span>',
+                ])
+            share_rep = C.fmt_pct(a["rep"], a["total"])
+            html += (
+                '<h3 class="subhead">Кого спрашивают</h3>'
+                + C.table_html(["Целевой IP", "Запросов", "запросов/мин"],
+                               tgt_rows)
+                + f'<p class="note">Всего ARP-кадров: '
+                  f'{C.fmt_int(a["total"])}, из них ответов — '
+                  f'{C.fmt_int(a["rep"])} ({share_rep}). Когда на поток '
+                  'запросов почти нет ответов, хосты многократно повторяют '
+                  '«кто здесь?» для адресов, которых физически нет в сегменте: '
+                  'устройство отключено или в резерве, а клиенты продолжают '
+                  'опрашивать его по имени/IP. Каждая такая попытка — это и '
+                  'есть источник шторма; цели из списка стоит сверить с '
+                  'конфигурацией опроса.</p>')
+        return html
 
     # -- Рекомендации -----------------------------------------------------------
 
@@ -620,6 +711,7 @@ class ServicesAnalyzer(BaseBranch):
         recs.extend(self._rule_retrans())
         recs.extend(self._rule_churn(gen))
         recs.extend(self._rule_arp_storm(gen))
+        recs.extend(self._rule_arp_unanswered(gen))
         if not recs:
             recs.append(Recommendation(
                 id="ok", severity="info",
@@ -750,19 +842,70 @@ class ServicesAnalyzer(BaseBranch):
         per_min = n / (gen.duration / 60) if gen.duration else 0
         if per_min < self.cfg.arp_storm_per_min:
             return []
+        # виновники: самые активные отправители запросов/gratuitous
+        dur_min = max(gen.duration / 60.0, 1e-9)
+        top = sorted(self._arp["by_mac"].items(),
+                     key=lambda kv: kv[1]["req"] + kv[1]["grat"],
+                     reverse=True)[:3]
+        ev = []
+        for mac, rec in top:
+            lines = [f"{mac}: {rec['req'] + rec['grat']} кадров "
+                     f"({(rec['req'] + rec['grat']) / dur_min:.0f}/мин)"]
+            if self._arp["targets"]:
+                tops = ", ".join(
+                    str(t) for t, _n in
+                    [(t, c) for t, c in self._arp["targets"].most_common(6)])
+                lines.append(f"цели запросов: {tops}")
+            ev.append("; ".join(lines))
         return [Recommendation(
             id="svc-arp-storm", severity="warning",
             title="Высокая интенсивность ARP-трафика",
-            problem=f"{n} ARP-кадров ({per_min:.0f}/мин).",
+            problem=(f"{n} ARP-кадров ({per_min:.0f}/мин), из них ответов: "
+                     f"{self._arp['rep']}."),
             advice=(
                 "Шторм ARP-запросов перегружает широковещательный домен и "
-                "процессоры коммутаторов/хостов. Типовые причины: петля с "
-                "зацикленным прокси-ARP, сканирование сети, неисправный "
-                "хост. Найдите источники по MAC и изолируйте сегмент."),
+                "процессоры коммутаторов/хостов. Если ответов почти нет — "
+                "хосты многократно спрашивают отсутствующие устройства; "
+                "уберите их из конфигураций опроса или верните в работу. "
+                "Если же ответы есть, а поток огромный — ищите петлю или "
+                "сканер по MAC-виновникам из списка. Единичные gratuitous-"
+                "объявления (до нескольких в минуту от одного MAC) — штатное "
+                "обновление таблиц, массовые — признак дублирования адреса."),
+            evidence=ev,
             commands=[
                 self._cmd("-Y arp -T fields -e arp.opcode -e eth.src "
                           "| sort | uniq -c | sort -rn | head -20"),
-                self._cmd("-Y arp && !arp.is-gratuitous -T fields "
+                self._cmd("-Y arp && !arp.isgratuitous -T fields "
                           "-e frame.time -e eth.src | head -40"),
+                self._cmd("-Y \"arp.opcode==1\" -T fields -e eth.src "
+                          "-e arp.dst.proto_ipv4 | sort | uniq -c "
+                          "| sort -rn | head -20"),
+            ],
+        )]
+
+    def _rule_arp_unanswered(self, gen: GeneralStats) -> list[Recommendation]:
+        a = self._arp
+        if a["req"] < 100 or a["rep"] > max(a["req"] // 100, 5):
+            return []
+        targets = ", ".join(str(t) for t, _n in a["targets"].most_common(5))
+        return [Recommendation(
+            id="svc-arp-unanswered", severity="warning",
+            title="ARP-запросы остаются без ответов",
+            problem=(
+                f"{a['req']} запросов «кто имеет …?» получили лишь "
+                f"{a['rep']} ответов; чаще всего спрашивают: {targets}."),
+            advice=(
+                "Хосты настойчиво ищут адреса, которых нет в сегменте. До тех "
+                "пор пока устройство недоступно, каждый опрашивающий будет "
+                "повторять резолюцию и ждать таймаута — это лишний "
+                "широковещательный трафик и задержки старта транзакций. "
+                "Сверьте цели с конфигурацией клиентов: мёртвые узлы нужно "
+                "исключить из опроса либо восстановить."),
+            commands=[
+                self._cmd("-Y \"arp.opcode==1\" -T fields -e eth.src "
+                          "-e arp.dst.proto_ipv4 | sort | uniq -c "
+                          "| sort -rn"),
+                self._cmd("-Y \"arp.opcode==2\" -T fields -e eth.src "
+                          "-e arp.src.proto_ipv4 | sort | uniq -c"),
             ],
         )]
