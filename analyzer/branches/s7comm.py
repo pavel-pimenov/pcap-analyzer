@@ -272,6 +272,7 @@ class S7CommAnalyzer(BaseBranch):
             "rtt_med_ms": med_rtt * 1000.0 if med_rtt is not None else 0.0,
             "rtt_p95_ms": p95_rtt * 1000.0 if p95_rtt is not None else 0.0,
             "syn": float(len(gen.syn102)),
+            "writes": float(s7.get("write_jobs", 0)),
             "silent_streams": float(silent),
             "clients": float(len({c for (c, _p) in s7["pairs"]})),
             "plcs": float(len({p for (_c, p) in s7["pairs"]})),
@@ -380,9 +381,11 @@ class S7CommAnalyzer(BaseBranch):
         "tcp.payload", "frame.protocols",
     ]
 
-    def _value_digests(self, r: dict, lens: list[int],
-                       expect: int) -> tuple[str, ...]:
-        """Дайджесты данных элементов Ack_Data из tcp.payload.
+    def _value_digests(self, r: dict, lens: list[int], expect: int,
+                       job: bool = False) -> tuple[str, ...]:
+        """Дайджесты данных элементов из tcp.payload (Ack_Data и Job Write).
+
+        Тип PDU определяется по байту ROSCTR в самом кадре.
 
         Полей с байтами значений в tshark нет, поэтому проходим структуру
         PDU вручную: TPKT(4) + COTP(1+len) + заголовок Ack_Data (12 байт с
@@ -404,10 +407,18 @@ class S7CommAnalyzer(BaseBranch):
         if len(buf) < 24 or expect <= 0 or len(lens) != expect:
             return ()
         s7 = 4 + 1 + buf[4]                     # COTP-длина не включает свой байт
-        if s7 + 13 > len(buf) or buf[s7] != 0x32 or buf[s7 + 1] != 3:
-            return ()                           # только Ack_Data
+        if s7 + 11 > len(buf) or buf[s7] != 0x32:
+            return ()
+        rosctr = buf[s7 + 1]
+        # Ack_Data несёт 2 байта ошибки в заголовке, Job — нет
+        if rosctr == 3:
+            hdr_len, expect_rosctr = 12, {3}
+        elif rosctr == 1:
+            hdr_len, expect_rosctr = 10, {1}
+        else:
+            return ()
         parlen = int.from_bytes(buf[s7 + 6:s7 + 8], "big")
-        off = s7 + 12 + parlen                  # начало элементов данных
+        off = s7 + hdr_len + parlen             # начало элементов данных
         limit = off + int.from_bytes(buf[s7 + 8:s7 + 10], "big") + 2
         out = []
         for ln in lens:
@@ -446,6 +457,10 @@ class S7CommAnalyzer(BaseBranch):
             "err_targets": {},
             # трекинг значений чтений: (pair, объект) -> [дайджест, изменения, чтений]
             "valtrack": {},
+            # записи Write Var: счётчик Job и детализация по целям
+            "write_jobs": 0,
+            "write_targets": Counter(),   # (client, plc, объект) -> записей
+            "write_digest": {},           # ключ -> [последний дайджест, совпало, всего]
             "poll_last": {},              # (client, plc, func) -> ts последнего Job
             # периодика Job по целям: (client, plc, func) -> Reservoir интервалов
             "poll_int": {},
@@ -503,11 +518,11 @@ class S7CommAnalyzer(BaseBranch):
                     bucket = (s7["areas_w"] if func == "0x05"
                               else s7["areas_r"])
                     bucket[(area, db)] += max(itemcnt, 1)
+                lbls = _item_labels(r)
                 if ts is not None and st != "":
                     q = s7.setdefault("pending", {}).setdefault(
                         (st, pduref), [])
-                    q.append(Req(ts, st, key, func=func,
-                                 items=_item_labels(r)))
+                    q.append(Req(ts, st, key, func=func, items=lbls))
                     # периодика Job: интервал между соседними запросами
                     # той же цели (клиент → PLC → функция)
                     pt_key = (key[0], key[1], func)
@@ -520,6 +535,32 @@ class S7CommAnalyzer(BaseBranch):
                                     self.cfg.max_intervals_per_target)
                             pi.add(ts - last_job)
                         s7["poll_last"][pt_key] = ts
+                    # ---- Анализ записей (Write Var) ---------------------
+                    if func == "0x05":
+                        s7["write_jobs"] += 1
+                        wt = s7["write_targets"]
+                        for lbl in lbls:
+                            wt[(key[0], key[1], lbl)] += 1
+                        lens_w = [_to_int_auto(x) or 0 for x in _split_field(
+                            r.get("s7comm.data.length"))]
+                        dgs = self._value_digests(
+                            r, lens_w, min(len(lens_w), len(lbls)),
+                            job=True)
+                        if dgs and len(dgs) == len(lbls):
+                            wd = s7["write_digest"]
+                            cap = self.cfg.valtrack_max_registers
+                            for lbl, dg in zip(lbls, dgs):
+                                wk = (key[0], key[1], lbl)
+                                rec = wd.get(wk)
+                                if rec is None:
+                                    if len(wd) < cap:
+                                        wd[wk] = [dg, 0, 1]
+                                else:
+                                    rec[2] += 1
+                                    if dg == rec[0]:
+                                        rec[1] += 1
+                                    else:
+                                        rec[0] = dg
                     # pduref циклически переиспользуется на долгоживущем
                     # потоке: если старые Job так и не получили ответ,
                     # ограничиваем очередь, иначе каждый новый ответ
@@ -674,6 +715,9 @@ class S7CommAnalyzer(BaseBranch):
                 sections.append(static_sec)
             sections.append(self._sec_functions(s7))
             sections.append(self._sec_areas(s7))
+            wr_sec = self._sec_writes(s7)
+            if wr_sec:
+                sections.append(wr_sec)
             sections.append(self._sec_errors(s7))
             err_sec = self._sec_item_errors(s7)
             if err_sec:
@@ -1298,6 +1342,65 @@ class S7CommAnalyzer(BaseBranch):
                        "Статичные переменные (читаются, но не меняются)",
                        body, cmds)
 
+    def _sec_writes(self, s7: dict) -> Section | None:
+        """Кто и какие объекты пишет; конфликты и повторяющиеся значения."""
+        if not s7["write_targets"]:
+            return None
+        total = sum(s7["write_targets"].values())
+        rows = []
+        for (cl, plc_ip, lbl), cnt in sorted(
+                s7["write_targets"].items(),
+                key=lambda kv: kv[1], reverse=True)[: self.cfg.max_rows_per_table]:
+            rows.append([
+                f"<strong>{C.esc(cl)}</strong>", self._srv_cell(plc_ip),
+                f"<code class=\"inline\">{C.esc(lbl)}</code>",
+                f'<span class="num">{C.fmt_int(cnt)}</span>',
+                f'<span class="num">{C.fmt_pct(cnt, total)}</span>',
+            ])
+        html = (
+            '<h3 class="subhead">Кто и что пишет</h3>'
+            + C.table_html(["Клиент", "PLC", "Объект", "Записей", "Доля"],
+                           rows)
+            + '<p class="note">Запись тяжелее чтения: транзакция блокирует '
+              'область на время обработки. Регулярная запись константы — '
+              'обычно команда «состояние/пульс»; проверьте, что цикл записи '
+              'оправдан.</p>')
+
+        # области, куда пишут несколько клиентов
+        by_db: dict[tuple[str, str], set] = {}
+        for (cl, plc_ip, lbl), cnt in s7["write_targets"].items():
+            m = re.match(r"DB(\d+)", lbl)
+            db_key = (plc_ip, f"DB{m.group(1)}" if m else lbl.split("@")[0])
+            by_db.setdefault(db_key, set()).add(cl)
+        conflicts = [(k, v) for k, v in by_db.items() if len(v) >= 2]
+        conf_html = ""
+        if conflicts:
+            crows = []
+            for (plc_ip, db_key), cls_ in sorted(
+                    conflicts, key=lambda kv: -len(kv[1]))[:10]:
+                writers = ", ".join(sorted(cls_))
+                total_c = sum(cnt for (cl, p, lbl), cnt in
+                              s7["write_targets"].items()
+                              if p == plc_ip and lbl.split("@")[0] == db_key)
+                crows.append([
+                    self._srv_cell(plc_ip),
+                    f"<code class=\"inline\">{C.esc(db_key)}</code>",
+                    f'<span class="num">{len(cls_)}</span>',
+                    C.esc(writers),
+                    f'<span class="num">{C.fmt_int(total_c)}</span>',
+                ])
+            conf_html = (
+                '<h3 class="subhead">Одну область пишут несколько клиентов</h3>'
+                + C.table_html(
+                    ["PLC", "Область", "Пишущих клиентов", "Кто именно",
+                     "Записей"], crows)
+                + '<p class="note">Два хозяина у одной области данных — риск '
+                  'гонок: последний записавший выигрывает, значения могут '
+                  '"мигать". Разведите права записи или введите '
+                  'посредника.</p>')
+        return Section("writes", "Записи переменных (Write Var)",
+                       html + conf_html, [])
+
     def _sec_errors(self, s7: dict) -> Section:
         rows = []
         for code, cnt in s7["retcodes"].most_common():
@@ -1433,6 +1536,61 @@ class S7CommAnalyzer(BaseBranch):
                     "-e ip.dst -e tcp.stream -e s7comm.header.pduref "
                     "| awk '{c[$1\" \"$2\" \"$3]++} END{for(k in c)"
                     "print c[k],k}' | sort -rn | head -15")])
+
+        # 2b-2. Конфликт записи: одну область пишут несколько клиентов
+        by_db: dict[tuple[str, str], set] = {}
+        for (cl, plc_ip, lbl), cnt in s7["write_targets"].items():
+            m = re.match(r"DB(\d+)", lbl)
+            db_key = (plc_ip, f"DB{m.group(1)}" if m else lbl.split("@")[0])
+            by_db.setdefault(db_key, set()).add(cl)
+        conflicts = [(k, v) for k, v in by_db.items() if len(v) >= 2]
+        if conflicts:
+            conflicts.sort(key=lambda kv: -len(kv[1]))
+            (plc_ip, db_key), cls_ = conflicts[0]
+            add("s7-write-conflict", "warning",
+                "Одну область данных пишут несколько клиентов",
+                f"{plc_ip} {db_key}: пишут {len(cls_)} клиентов "
+                f"({', '.join(sorted(cls_))}). Всего таких областей: "
+                f"{len(conflicts)}.",
+                "Записи от двух хозяев без координации — классическая гонка: "
+                "значения «мигают» в зависимости от того, кто записал "
+                "последним. Назначьте единственного писателя, разведите "
+                "области по назначению либо введите посредника (AGG/шлюз), "
+                "который агрегирует команды.",
+                evidence=[f"{p} {d}: пишут {', '.join(sorted(c))}"
+                          for (p, d), c in conflicts[:6]],
+                commands=[self._cmd(
+                    '-Y "s7comm.param.func == 0x05 && '
+                    f's7comm.param.item.db == '
+                    + (f'0x{int(re.search(r"DB(\d+)", db_key).group(1)):x}" '
+                       if re.search(r"DB(\d+)", db_key) else '0x1" ')
+                    + "-T fields -e frame.time -e ip.src "
+                      "-e s7comm.param.item.address.byte | head -40")])
+
+        # 2b-3. Запись одного и того же значения многократно
+        const_targets = []
+        for wk, rec in s7["write_digest"].items():
+            if rec[2] >= 20 and 100.0 * rec[1] / rec[2] >= 90.0:
+                const_targets.append((wk, rec))
+        if const_targets:
+            const_targets.sort(key=lambda kv: kv[1][2], reverse=True)
+            (pair, lbl), rec = const_targets[0]
+            add("s7-write-const", "info",
+                "Запись одного и того же значения многократно",
+                f"{pair[0]} → {pair[1]} {lbl}: {rec[2]} записей, из них "
+                f"{rec[1]} с прежним значением ({C.fmt_pct(rec[1], rec[2])}). "
+                f"Всего таких целей: {len(const_targets)}.",
+                "Каждая запись — цикл обработки на PLC, даже если значение не "
+                "изменилось. Пишите только при фактическом изменении "
+                "(по фронту события) или снизьте частоту; для пульсаций "
+                "живости используйте штатные механизмы наблюдения соединения.",
+                evidence=[f"{k[0][0]} → {k[0][1]} {k[1]}: "
+                          f"{v[1]}/{v[2]} записей с тем же значением"
+                          for k, v in const_targets[:5]],
+                commands=[self._cmd(
+                    '-Y "s7comm.param.func == 0x05" -T fields -e frame.time '
+                    "-e ip.src -e ip.dst -e s7comm.param.item.address.byte "
+                    "| head -40")])
 
         # 2c. Статичные теги: читаются, но значения не меняются
         candidates = [(k, v) for k, v in s7["valtrack"].items()
