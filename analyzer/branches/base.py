@@ -14,7 +14,10 @@ from html import escape
 from pathlib import Path
 from typing import Callable, Sequence
 
-ProgressCb = Callable[[str], None]
+#: Колбэк хода анализа: progress(сообщение, pct=None), где pct — оценка
+#: готовности 0..100 (или None, если оценить нечем). Второй аргумент
+#: необязательный, но колбэк должен его принимать.
+ProgressCb = Callable[..., None]
 
 from ..tshark_runner import stream_fields  # noqa: E402
 
@@ -259,7 +262,7 @@ class BaseBranch(ABC):
     def _thread_events(self, filt: str, base: float, w0: float,
                        win: float) -> dict:
         """Собрать события одного окна: точки запросов по каждому соединению."""
-        self.progress("  сбор событий выбранного окна…")
+        self.progress("  сбор событий выбранного окна…", pct=85)
         rows: dict[tuple[str, int], dict] = {}
         events = 0
         for r in stream_fields(self.tshark, self.pcap_str, self.FIELDS_THREADS,
@@ -371,7 +374,7 @@ class BaseBranch(ABC):
         self,
         pcap_path: Path,
         cfg,
-        progress: ProgressCb = lambda msg: None,
+        progress: ProgressCb = lambda msg, pct=None: None,
         tshark_bin: str | None = None,
     ) -> BranchResult:
         """Выполнить анализ и вернуть данные для отчёта."""

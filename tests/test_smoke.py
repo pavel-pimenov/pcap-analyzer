@@ -156,7 +156,7 @@ class ModbusAnalyzeTest(unittest.TestCase):
         from analyzer.tshark_runner import find_tshark
         branch = get_branch("modbus")
         cls.result = branch.analyze(
-            cls.pcap, DEFAULT_CONFIG, progress=lambda m: None,
+            cls.pcap, DEFAULT_CONFIG, progress=lambda m, pct=None: None,
             tshark_bin=find_tshark(None))
         from analyzer.report import render_document
         cls.html = render_document(cls.result)
@@ -203,7 +203,7 @@ class S7commAnalyzeTest(unittest.TestCase):
             self.skipTest("нет s7comm-образца")
         from analyzer.tshark_runner import find_tshark
         result = get_branch("s7comm").analyze(
-            pcap, DEFAULT_CONFIG, progress=lambda m: None,
+            pcap, DEFAULT_CONFIG, progress=lambda m, pct=None: None,
             tshark_bin=find_tshark(None))
         self.assertTrue(result.sections)
         from analyzer.report import render_document
@@ -228,7 +228,7 @@ class PdfSmokeTest(unittest.TestCase):
         from analyzer.report.pdf_report import render_pdf_bytes
         from analyzer.tshark_runner import find_tshark
         result = get_branch("modbus").analyze(
-            pcap, DEFAULT_CONFIG, progress=lambda m: None,
+            pcap, DEFAULT_CONFIG, progress=lambda m, pct=None: None,
             tshark_bin=find_tshark(None))
         data = render_pdf_bytes(result)
         self.assertTrue(data.startswith(b"%PDF"), "это не PDF")

@@ -29,7 +29,7 @@ def _branch() -> ModbusTcpAnalyzer:
     b.pcap = Path("sample.pcap")
     b.pcap_str = "sample.pcap"
     b.tshark = "tshark"
-    b.progress = lambda m: None
+    b.progress = lambda m, pct=None: None
     return b
 
 

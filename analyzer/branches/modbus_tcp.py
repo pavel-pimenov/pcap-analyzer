@@ -170,7 +170,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         self,
         pcap_path: Path,
         cfg: Config,
-        progress: ProgressCb = lambda msg: None,
+        progress: ProgressCb = lambda msg, pct=None: None,
         tshark_bin: str | None = None,
     ) -> BranchResult:
         self.cfg = cfg
@@ -187,13 +187,13 @@ class ModbusTcpAnalyzer(BaseBranch):
         )
         self.sha256_short = self._sha256_short(pcap_path)
 
-        progress("Проход 1/3: общий обзор TCP/IP…")
+        progress("Проход 1/3: общий обзор TCP/IP…", pct=17)
         gen = self._pass_general()
         duration = gen.duration
 
         result.capture_start_ts = gen.first_ts
 
-        progress("Проход 2/3: разбор Modbus/TCP…")
+        progress("Проход 2/3: разбор Modbus/TCP…", pct=50)
         mb = self._pass_modbus(gen)
 
         # тёплые цвета серверов (PLC): единая раскраска таблиц, диаграмм
@@ -203,7 +203,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         # окна для диаграмм Ганта (только если есть что показывать)
         self._threads = []
         if mb["req_total"] and gen.duration > 0:
-            progress("Проход 3/3: подбор окон активности…")
+            progress("Проход 3/3: подбор окон активности…", pct=83)
             self._threads = self._thread_windows(
                 "mbtcp && tcp.dstport==502", gen.first_ts, gen.duration)
 
@@ -298,7 +298,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                             or truthy(r.get("tcp.flags.reset", ""))):
                         info["closed_by"] = src
             if (i + 1) % 100000 == 0:
-                self.progress(f"  обработано {i + 1} пакетов…")
+                self.progress(f"  обработано {i + 1} пакетов…", pct=17)
         return g
 
     # -- Проход 2: Modbus -----------------------------------------------------
@@ -522,7 +522,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                     pt.last_ts = ts
 
             if (i + 1) % 100000 == 0:
-                self.progress(f"  обработано {i + 1} PDU Modbus…")
+                self.progress(f"  обработано {i + 1} PDU Modbus…", pct=50)
 
         # Неотвеченные запросы
         for nf, req in req_by_frame.items():

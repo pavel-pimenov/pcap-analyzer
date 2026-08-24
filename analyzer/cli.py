@@ -14,7 +14,7 @@ from .report import render_document
 from .tshark_runner import TsharkError
 
 
-def _progress(msg: str) -> None:
+def _progress(msg: str, pct: int | None = None) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 

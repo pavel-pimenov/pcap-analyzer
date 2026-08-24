@@ -215,14 +215,19 @@ class AppState:
             (self.reports_dir / f"{fid}.{ext}").unlink(missing_ok=True)
 
     # -- анализ -----------------------------------------------------------------
-    def _stage(self, fid: str, msg: str) -> None:
+    def _stage(self, fid: str, msg: str, pct: int | None = None) -> None:
         with self.lock:
             e = self.entries.get(fid)
             if e:
                 e["stage"] = msg
-                pct = _pct_from_stage(msg)
+                # приоритет у структурного процента от ветки; разбор строк
+                # «Проход N/M» оставлен для совместимости
                 if pct is not None:
-                    e["progress"] = pct
+                    e["progress"] = max(0, min(100, int(pct)))
+                else:
+                    parsed = _pct_from_stage(msg)
+                    if parsed is not None:
+                        e["progress"] = parsed
                 if e["status"] in ("queued", "new"):
                     e["status"] = "running"
 
@@ -262,12 +267,12 @@ class AppState:
             branch = get_branch(e.get("branch", DEFAULT_BRANCH))
             t0 = time.monotonic()
 
-            def progress(m: str, _fid=fid) -> None:
+            def progress(m: str, pct: int | None = None, _fid=fid) -> None:
                 with self.lock:
                     cancelled = bool(self.entries.get(_fid, {}).get("cancel"))
                 if cancelled:
                     raise AnalysisCancelled()
-                self._stage(_fid, m)
+                self._stage(_fid, m, pct)
 
             try:
                 # кэш по содержимому: идентичный дамп с готовым отчётом

@@ -158,7 +158,7 @@ class S7CommAnalyzer(BaseBranch):
         self,
         pcap_path: Path,
         cfg: Config,
-        progress: ProgressCb = lambda msg: None,
+        progress: ProgressCb = lambda msg, pct=None: None,
         tshark_bin: str | None = None,
     ) -> BranchResult:
         self.cfg = cfg
@@ -175,12 +175,12 @@ class S7CommAnalyzer(BaseBranch):
         )
         self.sha256_short = self._sha256_short(pcap_path)
 
-        progress("Проход 1/3: общий обзор TCP/IP…")
+        progress("Проход 1/3: общий обзор TCP/IP…", pct=17)
         gen = self._pass_general()
 
         result.capture_start_ts = gen.first_ts
 
-        progress("Проход 2/3: разбор S7comm…")
+        progress("Проход 2/3: разбор S7comm…", pct=50)
         s7 = self._pass_s7(gen)
 
         # тёплые цвета серверов (PLC): единая раскраска таблиц, диаграмм
@@ -191,7 +191,7 @@ class S7CommAnalyzer(BaseBranch):
         # показывать — только при наличии S7-трафика)
         self._threads = []
         if s7["req_total"] and gen.duration > 0:
-            progress("Проход 3/3: подбор окон активности…")
+            progress("Проход 3/3: подбор окон активности…", pct=83)
             self._threads = self._thread_windows(
                 "s7comm && tcp.dstport==102", gen.first_ts, gen.duration)
 
