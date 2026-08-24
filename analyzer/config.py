@@ -68,6 +68,7 @@ class Config:
     s7_dead_min_syns: int = 5              # SYN к «молчащему» узлу :102 для рекомендации
     s7_max_pending_per_ref: int = 8        # очередь Job на один (поток, pduref)
     s7_rtt_sanity_max_sec: float = 30.0    # RTT выше — считаем транзакцию потерянной
+    s7_pipeline_warn_depth: int = 8        # p95 незакрытых Job на пару для предупреждения
 
     # --- Ветка сервисов (TCP/UDP) ---------------------------------------------
     svc_heartbeat_max_bytes: int = 16      # нагрузка ≤N байт — «сердцебиение»

@@ -116,6 +116,18 @@ def _to_int_auto(value: str) -> int | None:
         return None
 
 
+def cv_of_ivs(values) -> float | None:
+    """Коэффициент вариации интервалов (регулярность цикла опроса)."""
+    vals = list(values)
+    if len(vals) < 2:
+        return None
+    mean = sum(vals) / len(vals)
+    if mean <= 0:
+        return None
+    var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+    return var ** 0.5 / mean
+
+
 def _item_labels(r: dict) -> tuple[str, ...]:
     """Читаемая метка каждого элемента запроса: «DB123@100..107», «M@5».
 
@@ -337,7 +349,49 @@ class S7CommAnalyzer(BaseBranch):
         "s7comm.param.item.area", "s7comm.param.item.db",
         "s7comm.param.item.address.byte", "s7comm.param.item.length",
         "s7comm.data.returncode", "s7comm.data.length",
+        "tcp.payload", "frame.protocols",
     ]
+
+    def _value_digests(self, r: dict, lens: list[int],
+                       expect: int) -> tuple[str, ...]:
+        """Дайджесты данных элементов Ack_Data из tcp.payload.
+
+        Полей с байтами значений в tshark нет, поэтому проходим структуру
+        PDU вручную: TPKT(4) + COTP(1+len) + заголовок Ack_Data (12 байт с
+        полями ошибки) + параметр-эхо (parlen) + элементы
+        [код(1) транспорт(1) длина(2) данные(+fill при нечётной длине)].
+        Длины данных берём из поля s7comm.data.length (tshark уже учёл
+        единицы transport size); шаг — 4 + длина + выравнивание.
+        Дайджест — первые 16 байтов значения. Возвращает () при любой
+        неоднозначности (фрагментация, несовпадение числа элементов).
+        """
+        hx = (r.get("tcp.payload") or "").replace(":", "").replace(",", "")
+        if not hx or len(hx) % 2 or "cotp.segments" in (
+                r.get("frame.protocols") or ""):
+            return ()
+        try:
+            buf = bytes.fromhex(hx)
+        except ValueError:
+            return ()
+        if len(buf) < 24 or expect <= 0 or len(lens) != expect:
+            return ()
+        s7 = 4 + 1 + buf[4]                     # COTP-длина не включает свой байт
+        if s7 + 13 > len(buf) or buf[s7] != 0x32 or buf[s7 + 1] != 3:
+            return ()                           # только Ack_Data
+        parlen = int.from_bytes(buf[s7 + 6:s7 + 8], "big")
+        off = s7 + 12 + parlen                  # начало элементов данных
+        limit = off + int.from_bytes(buf[s7 + 8:s7 + 10], "big") + 2
+        out = []
+        for ln in lens:
+            if off + 4 > min(len(buf), limit):
+                return ()
+            if buf[off + 2:off + 4] != b"\x00\x00" and \
+                    int.from_bytes(buf[off + 2:off + 4], "big") not in (ln,):
+                # спека в заголовке может быть в битах — не сверяем жёстко
+                pass
+            out.append(buf[off + 4:off + 4 + ln][:16].hex())
+            off += 4 + ln + (ln % 2)
+        return tuple(out) if len(out) == expect else ()
 
     def _pass_s7(self, gen: GeneralStats) -> dict:
         s7 = {
@@ -362,6 +416,13 @@ class S7CommAnalyzer(BaseBranch):
             "err_pairs": {},              # (client, plc) -> ответов с ошибками
             # (client, plc, объект) -> {"codes": Counter, "read": n, "write": n}
             "err_targets": {},
+            # трекинг значений чтений: (pair, объект) -> [дайджест, изменения, чтений]
+            "valtrack": {},
+            "poll_last": {},              # (client, plc, func) -> ts последнего Job
+            # периодика Job по целям: (client, plc, func) -> Reservoir интервалов
+            "poll_int": {},
+            # глубина конвейера: (client, plc) -> Reservoir числа незакрытых Job
+            "pipe_depth": {},
         }
         rows = stream_fields(self.tshark, self.pcap_str, self.FIELDS_S7,
                              display_filter="s7comm")
@@ -419,6 +480,18 @@ class S7CommAnalyzer(BaseBranch):
                         (st, pduref), [])
                     q.append(Req(ts, st, key, func=func,
                                  items=_item_labels(r)))
+                    # периодика Job: интервал между соседними запросами
+                    # той же цели (клиент → PLC → функция)
+                    pt_key = (key[0], key[1], func)
+                    last_job = s7["poll_last"].get(pt_key)
+                    if ts is not None:
+                        if last_job and 0 < ts - last_job <= 3600:
+                            pi = s7["poll_int"].get(pt_key)
+                            if pi is None:
+                                pi = s7["poll_int"][pt_key] = Reservoir(
+                                    self.cfg.max_intervals_per_target)
+                            pi.add(ts - last_job)
+                        s7["poll_last"][pt_key] = ts
                     # pduref циклически переиспользуется на долгоживущем
                     # потоке: если старые Job так и не получили ответ,
                     # ограничиваем очередь, иначе каждый новый ответ
@@ -443,6 +516,13 @@ class S7CommAnalyzer(BaseBranch):
                     req = waiters.pop(0)
                     if not waiters:
                         del s7["pending"][(st, pduref)]
+                    # сколько Job этой пары ещё ждёт ответа после текущего —
+                    # глубина конвейера незакрытых транзакций
+                    pd_ = s7["pipe_depth"].get(key)
+                    if pd_ is None:
+                        pd_ = s7["pipe_depth"][key] = Reservoir(
+                            self.cfg.max_intervals_per_target)
+                    pd_.add(len(waiters))
                     if req.ts is not None and ts is not None:
                         rtt = max(ts - req.ts, 0.0)
                         # санитарный потолок: RTT больше порога — почти
@@ -479,6 +559,29 @@ class S7CommAnalyzer(BaseBranch):
                             {"codes": Counter(), "read": 0, "write": 0})
                         d["codes"][code] += 1
                         d["write" if is_write else "read"] += 1
+
+                # трекинг значений чтений: дайджест данных каждого элемента
+                digests = ()
+                if req is not None and not bad_rets and req.items:
+                    lens = [_to_int_auto(x) or 0
+                            for x in _split_field(r.get("s7comm.data.length"))]
+                    digests = self._value_digests(r, lens, len(rets))
+                if (req is not None and not bad_rets and digests
+                        and req.items
+                        and len(digests) == len(rets) == len(req.items)):
+                    vt = s7["valtrack"]
+                    cap = self.cfg.valtrack_max_registers
+                    for lbl, dg in zip(req.items, digests):
+                        k = (req.pair, lbl)
+                        rec = vt.get(k)
+                        if rec is None:
+                            if len(vt) < cap:
+                                vt[k] = [dg, 0, 1]
+                        else:
+                            rec[2] += 1
+                            if dg != rec[0]:
+                                rec[0] = dg
+                                rec[1] += 1
 
             elif rosctr == "7":
                 s7["userdata_total"] += 1
@@ -535,6 +638,12 @@ class S7CommAnalyzer(BaseBranch):
             threads = self._sec_threads()
             if threads:
                 sections.append(threads)
+            per_sec = self._sec_periodicity(s7)
+            if per_sec:
+                sections.append(per_sec)
+            static_sec = self._sec_static_tags(s7)
+            if static_sec:
+                sections.append(static_sec)
             sections.append(self._sec_functions(s7))
             sections.append(self._sec_areas(s7))
             sections.append(self._sec_errors(s7))
@@ -1047,6 +1156,109 @@ class S7CommAnalyzer(BaseBranch):
                        "Ошибки доступа к переменным: кто и что",
                        html, cmds)
 
+    def _sec_periodicity(self, s7: dict) -> Section | None:
+        """Интенсивность Job по целям и глубина конвейера."""
+        bars = []
+        for (cl, plc_ip, func), ivs in s7["poll_int"].items():
+            if len(ivs) < self.cfg.poll_pressure_min_intervals:
+                continue
+            med = percentile(sorted(ivs), 50)
+            if med is None:
+                continue
+            fname = FUNC_NAMES.get(func, func)
+            bars.append((f"{cl} → {plc_ip} {fname}", med * 1000))
+        depth_lines = []
+        for (cl, plc_ip), depths in sorted(
+                s7["pipe_depth"].items(),
+                key=lambda kv: percentile(sorted(kv[1]), 95) or 0,
+                reverse=True):
+            if len(depths) < self.cfg.poll_pressure_min_intervals:
+                continue
+            p50 = percentile(sorted(depths), 50)
+            p95 = percentile(sorted(depths), 95)
+            depth_lines.append(
+                f"{C.esc(cl)} → {self._srv_cell(plc_ip)}: медиана "
+                f"<strong>{p50:.0f}</strong>, p95 <strong>{p95:.0f}</strong>")
+        if not bars and not depth_lines:
+            return None
+        parts = []
+        if bars:
+            bars.sort(key=lambda x: x[1])
+            parts.append('<div class="chart-box">'
+                         + C.hbar_svg(bars[:12],
+                                      value_fmt=lambda v: f"{v:.1f} мс")
+                         + "</div>"
+                         + "<p>Медианный зазор между отправкой соседних Job "
+                           "одной цели — интенсивность генерации запросов.</p>")
+        if depth_lines:
+            parts.append(
+                '<h3 class="subhead">Конвейер незакрытых Job (по парам)</h3>'
+                "<p>" + "; ".join(depth_lines[:8]) + ".</p>"
+                + '<p class="note">SCADA может держать несколько транзакций '
+                  'в полёте одновременно (конвейер). Глубина 1 — строгий '
+                  'запрос-ответ; растущая глубина означает, что клиент не '
+                  'успевает «переваривать» ответы или сознательно '
+                  'пипелайнит опрос: это усиливает очередь PLC и разброс '
+                  'RTT. См. правило «Глубокий конвейер запросов».</p>')
+        return Section("periodicity",
+                       "Интенсивность и конвейер запросов",
+                       "".join(parts), [])
+
+    def _sec_static_tags(self, s7: dict) -> Section | None:
+        """Теги, которые читаются, но их значения не меняются."""
+        cfg = self.cfg
+        candidates = [(k, v) for k, v in s7["valtrack"].items()
+                      if v[2] >= cfg.static_reg_min_reads]
+        if not candidates:
+            return None
+        static = [(k, v) for k, v in candidates
+                  if 100.0 * v[1] / v[2] < cfg.static_reg_change_pct]
+        if len(candidates) < cfg.static_reg_min_candidates or \
+                100.0 * len(static) / len(candidates) < cfg.static_share_pct:
+            return None
+        static.sort(key=lambda kv: kv[1][2], reverse=True)
+        rows = []
+        for (pair, label), (_dg, changes, reads) in static[:10]:
+            cl, plc_ip = pair
+            rows.append([
+                f"<strong>{C.esc(cl)}</strong>", self._srv_cell(plc_ip),
+                f"<code class=\"inline\">{C.esc(label)}</code>",
+                f'<span class="num">{C.fmt_int(reads)}</span>',
+                f'<span class="num">{C.fmt_int(changes)}</span>',
+                f'<span class="num">{C.fmt_pct(changes, reads)}</span>',
+            ])
+        body = (
+            f"<p>Из {C.fmt_int(len(candidates))} достаточно часто читаемых "
+            f"переменных <strong>{C.fmt_int(len(static))} "
+            f"({C.fmt_pct(len(static), len(candidates))})</strong> не меняют "
+            f"значения за весь захват (изменения реже чем в "
+            f"{cfg.static_reg_change_pct:.0f}% чтений):</p>"
+            + C.table_html(
+                ["Клиент", "PLC", "Переменная", "Чтений", "Изменений",
+                 "% изм."], rows)
+            + '<p class="note">Значение отслеживается по дайджесту первых '
+              'байтов ответа. Статичные теги — кандидаты на медленный цикл '
+              'опроса или чтение по изменению: конфигурация, уставки и '
+              'счётчики наработки редко нужны с периодом основного цикла. '
+              'Разделение на быстрый и медленный контуры разгружает PLC без '
+              'потери актуальности.</p>')
+        cmds = []
+        if static:
+            (pair, label) = static[0][0]
+            db_m = re.match(r"DB(\d+)", label)
+            addr_m = re.search(r"@(\d+)", label)
+            flt = "s7comm.param.item.area"
+            if db_m:
+                flt += f" && s7comm.param.item.db == 0x{int(db_m.group(1)):x}"
+            cmds.append((
+                f"Все чтения {label} ({pair[0]} → {pair[1]})",
+                self._cmd(f'-Y "{flt}" -T fields -e frame.time -e ip.src '
+                          "-e s7comm.param.item.db "
+                          "-e s7comm.param.item.address.byte | head -40")))
+        return Section("static-tags",
+                       "Статичные переменные (читаются, но не меняются)",
+                       body, cmds)
+
     def _sec_errors(self, s7: dict) -> Section:
         rows = []
         for code, cnt in s7["retcodes"].most_common():
@@ -1149,6 +1361,71 @@ class S7CommAnalyzer(BaseBranch):
                     "-e frame.number -e ip.src -e s7comm.param.item.db "
                     "-e s7comm.param.item.address.byte "
                     "-e s7comm.data.returncode | head -40")])
+
+        # 2b. Глубокий конвейер: много незакрытых Job на пару клиент → PLC
+        deep = []
+        for (cl, plc_ip), depths in s7["pipe_depth"].items():
+            if len(depths) < self.cfg.poll_pressure_min_intervals:
+                continue
+            p95 = percentile(sorted(depths), 95)
+            if p95 is not None and p95 >= self.cfg.s7_pipeline_warn_depth:
+                ps = s7["pairs"].get((cl, plc_ip))
+                med_rtt = percentile(sorted(ps.rtts), 50) if ps else None
+                deep.append((cl, plc_ip, p95, med_rtt))
+        if deep:
+            deep.sort(key=lambda x: x[2], reverse=True)
+            cl, plc_ip, p95, rtt = deep[0]
+            rtt_txt = f" при медианном отклике {C.fmt_ms(rtt)} мс" \
+                if rtt is not None else ""
+            add("s7-poll-pressure", "warning",
+                "Глубокий конвейер запросов к PLC",
+                f"{cl} → {plc_ip}: в 5% ответов очередь незакрытых Job "
+                f"достигает {p95:.0f}{rtt_txt}. Таких пар: {len(deep)}.",
+                "Клиент держит много транзакций одновременно: пока PLC "
+                "отвечает на одни, новые уже стоят в очереди контроллера — "
+                "латентность растёт, а таймауты клиента порождают потерянные "
+                "Job и переподключения. Ограничьте число одновременных "
+                "запросов на соединение до 1–3 или сократите списки чтения; "
+                "период цикла при этом не пострадает.",
+                evidence=[f"{c} → {p}: p95 конвейера {d:.0f} Job"
+                          for c, p, d, _r in deep[:6]],
+                commands=[self._cmd(
+                    '-Y "s7comm.header.pduref" -T fields -e ip.src '
+                    "-e ip.dst -e tcp.stream -e s7comm.header.pduref "
+                    "| awk '{c[$1\" \"$2\" \"$3]++} END{for(k in c)"
+                    "print c[k],k}' | sort -rn | head -15")])
+
+        # 2c. Статичные теги: читаются, но значения не меняются
+        candidates = [(k, v) for k, v in s7["valtrack"].items()
+                      if v[2] >= self.cfg.static_reg_min_reads]
+        static_tags = [(k, v) for k, v in candidates
+                       if 100.0 * v[1] / v[2] < self.cfg.static_reg_change_pct]
+        if len(candidates) >= self.cfg.static_reg_min_candidates and \
+                100.0 * len(static_tags) / len(candidates) \
+                >= self.cfg.static_share_pct:
+            static_tags.sort(key=lambda kv: kv[1][2], reverse=True)
+            (pair, label), (_dg, ch, rd) = static_tags[0]
+            db_m = re.match(r"DB(\d+)", label)
+            db_part = (f" && s7comm.param.item.db == "
+                       f"0x{int(db_m.group(1)):x}") if db_m else ""
+            add("s7-static-tags", "info",
+                f"~{100.0 * len(static_tags) / len(candidates):.0f}% часто "
+                "читаемых тегов не меняются",
+                f"{len(static_tags)} из {len(candidates)} переменных меняются "
+                f"реже чем в {self.cfg.static_reg_change_pct:.0f}% чтений. "
+                f"Например, {label} ({pair[0]} → {pair[1]}): {rd} чтений без "
+                f"изменений.",
+                "Разделите карту опроса на быстрый контур (динамичные "
+                "величины) и медленный: уставки, конфигурацию и счётчики "
+                "наработки читать раз в N минут или по событию. Это сокращает "
+                "трафик и нагрузку на PLC без потери актуальности данных.",
+                evidence=[f"{k[0][0]} → {k[0][1]} {k[1]}: "
+                          f"{v[2]} чтений, {v[1]} изменений"
+                          for k, v in static_tags[:5]],
+                commands=[self._cmd(
+                    '-Y "s7comm.header.rosctr==3'
+                    + (db_part or "") + '" -T fields -e frame.time -e ip.dst '
+                    "-e s7comm.data.length | head -40")])
 
         # 3. Запросы без ответа: считаем ВСЕ зависшие транзакции, а не
         # только ключи словаря; при высокой доле — эскалация до warning
