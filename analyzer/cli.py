@@ -62,6 +62,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--tshark-bin", default=None,
                       help="путь к tshark (иначе TSHARK_BIN или PATH)")
 
+    # --- diff -------------------------------------------------------------------
+    p_df = sub.add_parser(
+        "diff",
+        help="сравнение двух серий дампов: до и после изменений")
+    p_df.add_argument("before", help="маска серии «до»")
+    p_df.add_argument("after", help="маска серии «после»")
+    p_df.add_argument("-b", "--branch", default=DEFAULT_BRANCH,
+                      choices=sorted(BRANCHES),
+                      help="ветка анализа (по умолчанию: %(default)s)")
+    p_df.add_argument("-o", "--output", default="diff.html",
+                      help="путь к итоговому HTML (по умолчанию diff.html)")
+    p_df.add_argument("--tshark-bin", default=None,
+                      help="путь к tshark (иначе TSHARK_BIN или PATH)")
+
     # --- serve -----------------------------------------------------------------
     p_sv = sub.add_parser(
         "serve",
@@ -178,6 +192,43 @@ def main(argv: list[str] | None = None) -> int:
                        encoding="utf-8")
         _progress(f"[pcap-analyzer] Серия из {len(points)} файлов обработана "
                   f"за {took:.0f} c → {out}")
+        print(str(out))
+        return 0
+
+    if args.command == "diff":
+        from pathlib import Path as _Path
+
+        from .report import render_diff_html
+        from .trend import build_trend, expand_series
+
+        files_a = expand_series(args.before)
+        files_b = expand_series(args.after)
+        if not files_a or not files_b:
+            print("Ошибка: маски должны указывать хотя бы на один файл "
+                  f"(до: {len(files_a)}, после: {len(files_b)})",
+                  file=sys.stderr)
+            return 2
+        branch = get_branch(args.branch)
+
+        def prog(m, pct=None):
+            _progress(m)
+
+        _progress("Период «до»…")
+        points_a, ta = build_trend(files_a, branch, DEFAULT_CONFIG,
+                                   progress=prog,
+                                   tshark_bin=args.tshark_bin)
+        _progress("Период «после»…")
+        points_b, tb = build_trend(files_b, branch, DEFAULT_CONFIG,
+                                   progress=prog,
+                                   tshark_bin=args.tshark_bin)
+        out = _Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(render_diff_html(points_a, points_b,
+                                        args.before, args.after,
+                                        branch.title), encoding="utf-8")
+        _progress(f"[pcap-analyzer] Сравнение готово "
+                  f"({len(points_a)}+{len(points_b)} файлов, "
+                  f"{ta + tb:.0f} c) → {out}")
         print(str(out))
         return 0
 

@@ -420,5 +420,42 @@ class TrendRenderTest(unittest.TestCase):
         self.assertIn("<th>Правило</th><th>1</th><th>2</th><th>3</th>", html)
 
 
+class DiffRenderTest(unittest.TestCase):
+    """Дифф-отчёт: статусы правил и оценка метрик без tshark."""
+
+    def test_render_statuses_and_deltas(self):
+        from analyzer.report import TrendPoint, render_diff_html
+
+        def pt(i, ts, metrics, recs):
+            p = TrendPoint(path=Path(f"/tmp/d{i}.pcap"), start_ts=float(ts),
+                           metrics=dict(metrics))
+            for rid in recs:
+                p.rec_ids.add(rid)
+                p.rule_info[rid] = (
+                    ("warning", "Старое правило") if rid == "old-rule"
+                    else ("info", "Новое правило"))
+            return p
+
+        a = [pt(0, 1735000000, {"unans_pct": 20.0, "rtt_med_ms": 40.0},
+                ["old-rule"]),
+             pt(1, 1735000300, {"unans_pct": 22.0, "rtt_med_ms": 42.0},
+                ["old-rule"])]
+        b = [pt(2, 1735003600, {"unans_pct": 5.0, "rtt_med_ms": 39.0},
+                ["new-rule"])]
+        html = render_diff_html(a, b, "до", "после", "Анализ S7comm")
+        self.assertIn("Сравнение периодов", html)
+        # правило исчезло
+        self.assertIn("исчез", html)
+        # правило появилось
+        self.assertIn("появился", html)
+        # доля безответов упала с ~21% до 5% -> «лучше»
+        self.assertIn("лучше", html)
+        # RTT почти не изменилось (40->39 при размахе) — без оценки «хуже»
+        self.assertIn("delta good", html)
+        self.assertNotIn("delta bad", html)
+        self.assertIn("улучшилось", html)
+        self.assertIn("перестало срабатывать", html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
