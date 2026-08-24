@@ -312,6 +312,8 @@ class S7CommAnalyzer(BaseBranch):
             "pending": {},                # (stream, pduref) -> [Req, ...]
             "stream_reqs": Counter(),
             "s7_streams": set(),          # потоки, где был хоть один PDU S7
+            "stale_dropped": 0,           # Job вытеснен переполненной очередью pduref
+            "stale_matched": 0,           # ответ «сцепился» с давно зависшим Job
         }
         rows = stream_fields(self.tshark, self.pcap_str, self.FIELDS_S7,
                              display_filter="s7comm")
@@ -365,8 +367,20 @@ class S7CommAnalyzer(BaseBranch):
                               else s7["areas_r"])
                     bucket[(area, db)] += max(itemcnt, 1)
                 if ts is not None and st != "":
-                    s7.setdefault("pending", {}).setdefault(
-                        (st, pduref), []).append(Req(ts, st, key))
+                    q = s7.setdefault("pending", {}).setdefault(
+                        (st, pduref), [])
+                    q.append(Req(ts, st, key))
+                    # pduref циклически переиспользуется на долгоживущем
+                    # потоке: если старые Job так и не получили ответ,
+                    # ограничиваем очередь, иначе каждый новый ответ
+                    # «сцепится» с самым старым зависшим запросом и
+                    # раздует RTT до минут
+                    while len(q) > self.cfg.s7_max_pending_per_ref:
+                        stale = q.pop(0)
+                        s7["stale_dropped"] += 1
+                        ps_ = s7["pairs"].get(stale.pair)
+                        if ps_ is not None:
+                            ps_.no_resp += 1
                 b = int((ts or first_ts) - first_ts) // bucket_sec
                 s7["timeline"].setdefault(b, [0, 0])[0] += 1
 
@@ -380,8 +394,15 @@ class S7CommAnalyzer(BaseBranch):
                     if not waiters:
                         del s7["pending"][(st, pduref)]
                     if req.ts is not None and ts is not None:
-                        # RTT хранится в СЕКУНДАХ (fmt_ms сам переводит в мс)
-                        ps.rtts.add(max(ts - req.ts, 0.0))
+                        rtt = max(ts - req.ts, 0.0)
+                        # санитарный потолок: RTT больше порога — почти
+                        # наверняка потерянный запрос и переиспользованный
+                        # pduref, а не реальная задержка PLC
+                        if rtt <= self.cfg.s7_rtt_sanity_max_sec:
+                            ps.rtts.add(rtt)          # секунды (fmt_ms → мс)
+                        else:
+                            ps.no_resp += 1
+                            s7["stale_matched"] += 1
                 has_err = (errcls not in ("", "0x0", "0x00"))
                 rets = [v.strip().lower()
                         for v in (r.get("s7comm.data.returncode") or "").split(",")
@@ -973,7 +994,8 @@ class S7CommAnalyzer(BaseBranch):
 
         # 3. Запросы без ответа: считаем ВСЕ зависшие транзакции, а не
         # только ключи словаря; при высокой доле — эскалация до warning
-        pending_cnt = sum(len(v) for v in s7.get("pending", {}).values())
+        pending_cnt = sum(len(v) for v in s7.get("pending", {}).values()) \
+            + s7.get("stale_dropped", 0) + s7.get("stale_matched", 0)
         if pending_cnt:
             rate = 100.0 * pending_cnt / s7["req_total"] if s7["req_total"] else 0.0
             sev = ("warning" if rate >= self.cfg.s7_no_response_warn_pct
@@ -982,19 +1004,38 @@ class S7CommAnalyzer(BaseBranch):
                            key=lambda kv: kv[1].no_resp, reverse=True)[:3]
             ev = [f"{cl} → {p}: {ps.no_resp} без ответа из {ps.reqs}"
                   for (cl, p), ps in worst if ps.no_resp]
+            stale = (f" Переиспользование pduref: вытеснено "
+                     f"{s7.get('stale_dropped', 0)}, отцеплено при ответе "
+                     f"{s7.get('stale_matched', 0)}.") \
+                if (s7.get("stale_dropped") or s7.get("stale_matched")) else ""
             add("s7-unanswered", sev,
                 "Запросы остаются без ответа PLC",
                 f"Не дождались Ack_Data: {pending_cnt} "
-                f"({rate:.1f}% от всех Job).",
-                "Транзакции теряются вместе с соединением при "
-                "переподключениях либо PLC не успевает отвечать в таймаут "
-                "клиента. Сопоставьте моменты пропадания ответов с разрывами "
-                "TCP; для виновника проверьте длину цикла PLC и число "
-                "одновременных соединений.",
+                f"({rate:.1f}% от всех Job).{stale}",
+                "Возможных причин две группы. Первая — сеть действительно "
+                "теряет ответы: транзакция пропадает вместе с соединением при "
+                "переподключении либо PLC не успевает ответить до таймаута "
+                "клиента. Вторая — эффект измерения: асимметрия маршрута или "
+                "неполный захват. Асимметрия маршрута означает, что путь "
+                "«туда» и «обратно» разный: запрос от SCADA доходит до "
+                "контроллера через один коммутатор, а ответ возвращается "
+                "другой дорогой. Точка съёма трафика (зеркало) физически стоит "
+                "на одном конкретном участке и видит лишь те пути, которые "
+                "через него пролегают. Это как почта: письмо опущено в ящик у "
+                "дома, а ответ вам вручили на работе — наблюдатель, стоящий "
+                "только у дома, запишет «вопрос без ответа», хотя переписка "
+                "шла исправно. Как отличить одно от другого: если два зеркала "
+                "на разных участках показывают сильно разные доли «безответных» "
+                "запросов для одних и тех же сессий (например, у SCADA — 0%, у "
+                f"PLC — {rate:.0f}%), а TCP-соединения живут долго и без "
+                "разрывов, — почти наверняка виновата точка съёма, а не PLC. "
+                "Тогда сверьте схему зеркалирования и полноту записи дампов. "
+                "Если же дампы согласны между собой — проверяйте таймауты "
+                "клиента, длину цикла PLC и число одновременных соединений.",
                 evidence=ev,
                 commands=[self._cmd(
-                    '-Y "s7comm.header.rosctr==1 && !s7comm.header.pduref" '
-                    "-c 5")])
+                    '-Y "s7comm.header.rosctr==3" -T fields -e ip.src '
+                    "| sort | uniq -c | sort -rn")])
 
         # 3b. «Молчащие» цели :102 — подключения без единого байта ответа
         dead_ev = []

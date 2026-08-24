@@ -66,6 +66,8 @@ class Config:
     s7_single_read_pct: float = 80.0       # доля запросов с одним элементом, %
     s7_no_response_warn_pct: float = 10.0  # доля Job без Ack_Data для warning, %
     s7_dead_min_syns: int = 5              # SYN к «молчащему» узлу :102 для рекомендации
+    s7_max_pending_per_ref: int = 8        # очередь Job на один (поток, pduref)
+    s7_rtt_sanity_max_sec: float = 30.0    # RTT выше — считаем транзакцию потерянной
 
     # --- Прочее ---------------------------------------------------------------
     top_registers_limit: int = 20          # топ-N регистров в отчёте
