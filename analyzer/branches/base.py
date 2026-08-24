@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import random
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field
@@ -20,6 +21,41 @@ SEVERITY_WARNING = "warning"
 SEVERITY_INFO = "info"
 
 SEVERITY_ORDER = {SEVERITY_CRITICAL: 0, SEVERITY_WARNING: 1, SEVERITY_INFO: 2}
+
+
+class Reservoir:
+    """Ограниченная случайная выборка значений (алгоритм R, Vitter).
+
+    Хранит не более cap значений из n добавленных; каждое из n значений
+    попадает в выборку с равной вероятностью, поэтому перцентили по выборке
+    корректно оценивают весь захват (важно для больших файлов: все RTT
+    в память не помещаются). Зерно генератора фиксировано — поведение
+    детерминировано от запуска к запуску при одинаковом входе.
+    """
+
+    __slots__ = ("cap", "seen", "_items", "_rng")
+
+    def __init__(self, cap: int) -> None:
+        self.cap = max(int(cap), 0)
+        self.seen = 0
+        self._items: list[float] = []
+        self._rng = random.Random(0)
+
+    def add(self, value: float) -> None:
+        """Добавить значение, вытесняя случайное при заполненной выборке."""
+        self.seen += 1
+        if len(self._items) < self.cap:
+            self._items.append(value)
+            return
+        j = self._rng.randrange(self.seen)
+        if j < self.cap:
+            self._items[j] = value
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 @dataclass

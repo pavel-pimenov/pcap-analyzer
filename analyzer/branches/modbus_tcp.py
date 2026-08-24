@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -25,6 +25,7 @@ from .base import (
     KpiItem,
     ProgressCb,
     Recommendation,
+    Reservoir,
     Section,
 )
 
@@ -108,7 +109,7 @@ class PairStats:
     bytes_: int = 0
     streams: set = field(default_factory=set)
     fcodes: Counter = field(default_factory=Counter)
-    rtts: deque = field(default_factory=lambda: deque())
+    rtts: Reservoir = field(default_factory=Reservoir)
     first_ts: float | None = None
     last_ts: float | None = None
 
@@ -125,7 +126,7 @@ class PollTarget:
     cnt: int
     n_req: int = 0
     last_ts: float | None = None
-    intervals: deque = field(default_factory=lambda: deque())
+    intervals: Reservoir = field(default_factory=Reservoir)
 
 
 @dataclass
@@ -179,11 +180,6 @@ def _percentile(sorted_vals, p: float):
     if lo == hi:
         return sorted_vals[int(k)]
     return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
-
-
-def _reservoir_add(dq: deque, value, cap: int):
-    """Добавить значение в ограниченную коллекцию (простое вытеснение)."""
-    dq.append(value)
 
 
 def _fmt_ts_offset(ts: float, first_ts: float) -> str:
@@ -450,7 +446,7 @@ class ModbusTcpAnalyzer(BaseBranch):
                     ps = self._pair(mb, client, server)
                     ps.resps += 1
                     if rtt is not None:
-                        _reservoir_add(ps.rtts, rtt, self.cfg.max_rtts_per_pair)
+                        ps.rtts.add(rtt)
                     if is_exc:
                         ps.excs += 1
                         mb["exc_total"] += 1
@@ -562,12 +558,15 @@ class ModbusTcpAnalyzer(BaseBranch):
                     tk = (client, server, unit, fc_base, ref, wcnt)
                     pt = mb["poll_targets"].get(tk)
                     if pt is None:
-                        pt = mb["poll_targets"][tk] = PollTarget(client, server, unit, fc_base, ref, wcnt)
+                        pt = mb["poll_targets"][tk] = PollTarget(
+                            client, server, unit, fc_base, ref, wcnt,
+                            intervals=Reservoir(self.cfg.max_intervals_per_target),
+                        )
                     pt.n_req += 1
                     if pt.last_ts is not None and ts > pt.last_ts:
                         iv = ts - pt.last_ts
                         if 0 < iv <= 3600:
-                            _reservoir_add(pt.intervals, iv, self.cfg.max_intervals_per_target)
+                            pt.intervals.add(iv)
                     pt.last_ts = ts
 
             if (i + 1) % 100000 == 0:
@@ -581,11 +580,11 @@ class ModbusTcpAnalyzer(BaseBranch):
                     mb["unanswered_frames"].append(req.n)
         return mb
 
-    @staticmethod
-    def _pair(mb: dict, client: str, server: str) -> PairStats:
+    def _pair(self, mb: dict, client: str, server: str) -> PairStats:
         ps = mb["pairs"].get((client, server))
         if ps is None:
-            ps = mb["pairs"][(client, server)] = PairStats()
+            ps = mb["pairs"][(client, server)] = PairStats(
+                rtts=Reservoir(self.cfg.max_rtts_per_pair))
             mb["pair_order"].append((client, server))
         return ps
 

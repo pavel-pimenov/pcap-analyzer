@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +23,7 @@ from .base import (
     KpiItem,
     ProgressCb,
     Recommendation,
+    Reservoir,
     Section,
     sort_recommendations,
 )
@@ -158,7 +159,7 @@ class PairStats:
     bytes_: int = 0
     streams: set = field(default_factory=set)
     fcodes: Counter = field(default_factory=Counter)
-    rtts: deque = field(default_factory=lambda: deque())
+    rtts: Reservoir = field(default_factory=Reservoir)
     items: int = 0           # всего элементов в запросах
     single_item_reqs: int = 0
 
@@ -371,7 +372,10 @@ class S7CommAnalyzer(BaseBranch):
             client, plc = self._roles(sport, dport, src, dst)
             key = (client, plc)
 
-            ps = s7["pairs"].setdefault(key, PairStats())
+            ps = s7["pairs"].get(key)
+            if ps is None:
+                ps = s7["pairs"][key] = PairStats(
+                    rtts=Reservoir(self.cfg.max_rtts_per_pair))
             ps.bytes_ += _to_int(r.get("frame.len"), 0)
             if st != "":
                 ps.streams.add(st)
@@ -412,7 +416,7 @@ class S7CommAnalyzer(BaseBranch):
                         del s7["pending"][(st, pduref)]
                     if req.ts is not None and ts is not None:
                         # RTT хранится в СЕКУНДАХ (fmt_ms сам переводит в мс)
-                        ps.rtts.append(max(ts - req.ts, 0.0))
+                        ps.rtts.add(max(ts - req.ts, 0.0))
                 has_err = (errcls not in ("", "0x0", "0x00"))
                 rets = [v.strip().lower()
                         for v in (r.get("s7comm.data.returncode") or "").split(",")
