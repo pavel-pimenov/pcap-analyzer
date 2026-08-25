@@ -15,6 +15,11 @@
 #   docker compose run --rm analyzer branches
 #
 # Параметры по умолчанию можно вынести в файл .env рядом с compose-файлом.
+#
+# Закрыть интерфейс токеном (пример):
+#   docker compose run -d --rm web serve --host 0.0.0.0 --port 8000 \
+#       --data-dir /data/webdata --samples-dir /data/pcap-sample \
+#       --token МОЁ_СЛОВО
 # =============================================================================
 
 services:
@@ -31,9 +36,10 @@ services:
       # Загрузки пользователей и готовые отчёты (именованный том)
       - webdata:/data/webdata
     healthcheck:
-      # curl в slim-образе нет — проверяем стандартной библиотекой python
+      # curl в slim-образе нет — проверяем стандартной библиотекой python;
+      # проверяем страницу "/" — она отдаётся даже при включённом --token
       test: ["CMD", "python3", "-c",
-             "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/api/branches', timeout=5)"]
+             "import urllib.request as u; r=u.urlopen('http://127.0.0.1:8000/', timeout=5); assert r.status==200"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -68,8 +68,8 @@ footer.report { display: none; }
 """
 
 
-def render_pdf_bytes(result: BranchResult) -> bytes:
-    """Собрать HTML-отчёт и отдать его в виде PDF (байты)."""
+def render_html_to_pdf(html: str) -> bytes:
+    """Любой готовый HTML отчёта -> PDF с печатной таблицей стилей."""
     try:
         from weasyprint import CSS, HTML
     except ImportError as e:  # подсказка вместо трейсбека с cryptic ModuleNotFoundError
@@ -79,11 +79,14 @@ def render_pdf_bytes(result: BranchResult) -> bytes:
             "(в Debian/Ubuntu: apt install libpango-1.0-0 libpangocairo-1.0-0 "
             "libgdk-pixbuf-2.0-0 fonts-dejavu-core)."
         ) from e
-
-    html = render_document(result)
     doc = HTML(string=html, base_url=".").render(
         stylesheets=[CSS(string=_PRINT_CSS)])
     return doc.write_pdf()
+
+
+def render_pdf_bytes(result: BranchResult) -> bytes:
+    """Собрать HTML-отчёт и отдать его в виде PDF (байты)."""
+    return render_html_to_pdf(render_document(result))
 
 
 def render_pdf_file(result: BranchResult, out_path) -> None:

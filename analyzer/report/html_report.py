@@ -76,6 +76,10 @@ td span.srv, .srv-legend .srv { padding:1px 7px; border-radius:4px;
 .sev-info     { background:var(--sev-info-bg);     color:var(--sev-info-fg); }
 .rec { border:1px solid var(--border); border-left-width:5px; border-radius:8px;
        padding:12px 16px; margin:10px 0; }
+section.card.verdict { border-left-width:5px; }
+section.card.verdict.sev-critical { border-left-color:#dc2626; }
+section.card.verdict.sev-warning  { border-left-color:#d97706; }
+section.card.verdict.sev-info     { border-left-color:#2563eb; }
 .rec.critical { border-left-color:#dc2626; background:#fffafa; }
 .rec.warning  { border-left-color:#d97706; background:#fffbeb; }
 .rec.info     { border-left-color:#2563eb; background:#f8fbff; }
@@ -196,6 +200,37 @@ document.addEventListener("DOMContentLoaded",function(){
 """
 
 
+def _verdict_html(result: BranchResult) -> str:
+    """Блок «Вывод»: краткое резюме рекомендаций в шапке отчёта."""
+    recs = sorted(result.recommendations,
+                  key=lambda r: (SEVERITY_ORDER.get(r.severity, 9), r.id))
+    real = [r for r in recs if r.id != "ok"]
+    counts = {"critical": 0, "warning": 0, "info": 0}
+    for r in real:
+        counts[r.severity] = counts.get(r.severity, 0) + 1
+    parts = [f"Критичных: <strong>{counts['critical']}</strong>",
+             f"важных: <strong>{counts['warning']}</strong>",
+             f"советов: <strong>{counts['info']}</strong>"]
+    tops = [r.title for r in real
+            if r.severity in ("critical", "warning")][:3]
+    cls = ("sev-critical" if counts["critical"]
+           else "sev-warning" if counts["warning"] else "sev-info")
+    body = ("<p><strong>Итог анализа:</strong> " + ", ".join(parts)
+            + ".</p>")
+    if tops:
+        lis = "".join(f"<li>{esc(t)}</li>" for t in tops)
+        body += f"<ul>{lis}</ul>"
+        if len(real) > len(tops):
+            body += ('<p class="note">Полный список с деталями и командами '
+                     "проверки — в разделе «Рекомендации» ниже.</p>")
+    else:
+        body += ('<p class="note">Правила не выявили проблем выше порогов '
+                 "из конфигурации. Сохраните отчёт как эталон для будущих "
+                 "сравнений.</p>")
+    return (f'<section class="card verdict {cls}" id="verdict">'
+            f"<h2>Вывод</h2>{body}</section>")
+
+
 def render_document(result: BranchResult) -> str:
     """Собрать полный HTML-файл отчёта (один автономный файл)."""
     generated = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
@@ -252,6 +287,7 @@ def render_document(result: BranchResult) -> str:
     + "</div>"
 ) if len(result.server_colors) >= 2 else ""}
 
+{_verdict_html(result)}
 {('<section class="card" id="summary"><h2>Ключевые показатели</h2>' + kpi_cards(result.kpi) + '</section>') if result.kpi else ""}
 
 {"".join(sections_html)}

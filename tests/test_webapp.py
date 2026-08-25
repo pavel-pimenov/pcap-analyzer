@@ -273,6 +273,19 @@ class WebSeriesTest(unittest.TestCase):
                          f"ошибка диффа: {st.get('error')}")
         code, _h, body = _request(self.base, f"/view/{gd}")
         self.assertIn("Сравнение периодов", body.decode("utf-8"))
+        # PDF для групп собирается, если установлен weasyprint
+        try:
+            import weasyprint  # noqa: F401
+            has_wp = True
+        except ImportError:
+            has_wp = False
+        code, headers, body = _request(self.base,
+                                       f"/export/{g1}?fmt=pdf")
+        if has_wp:
+            self.assertEqual(code, 200)
+            self.assertTrue(body.startswith(b"%PDF"))
+        else:
+            self.assertEqual(code, 404)
         # удаление групп не трогает исходные файлы
         code, _h, _d = _request(self.base, f"/api/groups/{g1}",
                                 method="DELETE")

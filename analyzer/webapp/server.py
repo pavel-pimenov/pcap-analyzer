@@ -29,8 +29,9 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from ..branches import BRANCHES, DEFAULT_BRANCH, get_branch
 from ..config import DEFAULT_CONFIG
-from ..report import render_document, render_pdf_bytes, \
-    render_diff_html, render_trend_html
+from ..report import (render_diff_html, render_document,
+                      render_html_to_pdf, render_pdf_bytes,
+                      render_trend_html)
 from ..trend import build_trend
 from . import page
 
@@ -184,7 +185,7 @@ class AppState:
             "added": g.get("added", ""),
             "members": len(g.get("fids", [])),
             "hasHtml": (self.reports_dir / f"{gid}.html").is_file(),
-            "hasPdf": False,
+            "hasPdf": (self.reports_dir / f"{gid}.pdf").is_file(),
         }
 
     def list_files(self) -> list[dict]:
@@ -398,6 +399,11 @@ class AppState:
         html = render_trend_html(points, branch.title,
                                  g.get("name") or gid)
         (self.reports_dir / f"{gid}.html").write_text(html, encoding="utf-8")
+        try:
+            (self.reports_dir / f"{gid}.pdf").write_bytes(
+                render_html_to_pdf(html))
+        except Exception as pe:                  # PDF не критичен
+            self._gstage(gid, f"готово; PDF не собран: {pe}")
         with self.lock:
             g2 = self.groups.get(gid)
             g2.update(status="done", progress=100,
@@ -426,6 +432,11 @@ class AppState:
                              branch, DEFAULT_CONFIG, progress=prog)
         html = render_diff_html(pa, pb, ga["name"], gb["name"], branch.title)
         (self.reports_dir / f"{gid}.html").write_text(html, encoding="utf-8")
+        try:
+            (self.reports_dir / f"{gid}.pdf").write_bytes(
+                render_html_to_pdf(html))
+        except Exception as pe:
+            self._gstage(gid, f"готово; PDF не собран: {pe}")
         with self.lock:
             g2 = self.groups.get(gid)
             g2.update(status="done", progress=100,

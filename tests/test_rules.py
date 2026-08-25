@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import re as _re_mod  # noqa: F401 (используется в тестах ниже)
 import sys
 import tempfile
 import unittest
@@ -478,6 +479,44 @@ class OverlapBlocksTest(unittest.TestCase):
     def test_runs_str(self):
         from analyzer.overlap import _runs_str
         self.assertEqual(_runs_str([1, 2, 3, 7]), "1&ndash;3, 7")
+
+
+class VerdictBlockTest(unittest.TestCase):
+    """Блок «Вывод» в шапке отчёта строится из рекомендаций."""
+
+    def _render(self, recs):
+        from analyzer.branches.base import BranchResult, Recommendation
+        from analyzer.report.html_report import render_document
+        result = BranchResult(branch_name="modbus",
+                              branch_title="Т", pcap_path=Path("x.pcap"),
+                              pcap_size_bytes=1)
+        result.recommendations = recs
+        return render_document(result)
+
+    def test_counts_and_top_titles(self):
+        from analyzer.branches.base import Recommendation
+        html = self._render([
+            Recommendation(id="a", severity="warning",
+                           title="Первое предупреждение",
+                           problem="p", advice="a"),
+            Recommendation(id="b", severity="critical",
+                           title="Критичная штука", problem="p", advice="a"),
+            Recommendation(id="ok", severity="info",
+                           title="Явных проблем не обнаружено",
+                           problem="", advice=""),
+        ])
+        v = _re_mod.search(r'id="verdict".*?</section>', html,
+                           _re_mod.S).group(0)
+        plain = _re_mod.sub(r"<[^>]+>", " ", v)
+        self.assertIn("Критичных:", plain.replace("  ", " "))
+        self.assertIn("1", plain)
+        self.assertIn("важных:", plain)
+        self.assertIn("Критичная штука", plain)
+        self.assertNotIn("Явных проблем", plain)   # ok-заглушка не считается
+
+    def test_empty_state(self):
+        html = self._render([])
+        self.assertIn("не выявили проблем", html)
 
 
 class VersionSyncTest(unittest.TestCase):
