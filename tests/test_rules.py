@@ -519,6 +519,31 @@ class VerdictBlockTest(unittest.TestCase):
         self.assertIn("не выявили проблем", html)
 
 
+class TrendAnomaliesTest(unittest.TestCase):
+    """Детектор выбросов в трендах (MAD)."""
+
+    def test_spike_detected_flat_not(self):
+        from analyzer.report.trend_report import find_anomalies
+        self.assertEqual(find_anomalies([10, 11, 10, 12, 10, 95, 11]), [5])
+        self.assertEqual(find_anomalies([5.0] * 8), [])
+        self.assertEqual(find_anomalies([]), [])
+
+    def test_render_marks_and_section(self):
+        from analyzer.report import TrendPoint, render_trend_html
+        pts = []
+        vals = [100, 101, 99, 300]           # выброс на 4-й точке
+        for i, (ts, reqs) in enumerate(zip((1735000000, 1735000300,
+                                            1735000600, 1735000900), vals)):
+            pts.append(TrendPoint(path=Path(f"/tmp/a_{i}.pcap"),
+                                  start_ts=float(ts),
+                                  metrics={"reqs": float(reqs)}))
+        html = render_trend_html(pts, "Т", "маска", anomaly_k=5.0)
+        self.assertIn('id="anomalies"', html)
+        # красная точка-выброс на графике
+        self.assertIn('fill="#dc2626"', html)
+        self.assertIn("Аномалии в рядах", html)
+
+
 class VersionSyncTest(unittest.TestCase):
     """Версия в pyproject.toml совпадает с analyzer.__version__."""
 

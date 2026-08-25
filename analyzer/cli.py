@@ -252,8 +252,9 @@ def main(argv: list[str] | None = None) -> int:
         out = _Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         from .report import render_trend_html
-        out.write_text(render_trend_html(points, branch.title, args.pattern),
-                       encoding="utf-8")
+        out.write_text(render_trend_html(
+            points, branch.title, args.pattern,
+            anomaly_k=cfg.trend_anomaly_k), encoding="utf-8")
         _progress(f"[pcap-analyzer] Серия из {len(points)} файлов обработана "
                   f"за {took:.0f} c → {out}")
         print(str(out))

@@ -86,6 +86,7 @@ class Config:
     top_registers_limit: int = 20          # топ-N регистров в отчёте
     skip_gantt: bool = False               # пропускать диаграммы Ганта (режим трендов)
     display_tz_offset: float | None = None  # зона показа времени, часов от UTC
+    trend_anomaly_k: float = 5.0           # порог выброса в трендах, масштабов MAD
 
 
 # Экземпляр по умолчанию

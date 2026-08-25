@@ -56,6 +56,25 @@ class TrendPoint:
     took_s: float = 0.0
 
 
+def find_anomalies(values: list[float], k: float = 5.0) -> list[int]:
+    """Индексы точек, отклонившихся от медианы более чем на k·MAD.
+
+    MAD — медиана абсолютных отклонений, масштаб 1.4826 для сравнимости
+    со среднеквадратичным отклонением при нормальном распределении.
+    Робастно к редким выбросам в отличие от среднего/сигмы.
+    """
+    if not values:
+        return []
+    vals = sorted(values)
+    med = vals[len(vals) // 2] if len(vals) % 2 else \
+        (vals[len(vals) // 2 - 1] + vals[len(vals) // 2]) / 2
+    dev = sorted(abs(v - med) for v in values)
+    if not dev or dev[len(dev) // 2] == 0:
+        return []
+    mad = 1.4826 * dev[len(dev) // 2]
+    return [i for i, v in enumerate(values) if abs(v - med) > k * mad]
+
+
 def _label(ts: float | None) -> str:
     if ts is None:
         return "?"
@@ -71,10 +90,12 @@ def _psize(p: Path) -> int:
 
 
 def render_trend_html(points: list[TrendPoint], branch_title: str,
-                      pattern: str) -> str:
+                      pattern: str, *,
+                      anomaly_k: float = 5.0) -> str:
     """Собрать автономный HTML трендового отчёта."""
     generated = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     n = len(points)
+    cfg_k = anomaly_k
     total_bytes = sum(_psize(pt.path) for pt in points)
     t0 = min((p.start_ts for p in points if p.start_ts is not None),
              default=None)
@@ -104,20 +125,43 @@ def render_trend_html(points: list[TrendPoint], branch_title: str,
             if k not in keys:
                 keys.append(k)
     charts = []
+    anomaly_rows = []
     for k in keys:
         vals = [pt.metrics.get(k, 0.0) for pt in points]
         if all(v == 0 for v in vals):
             continue
         labels = [_label(pt.start_ts) for pt in points]
         title = METRIC_TITLES.get(k, k)
-        svg = _timeline_line(labels, vals)
+        outs = find_anomalies(vals, cfg_k)
+        svg = _timeline_line(labels, vals, outliers=outs)
+        note = (f"<p class=\"num note\">min {min(vals):.1f} · max "
+                f"{max(vals):.1f} · последний {vals[-1]:.1f}</p>")
+        if outs:
+            note += ('<p class="note">Выбросы отмечены красным: '
+                     "значение далеко от медианы серии.</p>")
+            for i in outs:
+                anomaly_rows.append([
+                    title,
+                    f"<strong>{i + 1}</strong> ({labels[i]})",
+                    f"{vals[i]:.1f}",
+                    "см. график",
+                ])
         charts.append(
             f'<section class="card" id="m-{k}"><h2>{title}</h2>'
-            f'<div class="chart-box">{svg}</div>'
-            f"<p class=\"num note\">min {min(vals):.1f} · max "
-            f"{max(vals):.1f} · последний {vals[-1]:.1f}</p></section>")
+            f'<div class="chart-box">{svg}</div>{note}</section>')
     charts_html = "".join(charts) or \
         '<section class="card"><p>Метрик не собрано.</p></section>'
+
+    anomaly_section = ""
+    if anomaly_rows:
+        anomaly_section = (
+            '<section class="card" id="anomalies">'
+            "<h2>Аномалии в рядах</h2>"
+            "<p>Точки, отклонившиеся от медианы серии более чем на "
+            f"{cfg_k:g} масштабов MAD:</p>"
+            + _table(["Метрика", "Файл (№, старт)", "Значение", ""],
+                     anomaly_rows)
+            + "</section>")
 
     # ---- матрица правил ------------------------------------------------------
     rule_info: dict[str, tuple[str, str]] = {}
@@ -182,6 +226,7 @@ table.data-table.matrix td:first-child {{ text-align:left; white-space:normal; }
 </header>
 
 {files_html}
+{anomaly_section}
 {charts_html}
 {matrix_html}
 
@@ -214,7 +259,8 @@ def _table(headers: list[str], rows: list[list[str]],
 
 
 def _timeline_line(labels: list[str], values: list[float],
-                   height: int = 200) -> str:
+                   height: int = 200, outliers: list[int] | None = None
+                   ) -> str:
     """Линейный график с точками: значения по файлам серии."""
     width = 960
     pad_l, pad_r, pad_t, pad_b = 46, 14, 14, 40
@@ -241,8 +287,13 @@ def _timeline_line(labels: list[str], values: list[float],
             x = pad_l + i * step
             y = pad_t + plot_h * (1 - v / max_val)
             pts.append(f"{x:.1f},{y:.1f}")
-            out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.5" '
-                       'fill="#2563eb"/>')
+            is_out = outliers and i in outliers
+            color = "#dc2626" if is_out else "#2563eb"
+            r = 5 if is_out else 3.5
+            out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r}" '
+                       f'fill="{color}"'
+                       + (' stroke="#fecaca" stroke-width="2"' if is_out
+                          else "") + "/>")
             out.append(f'<text x="{x:.1f}" y="{y - 8:.1f}" font-size="10" '
                        f'fill="#111827" text-anchor="middle">{v:.1f}</text>')
         out.append(f'<polyline points="{" ".join(pts)}" fill="none" '
