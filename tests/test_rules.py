@@ -447,6 +447,39 @@ class TrendRenderTest(unittest.TestCase):
         self.assertIn("<th>Правило</th><th>1</th><th>2</th><th>3</th>", html)
 
 
+class OverlapBlocksTest(unittest.TestCase):
+    """Слияние регистров двух сторон в канонические блоки."""
+
+    def test_merge_and_split_by_max_words(self):
+        from analyzer.overlap import _block_rate, canonical_blocks
+        cov_a = {("10.0.0.1", 1, 3, r): 10.0 for r in (1, 2, 3, 4)}
+        # сторона Б читает только 5-й регистр → блок склеится до 1..5
+        cov_b = {("10.0.0.1", 1, 3, 5): 6.0}
+        blocks = canonical_blocks(cov_a, cov_b, max_words=125)
+        self.assertEqual(len(blocks), 1)
+        b = blocks[0]
+        self.assertEqual((b["start"], b["len"]), (1, 5))
+        self.assertAlmostEqual(b["rate"], 10.0)   # максимум из сторон
+
+    def test_long_run_split_into_chunks(self):
+        from analyzer.overlap import canonical_blocks
+        cov = {("s", 1, 4, r): 1.0 for r in range(300)}
+        blocks = canonical_blocks(cov, {}, max_words=125)
+        self.assertEqual([b["len"] for b in blocks], [125, 125, 50])
+        self.assertEqual(blocks[0]["start"], 0)
+        self.assertEqual(blocks[2]["start"], 250)
+
+    def test_block_rate_ignores_zero_registers(self):
+        from analyzer.overlap import _block_rate
+        cov = {("s", 1, 3, 7): 12.0}
+        # в блоке 7..9 активен только один регистр
+        self.assertAlmostEqual(_block_rate(cov, "s", 1, 3, 7, 9), 12.0)
+
+    def test_runs_str(self):
+        from analyzer.overlap import _runs_str
+        self.assertEqual(_runs_str([1, 2, 3, 7]), "1&ndash;3, 7")
+
+
 class VersionSyncTest(unittest.TestCase):
     """Версия в pyproject.toml совпадает с analyzer.__version__."""
 

@@ -77,6 +77,21 @@ def build_parser() -> argparse.ArgumentParser:
                       help="зона показа времени в отчёте, часов от UTC "
                            "(например 3 или -5.5); по умолчанию — локальная")
 
+    # --- overlap ----------------------------------------------------------------
+    p_ov = sub.add_parser(
+        "overlap",
+        help="сравнение карт опроса двух дампов: кто какие регистры читает")
+    p_ov.add_argument("before", help="первый pcap (сторона А)")
+    p_ov.add_argument("after", help="второй pcap (сторона Б)")
+    p_ov.add_argument("-o", "--output", default="overlap.html",
+                      help="путь к итоговому HTML (по умолчанию overlap.html)")
+    p_ov.add_argument("--tshark-bin", default=None,
+                      help="путь к tshark (иначе TSHARK_BIN или PATH)")
+    p_ov.add_argument("--config", default=None,
+                      help="TOML-файл с порогами правил")
+    p_ov.add_argument("--tz", type=float, default=None, metavar="ЧАСЫ",
+                      help="зона показа времени, часов от UTC")
+
     # --- diff -------------------------------------------------------------------
     p_df = sub.add_parser(
         "diff",
@@ -280,6 +295,26 @@ def main(argv: list[str] | None = None) -> int:
         _progress(f"[pcap-analyzer] Сравнение готово "
                   f"({len(points_a)}+{len(points_b)} файлов, "
                   f"{ta + tb:.0f} c) → {out}")
+        print(str(out))
+        return 0
+
+    if args.command == "overlap":
+        from .overlap import collect_side, render_overlap_html
+
+        pa, pb = Path(args.before), Path(args.after)
+        for x in (pa, pb):
+            if not x.is_file():
+                print(f"Ошибка: файл не найден: {x}", file=sys.stderr)
+                return 2
+        _progress("Сторона А: разбор карты чтений…")
+        side_a = collect_side(pa, cfg, args.tshark_bin)
+        _progress("Сторона Б: разбор карты чтений…")
+        side_b = collect_side(pb, cfg, args.tshark_bin)
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(render_overlap_html(side_a, side_b, cfg),
+                       encoding="utf-8")
+        _progress(f"[pcap-analyzer] Сравнение карт готово → {out}")
         print(str(out))
         return 0
 

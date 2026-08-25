@@ -110,6 +110,9 @@ python3 -m analyzer serve --port 8125 --data-dir /tmp/webdata --samples-dir pcap
 python3 -m analyzer trend "pcap-sample/plc_cgn_*.pcap" -b s7comm --jobs 4 -o /tmp/trend.html
 python3 -m analyzer diff "dump/before_*.pcap" "dump/after_*.pcap" -b modbus -o /tmp/diff.html
 
+# сравнение карт опроса двух станций:
+python3 -m analyzer overlap dump/a.pcap dump/b.pcap -o /tmp/overlap.html
+
 # конфигурация порогов и зона времени:
 python3 -m analyzer analyze <pcap> --config thresholds.toml --tz 3 -o /tmp/r.html
 ```
