@@ -624,6 +624,12 @@ def parse_multipart_file(rfile, boundary: bytes, dest: Path,
             if idx >= 0:
                 out.write(buf[:idx])
                 total += idx
+                # лимит проверяем и на финальном куске: маленький файл
+                # может целиком уместиться в один чанк чтения
+                if total > MAX_UPLOAD_BYTES:
+                    gb = MAX_UPLOAD_BYTES >> 30
+                    raise ValueError(
+                        f"файл слишком большой (лимит {gb} ГБ)")
                 break
             if len(buf) > keep:
                 out.write(buf[:-keep])
