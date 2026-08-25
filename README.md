@@ -135,6 +135,8 @@ python -m analyzer trend "pcap-sample/plc_cgn_*.pcap" -b s7comm \
     -o trend.html --jobs 4
 python -m analyzer diff "dump/before_*.pcap" "dump/after_*.pcap" -b modbus -o diff.html
 python -m analyzer overlap dump/serverA.pcap dump/serverB.pcap -o overlap.html
+python -m analyzer baseline "dump/good_*.pcap" -b modbus -o baseline.json
+python -m analyzer diff "dump/new_*.pcap" --baseline baseline.json -b modbus -o vs_baseline.html
 python -m analyzer branches
 python -m analyzer --version
 ```

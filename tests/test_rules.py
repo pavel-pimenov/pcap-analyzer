@@ -20,6 +20,7 @@ from analyzer.branches.base import (                             # noqa: E402
     Reservoir, percentile)
 from analyzer.branches.modbus_tcp import (                       # noqa: E402
     GeneralStats, ModbusTcpAnalyzer, PairStats, PollTarget, merge_ranges)
+from analyzer.report import TrendPoint                        # noqa: E402
 from analyzer.config import Config                               # noqa: E402
 
 
@@ -542,6 +543,46 @@ class TrendAnomaliesTest(unittest.TestCase):
         # красная точка-выброс на графике
         self.assertIn('fill="#dc2626"', html)
         self.assertIn("Аномалии в рядах", html)
+
+
+class BaselineTest(unittest.TestCase):
+    """Эталонный снимок: агрегация и восстановление точки."""
+
+    def _points(self):
+        pts = []
+        for i, (ts, reqs) in enumerate(
+                ((1735000000, 100.0), (1735000300, 104.0))):
+            pt = TrendPoint(path=Path(f"/tmp/b_{i}.pcap"),
+                            start_ts=float(ts),
+                            metrics={"reqs": reqs, "unans_pct": 20.0})
+            pt.rec_ids.add("conn-churn")
+            pt.rule_info["conn-churn"] = ("warning", "Частые переподключения")
+            pts.append(pt)
+        return pts
+
+    def test_snapshot_roundtrip(self):
+        from analyzer.trend import point_from_snapshot, snapshot_from_points
+        snap = snapshot_from_points(self._points(), "modbus")
+        self.assertEqual(snap["branch"], "modbus")
+        self.assertEqual(snap["files"], 2)
+        self.assertAlmostEqual(snap["metrics"]["reqs"], 102.0)
+        self.assertIn("conn-churn", snap["rules"])
+        pt = point_from_snapshot(snap, label="эталон:b.json")
+        self.assertEqual(pt.metrics["reqs"], 102.0)
+        self.assertIn("conn-churn", pt.rec_ids)
+
+    def test_diff_against_baseline_render(self):
+        from analyzer.report import render_diff_html
+        from analyzer.trend import point_from_snapshot, snapshot_from_points
+        snap = snapshot_from_points(self._points(), "modbus")
+        new_pt = TrendPoint(path=Path("new.pcap"), start_ts=1735003600.0,
+                            metrics={"reqs": 120.0, "unans_pct": 4.0})
+        html = render_diff_html(self._points(),
+                                [point_from_snapshot(snap, "эталон")],
+                                "серия", "эталон", "Анализ Modbus/TCP")
+        self.assertIn("Сравнение периодов", html)
+        # правило было в эталоне и в серии — «в обоих периодах»
+        self.assertIn("в обоих периодах", html)
 
 
 class VersionSyncTest(unittest.TestCase):

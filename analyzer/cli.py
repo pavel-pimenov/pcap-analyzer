@@ -77,6 +77,23 @@ def build_parser() -> argparse.ArgumentParser:
                       help="зона показа времени в отчёте, часов от UTC "
                            "(например 3 или -5.5); по умолчанию — локальная")
 
+    # --- baseline ----------------------------------------------------------------
+    p_bl = sub.add_parser(
+        "baseline",
+        help="сохранить эталонные метрики серии в JSON для diff --baseline")
+    p_bl.add_argument("pattern", help="маска файлов серии")
+    p_bl.add_argument("-b", "--branch", default=DEFAULT_BRANCH,
+                      choices=sorted(BRANCHES),
+                      help="ветка анализа (по умолчанию: %(default)s)")
+    p_bl.add_argument("-o", "--output", default="baseline.json",
+                      help="путь к JSON-снимку (по умолчанию baseline.json)")
+    p_bl.add_argument("--jobs", type=int, default=1, metavar="N",
+                      help="параллельно анализировать N файлов")
+    p_bl.add_argument("--tshark-bin", default=None,
+                      help="путь к tshark")
+    p_bl.add_argument("--config", default=None,
+                      help="TOML-файл с порогами правил")
+
     # --- overlap ----------------------------------------------------------------
     p_ov = sub.add_parser(
         "overlap",
@@ -97,7 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
         "diff",
         help="сравнение двух серий дампов: до и после изменений")
     p_df.add_argument("before", help="маска серии «до»")
-    p_df.add_argument("after", help="маска серии «после»")
+    p_df.add_argument("after", nargs="?", default=None,
+                      help="маска серии «после» (или --baseline)")
+    p_df.add_argument("--baseline", default=None,
+                      help="JSON-снимок эталона вместо серии «после» "
+                           "(создаётся командой baseline)")
     p_df.add_argument("-b", "--branch", default=DEFAULT_BRANCH,
                       choices=sorted(BRANCHES),
                       help="ветка анализа (по умолчанию: %(default)s)")
@@ -264,13 +285,19 @@ def main(argv: list[str] | None = None) -> int:
         from pathlib import Path as _Path
 
         from .report import render_diff_html
-        from .trend import build_trend, expand_series
+        import json as _json
+
+        from .trend import (build_trend, expand_series,
+                            point_from_snapshot, snapshot_from_points)
 
         files_a = expand_series(args.before)
-        files_b = expand_series(args.after)
-        if not files_a or not files_b:
-            print("Ошибка: маски должны указывать хотя бы на один файл "
-                  f"(до: {len(files_a)}, после: {len(files_b)})",
+        files_b = expand_series(args.after or "")
+        if not files_a:
+            print("Ошибка: маска «до» должна указывать хотя бы на один файл",
+                  file=sys.stderr)
+            return 2
+        if not files_b and not args.baseline:
+            print("Ошибка: укажите серию «после» или --baseline",
                   file=sys.stderr)
             return 2
         branch = get_branch(args.branch)
@@ -283,19 +310,59 @@ def main(argv: list[str] | None = None) -> int:
                                    progress=prog,
                                    tshark_bin=args.tshark_bin,
                                    jobs=max(1, args.jobs))
-        _progress("Период «после»…")
-        points_b, tb = build_trend(files_b, branch, cfg,
-                                   progress=prog,
-                                   tshark_bin=args.tshark_bin,
-                                   jobs=max(1, args.jobs))
+        if args.baseline:
+            _progress(f"Эталон: {args.baseline}…")
+            snap = _json.loads(
+                Path(args.baseline).read_text(encoding="utf-8"))
+            if snap.get("branch") != branch.name:
+                print(f"Предупреждение: эталон снят веткой "
+                      f"'{snap.get('branch')}', сравнение с '{branch.name}'",
+                      file=sys.stderr)
+            points_b = [point_from_snapshot(
+                snap, label=f"эталон:{Path(args.baseline).name}")]
+            tb = 0.0
+            label_b = f"эталон {Path(args.baseline).name}"
+        else:
+            _progress("Период «после»…")
+            points_b, tb = build_trend(files_b, branch, cfg,
+                                       progress=prog,
+                                       tshark_bin=args.tshark_bin,
+                                       jobs=max(1, args.jobs))
+            label_b = args.after or ""
         out = _Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(render_diff_html(points_a, points_b,
-                                        args.before, args.after,
+                                        args.before, label_b,
                                         branch.title), encoding="utf-8")
         _progress(f"[pcap-analyzer] Сравнение готово "
                   f"({len(points_a)}+{len(points_b)} файлов, "
                   f"{ta + tb:.0f} c) → {out}")
+        print(str(out))
+        return 0
+
+    if args.command == "baseline":
+        import json as _json
+
+        from .trend import build_trend, expand_series, snapshot_from_points
+
+        files = expand_series(args.pattern)
+        if not files:
+            print(f"Ошибка: по маске не найдено файлов: {args.pattern}",
+                  file=sys.stderr)
+            return 2
+        branch = get_branch(args.branch)
+        _progress(f"Эталон по {len(files)} файлам…")
+        pts, took = build_trend(files, branch, cfg,
+                                progress=lambda m, pct=None: _progress(m),
+                                tshark_bin=args.tshark_bin,
+                                jobs=max(1, args.jobs))
+        snap = snapshot_from_points(pts, branch.name)
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_json.dumps(snap, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        _progress(f"[pcap-analyzer] Эталон сохранён ({len(files)} файлов, "
+                  f"{took:.0f} c) → {out}")
         print(str(out))
         return 0
 

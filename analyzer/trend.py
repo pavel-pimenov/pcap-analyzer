@@ -22,6 +22,50 @@ from .branches.base import BaseBranch
 from .report import TrendPoint
 
 
+def snapshot_from_points(points: list[TrendPoint],
+                         branch_name: str) -> dict:
+    """Агрегировать серию в эталонный снимок (среднее метрик + правила).
+
+    Снимок сохраняется в JSON и позже сравнивается с новым дампом через
+    `diff ... --baseline`, без хранения целой серии «до».
+    """
+    import datetime as _dt
+
+    from . import __version__
+    metrics = {}
+    for pt in points:
+        for k, v in pt.metrics.items():
+            metrics.setdefault(k, []).append(v)
+    rules: dict[str, dict] = {}
+    fired: dict[str, int] = {}
+    for pt in points:
+        for rid in pt.rec_ids:
+            fired[rid] = fired.get(rid, 0) + 1
+        for rid, st in pt.rule_info.items():
+            rules.setdefault(rid, {"severity": st[0], "title": st[1]})
+    return {
+        "pcap_analyzer": __version__,
+        "branch": branch_name,
+        "created": _dt.datetime.now().isoformat(timespec="seconds"),
+        "files": len(points),
+        "metrics": {k: sum(v) / len(v) for k, v in metrics.items()},
+        "rules": rules,
+        "rule_hits": fired,
+    }
+
+
+def point_from_snapshot(snap: dict, label: str = "эталон") -> TrendPoint:
+    """Восстановить одну синтетическую точку тренда из снимка."""
+    pt = TrendPoint(path=Path(label), start_ts=None,
+                    metrics={k: float(v)
+                             for k, v in snap.get("metrics", {}).items()})
+    for rid, info in snap.get("rules", {}).items():
+        pt.rec_ids.add(rid)
+        pt.rule_info[rid] = (info.get("severity", "info"),
+                             info.get("title", rid))
+    return pt
+
+
 def expand_series(pattern: str) -> list[Path]:
     """Файлы серии по маске, отсортированные по имени."""
     return sorted(Path(x) for x in iglob(pattern) if Path(x).is_file())
