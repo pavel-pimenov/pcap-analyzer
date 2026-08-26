@@ -141,7 +141,8 @@ def _item_labels(r: dict) -> tuple[str, ...]:
     out = []
     for i, area in enumerate(areas):
         db = dbs[i] if i < len(dbs) else ""
-        base = (f"DB{int(db, 16)}" if area == "0x84" and db
+        # tshark отдаёт номер DB десятичным числом (FT_UINT16 BASE_DEC)
+        base = (f"DB{int(db)}" if area == "0x84" and db
                 else AREA_NAMES.get(area, f"область {area}"))
         addr = _to_int_auto(addrs[i]) if i < len(addrs) else None
         ln = _to_int_auto(lens[i]) if i < len(lens) else None
@@ -1159,7 +1160,7 @@ class S7CommAnalyzer(BaseBranch):
         rows = []
         for area, db in ranked[: self.cfg.top_registers_limit]:
             name = AREA_NAMES.get(area, f"Область {area}")
-            label = f"{name}, №{int(db, 16)}" if area == "0x84" and db else name
+            label = f"{name}, №{int(db)}" if area == "0x84" and db else name
             rd = s7["areas_r"][(area, db)]
             wr = s7["areas_w"][(area, db)]
             rows.append([
@@ -1254,7 +1255,7 @@ class S7CommAnalyzer(BaseBranch):
         if ranked:
             (cl, plc, label), d = ranked[0]
             db_m = re.match(r"DB(\d+)", label)
-            db_filter = (f" && s7comm.param.item.db == 0x{int(db_m.group(1)):x}"
+            db_filter = (f" && s7comm.param.item.db == {db_m.group(1)}"
                          if db_m else "")
             cmds.append((
                 f"Все ошибочные обращения к {label} от {cl}",
@@ -1360,7 +1361,7 @@ class S7CommAnalyzer(BaseBranch):
             addr_m = re.search(r"@(\d+)", label)
             flt = "s7comm.param.item.area"
             if db_m:
-                flt += f" && s7comm.param.item.db == 0x{int(db_m.group(1)):x}"
+                flt += f" && s7comm.param.item.db == {db_m.group(1)}"
             cmds.append((
                 f"Все чтения {label} ({pair[0]} → {pair[1]})",
                 self._cmd(f'-Y "{flt}" -T fields -e frame.time -e ip.src '
@@ -1650,8 +1651,8 @@ class S7CommAnalyzer(BaseBranch):
                 commands=[self._cmd(
                     '-Y "s7comm.param.func == 0x05 && '
                     f's7comm.param.item.db == '
-                    + (f'0x{int(re.search(r"DB(\d+)", db_key).group(1)):x}" '
-                       if re.search(r"DB(\d+)", db_key) else '0x1" ')
+                    + (f'{re.search(r"DB(\d+)", db_key).group(1)}" '
+                       if re.search(r"DB(\d+)", db_key) else '1" ')
                     + "-T fields -e frame.time -e ip.src "
                       "-e s7comm.param.item.address.byte | head -40")])
 
@@ -1692,7 +1693,7 @@ class S7CommAnalyzer(BaseBranch):
             (pair, label), (_dg, ch, rd) = static_tags[0]
             db_m = re.match(r"DB(\d+)", label)
             db_part = (f" && s7comm.param.item.db == "
-                       f"0x{int(db_m.group(1)):x}") if db_m else ""
+                       f"{db_m.group(1)}") if db_m else ""
             add("s7-static-tags", "info",
                 f"~{100.0 * len(static_tags) / len(candidates):.0f}% часто "
                 "читаемых тегов не меняются",
