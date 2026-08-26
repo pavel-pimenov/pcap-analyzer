@@ -19,7 +19,8 @@ from ..report.trend_report import METRIC_TITLES, TrendPoint, _psize
 #: метрики, для которых уменьшение — улучшение
 GOOD_WHEN_LOWER = {
     "no_resp_pct", "unans_pct", "exc_pct", "err_pct",
-    "rtt_med_ms", "rtt_p95_ms", "syn", "arp_per_min",
+    "rtt_med_ms", "rtt_p95_ms", "p95_rtt_worst_ms",
+    "syn", "arp_per_min", "err_targets_count",
     "retrans_pct", "silent_streams", "noise_frames",
 }
 
@@ -188,6 +189,7 @@ def render_diff_html(points_a: list[TrendPoint], points_b: list[TrendPoint],
 {kpi_html}
 {series_card("after", "Период «после»", points_b, label_b)}
 {rules_html}
+{_pollmap_section(_persistent_pollmap(points_a), _persistent_pollmap(points_b))}
 
 <footer class="report">
   Дифф-отчёт статический и полностью автономный. Каждая точка — результат
@@ -229,6 +231,69 @@ def _rule_fractions(points: list[TrendPoint]) -> dict[str, float]:
         for rid in pt.rec_ids:
             cnt[rid] = cnt.get(rid, 0) + 1
     return {rid: n / len(points) for rid, n in cnt.items()}
+
+
+def _persistent_pollmap(points: list[TrendPoint]
+                        ) -> tuple[dict[str, int], int] | None:
+    """Постоянные метки карты опроса периода: встречаются в >= половины
+    файлов с известной картой — случайные пропуски коротких срезов
+    отфильтрованы. None — ветка не собирает карту или данных мало."""
+    sets = [pt.read_labels for pt in points if pt.read_labels]
+    if not sets or len(sets) * 2 < len(points):
+        return None
+    freq: dict[str, int] = {}
+    for labels in sets:
+        for lbl in labels:
+            freq[lbl] = freq.get(lbl, 0) + 1
+    half = len(sets) / 2.0
+    return {lbl: n for lbl, n in freq.items() if n >= half}, len(sets)
+
+
+def _pollmap_section(map_a, map_b) -> str:
+    """Секция «Карта опроса»: какие регистры появились/исчезли."""
+    if not map_a or not map_b:
+        return ""
+    pers_a, files_a = map_a
+    pers_b, files_b = map_b
+    gone = sorted(pers_a.keys() - pers_b.keys(),
+                  key=lambda k: -pers_a[k])[:12]
+    new = sorted(pers_b.keys() - pers_a.keys(),
+                 key=lambda k: -pers_b[k])[:12]
+    common = pers_a.keys() & pers_b.keys()
+    n_gone, n_new = len(pers_a) - len(common), len(pers_b) - len(common)
+    if not gone and not new:
+        return ('<section class="card" id="pollmap"><h2>Карта опроса</h2>'
+                f"<p>Постоянный набор опрашиваемых регистров не изменился "
+                f"({len(pers_a)} меток).</p></section>")
+
+    def rows(items: list[str], freq: dict[str, int], files_n: int,
+             status: str) -> list[list[str]]:
+        out = []
+        for lbl in items:
+            plc, _, reg = lbl.partition(" ")
+            out.append([
+                f'<code class="inline">{escape(reg or lbl)}</code>',
+                escape(plc),
+                f'<span class="num">{freq[lbl]}/{files_n}</span>',
+                status,
+            ])
+        return out
+
+    body = (f"<p>«Постоянные» метки — присутствуют в опросе минимум "
+            f"половины файлов периода; случайные пропуски коротких срезов "
+            f"так отфильтрованы. Исчезло <strong>{n_gone}</strong>, "
+            f"появилось <strong>{n_new}</strong>.</p>")
+    if gone:
+        body += ("<h3 class='subhead'>Исключены из опроса</h3>"
+                 + _table(["Метка", "PLC", "Файлов (до)", "Статус"],
+                          rows(gone, pers_a, files_a, "убран")))
+    if new:
+        body += ("<h3 class='subhead'>Добавлены в опрос</h3>"
+                 + _table(["Метка", "PLC", "Файлов (после)", "Статус"],
+                          rows(new, pers_b, files_b, "новый")))
+    return (f'<section class="card" id="pollmap">'
+            "<h2>Карта опроса: новые и исчезнувшие регистры</h2>"
+            + body + "</section>")
 
 
 def _sev_dot(sev: str) -> str:

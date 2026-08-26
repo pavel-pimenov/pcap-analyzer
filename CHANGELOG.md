@@ -2,6 +2,21 @@
 
 Формат — Keep a Changelog; версии — семантические.
 
+## [Unreleased]
+
+### Добавлено
+- S7comm: секция «Профиль записи во времени» — детектор всплесков
+  Write Var (всплески разовой операции против регулярного цикла;
+  пороги `s7_write_burst_gap_sec`, `s7_write_pause_sec`,
+  `s7_write_burst_min_jobs`).
+- S7comm: карта опроса (`read_labels` в `BranchResult`/`TrendPoint`,
+  лимит `pollmap_max_registers`) и дифф-секция «Карта опроса: новые
+  и исчезнувшие регистры» между периодами.
+- Метрики трендов/диффа: `p95_rtt_worst_ms`, `err_targets_count`,
+  `poll_map_size`, `write_burst_share` (+ названия в `METRIC_TITLES`);
+  `err_targets_count` и `p95_rtt_worst_ms` считаются «лучше при
+  уменьшении».
+
 ## [0.3.0] — 2026-08-25
 
 Серии из браузера, сравнение карт опроса, эталоны и аномалии.

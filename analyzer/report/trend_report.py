@@ -28,6 +28,10 @@ METRIC_TITLES = {
     "err_pct": "Ответов с ошибками, %",
     "rtt_med_ms": "Медиана отклика, мс",
     "rtt_p95_ms": "p95 отклика, мс",
+    "p95_rtt_worst_ms": "Худший p95 отклика по PLC, мс",
+    "err_targets_count": "Регистров с ошибками доступа",
+    "poll_map_size": "Размер карты опроса (регистров)",
+    "write_burst_share": "Записей «внутри всплесков», %",
     "syn": "SYN-подключений",
     "writes": "Операций записи",
     "conns": "Потоков к серверу",
@@ -54,6 +58,9 @@ class TrendPoint:
     # id правила -> (severity, title) — наполняется по мере обхода точек
     rule_info: dict[str, tuple[str, str]] = field(default_factory=dict)
     took_s: float = 0.0
+    # карта опроса файла (метки целей чтения); None — ветка не собирает
+    # её или точка восстановлена из снимка-эталона
+    read_labels: frozenset[str] | None = None
 
 
 def find_anomalies(values: list[float], k: float = 5.0) -> list[int]:

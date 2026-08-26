@@ -81,6 +81,7 @@ def _analyze_file(branch: BaseBranch, f: Path, cfg,
                          tshark_bin=tshark_bin)
     pt = TrendPoint(path=f, start_ts=res.capture_start_ts,
                     metrics=dict(res.metrics),
+                    read_labels=res.read_labels or None,
                     took_s=_time.monotonic() - t0)
     for r in res.recommendations:
         pt.rec_ids.add(r.id)

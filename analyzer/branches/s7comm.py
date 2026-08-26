@@ -262,6 +262,12 @@ class S7CommAnalyzer(BaseBranch):
         med_rtt = percentile(all_rtts, 50)
         p95_rtt = percentile(all_rtts, 95)
         silent = sum(1 for i in gen.streams102.values() if not i["resp_bytes"])
+        # худший p95 по отдельным PLC: общий p95 размывает «тормозящую»
+        # станцию среди быстрых соседей
+        pair_p95 = [percentile(sorted(ps.rtts), 95)
+                    for ps in s7["pairs"].values() if len(ps.rtts)]
+        worst_p95 = max(pair_p95) if pair_p95 else 0.0
+        wprof = self._write_profile(s7)
         result.metrics = {
             "jobs": float(s7["req_total"]),
             "acks": float(s7["resp_total"]),
@@ -271,12 +277,17 @@ class S7CommAnalyzer(BaseBranch):
                         if s7["resp_total"] else 0.0),
             "rtt_med_ms": med_rtt * 1000.0 if med_rtt is not None else 0.0,
             "rtt_p95_ms": p95_rtt * 1000.0 if p95_rtt is not None else 0.0,
+            "p95_rtt_worst_ms": worst_p95 * 1000.0,
             "syn": float(len(gen.syn102)),
             "writes": float(s7.get("write_jobs", 0)),
             "silent_streams": float(silent),
             "clients": float(len({c for (c, _p) in s7["pairs"]})),
             "plcs": float(len({p for (_c, p) in s7["pairs"]})),
+            "err_targets_count": float(len(s7["err_targets"])),
+            "poll_map_size": float(len(s7["pollmap"])),
+            "write_burst_share": wprof["intra_share_pct"],
         }
+        result.read_labels = frozenset(s7["pollmap"])
         result.kpi = self._build_kpi(gen, s7)
         result.sections = self._build_sections(gen, s7)
         result.recommendations = self._build_recommendations(gen, s7)
@@ -461,6 +472,12 @@ class S7CommAnalyzer(BaseBranch):
             "write_jobs": 0,
             "write_targets": Counter(),   # (client, plc, объект) -> записей
             "write_digest": {},           # ключ -> [последний дайджест, совпало, всего]
+            # профиль записи: интервалы между любыми соседними Write Job
+            # (Reservoir) и ts последнего Job — для детектора всплесков
+            "wint_all": Reservoir(self.cfg.max_intervals_per_target),
+            "wlast_ts": None,
+            # карта опроса: метки целей чтения «PLC DBn@addr» (с лимитом)
+            "pollmap": set(),
             "poll_last": {},              # (client, plc, func) -> ts последнего Job
             # периодика Job по целям: (client, plc, func) -> Reservoir интервалов
             "poll_int": {},
@@ -519,6 +536,11 @@ class S7CommAnalyzer(BaseBranch):
                               else s7["areas_r"])
                     bucket[(area, db)] += max(itemcnt, 1)
                 lbls = _item_labels(r)
+                if func != "0x05" and lbls:
+                    # карта опроса: пополняем, пока не исчерпан лимит
+                    pm = s7["pollmap"]
+                    if len(pm) < self.cfg.pollmap_max_registers:
+                        pm.update(f"{plc} {lbl}" for lbl in lbls)
                 if ts is not None and st != "":
                     q = s7.setdefault("pending", {}).setdefault(
                         (st, pduref), [])
@@ -538,6 +560,12 @@ class S7CommAnalyzer(BaseBranch):
                     # ---- Анализ записей (Write Var) ---------------------
                     if func == "0x05":
                         s7["write_jobs"] += 1
+                        # интервал между любыми соседними Write Job —
+                        # один на Job (не на элемент), для профиля всплесков
+                        wprev = s7["wlast_ts"]
+                        if wprev is not None and 0 < ts - wprev <= 3600:
+                            s7["wint_all"].add(ts - wprev)
+                        s7["wlast_ts"] = ts
                         wt = s7["write_targets"]
                         for lbl in lbls:
                             wt[(key[0], key[1], lbl)] += 1
@@ -1342,6 +1370,30 @@ class S7CommAnalyzer(BaseBranch):
                        "Статичные переменные (читаются, но не меняются)",
                        body, cmds)
 
+    def _write_profile(self, s7: dict) -> dict:
+        """Профиль записи: всплески (разовая операция) против цикла.
+
+        Интервалы между соседними Write Job берутся из Reservoir;
+        «внутри всплеска» — интервалы короче s7_write_burst_gap_sec,
+        граница всплесков — пауза длиннее s7_write_pause_sec.
+        """
+        res = s7.get("wint_all")
+        out = {"jobs": int(s7.get("write_jobs", 0)), "intervals": 0,
+               "intra_share_pct": 0.0, "bursts": 0, "max_pause_sec": 0.0,
+               "intra_med_ms": 0.0}
+        if not res or not len(res):
+            return out
+        vals = sorted(res)
+        intra = [x for x in vals if x <= self.cfg.s7_write_burst_gap_sec]
+        pauses = [x for x in vals if x > self.cfg.s7_write_pause_sec]
+        out["intervals"] = len(vals)
+        out["intra_share_pct"] = 100.0 * len(intra) / len(vals)
+        out["bursts"] = len(pauses) + 1
+        out["max_pause_sec"] = max(pauses) if pauses else 0.0
+        if intra:
+            out["intra_med_ms"] = percentile(sorted(intra), 50) * 1000.0
+        return out
+
     def _sec_writes(self, s7: dict) -> Section | None:
         """Кто и какие объекты пишет; конфликты и повторяющиеся значения."""
         if not s7["write_targets"]:
@@ -1398,8 +1450,44 @@ class S7CommAnalyzer(BaseBranch):
                   'гонок: последний записавший выигрывает, значения могут '
                   '"мигать". Разведите права записи или введите '
                   'посредника.</p>')
+
+        # профиль записи: всплески (разовая операция) или регулярный цикл
+        burst_html = ""
+        wprof = self._write_profile(s7)
+        if wprof["jobs"] >= self.cfg.s7_write_burst_min_jobs \
+                and wprof["intervals"]:
+            if wprof["intra_share_pct"] >= 60.0:
+                kind = ("всплески — профиль разовой скриптовой операции "
+                        "(массовая установка/сброс), а не регулярный цикл")
+            elif wprof["bursts"] == 1:
+                kind = "непрерывный поток записей"
+            else:
+                kind = "цикл с паузами"
+            burst_rows = [[
+                f'<span class="num">{C.fmt_int(wprof["bursts"])}</span>',
+                f'<span class="num">{C.fmt_int(wprof["jobs"])}</span>',
+                f'<span class="num">{C.fmt_pct(wprof["intra_share_pct"], 100)}</span>',
+                (f'<span class="num">{wprof["intra_med_ms"]:.0f} мс</span>'
+                 if wprof["intra_med_ms"] else "&mdash;"),
+                (f'<span class="num">{C.fmt_dur(wprof["max_pause_sec"])}</span>'
+                 if wprof["max_pause_sec"] else "&mdash;"),
+                kind,
+            ]]
+            burst_html = (
+                '<h3 class="subhead">Профиль записи во времени</h3>'
+                + C.table_html(
+                    ["Всплесков", "Записей", "Доля «внутри всплесков», %",
+                     "Медианный шаг внутри всплеска", "Макс. пауза",
+                     "Оценка"], burst_rows)
+                + '<p class="note">«Внутри всплеска» — интервал между '
+                  f'записями короче {self.cfg.s7_write_burst_gap_sec:g} с; '
+                  'всплески разделены паузами длиннее '
+                  f'{self.cfg.s7_write_pause_sec:g} с. Пачки одиночных '
+                  'битовых команд по десяткам за секунду — обычно сценарий '
+                  'или пакетная выгрузка: убедитесь, что это не гонка '
+                  'с циклом опроса.</p>')
         return Section("writes", "Записи переменных (Write Var)",
-                       html + conf_html, [])
+                       html + conf_html + burst_html, [])
 
     def _sec_errors(self, s7: dict) -> Section:
         rows = []

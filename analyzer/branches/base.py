@@ -111,6 +111,10 @@ class BranchResult:
     server_colors: dict[str, tuple[str, str]] = field(default_factory=dict)
     # компактные числовые метрики для трендового режима (ключ -> значение)
     metrics: dict[str, float] = field(default_factory=dict)
+    # карта опроса: метки целей чтения («192.0.2.1 DB100@50»); наполняет
+    # ветка, если поддерживает; используется diff-отчётом для поиска
+    # новых/исчезнувших регистров между периодами
+    read_labels: frozenset[str] = field(default_factory=frozenset)
 
 
 class BaseBranch(ABC):
