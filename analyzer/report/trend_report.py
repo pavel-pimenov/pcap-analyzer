@@ -44,6 +44,17 @@ METRIC_TITLES = {
     "tcp_services": "TCP-сервисов",
     "silent_streams": "«Молчащих» потоков",
     "noise_frames": "Служебных кадров",
+    "coilers_frames": "Телеграмм Coilers, всего",
+    "setup_frames": "Уставки на полосу (2001), кадров",
+    "uutr_frames": "Ширина и температура (2004), кадров",
+    "coil_frames": "Уставки на моталки (3001), кадров",
+    "data_frames": "Данные моталок (3002), кадров",
+    "misc_frames": "Прочие телеграммы, кадров",
+    "retrans_frames": "Ретрансмиссий TCP, кадров",
+    "coilers_interval_ms": "Интервал телеграмм, мс",
+    "data_interval_med_ms": "Интервал данных моталок, мс",
+    "ts_reversals": "Реверсов времени в телеграммах",
+    "static_fields": "Статичных полей",
 }
 
 

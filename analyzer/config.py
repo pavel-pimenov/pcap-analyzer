@@ -88,6 +88,22 @@ class Config:
     svc_one_way_min_kb: int = 64           # минимальный объём одностороннего потока, КБ
     arp_storm_per_min: float = 30.0        # ARP-кадров в минуту для предупреждения
 
+    # --- Ветка Coilers (телеграммы прокатного стана) --------------------------
+    coilers_fast_interval_ms: float = 5.0  # медиана интервала ниже — «слишком часто»
+    coilers_gap_mult: float = 10.0         # пауза длиннее N×медианы — «длительная пауза»
+    coilers_gap_min_frames: int = 10       # минимум телеграмм канала для оценки пауз
+    coilers_retrans_pct: float = 1.0       # доля ретрансмиссий кадра для предупреждения, %
+    coilers_static_min_frames: int = 30    # минимум кадров для вывода о «зависшем» поле
+    coilers_static_zero_pct: float = 99.0  # доля нулевых значений «резервного» поля, %
+    coilers_counter_skips_warn: int = 3    # скачков счётчика с пропуском — для warning
+    coilers_counter_wraps_warn: int = 2    # сбросов счётчика — для предупреждения
+    coilers_ts_reversals_min: int = 3      # инверсий времени в телеграммах — для warning
+    coilers_keepalive_pct: float = 30.0    # доля кадров Setup формата keepalive, %
+    coilers_uniq_cap: int = 200            # максимум уникальных значений поля (счётчик)
+    coilers_max_samples: int = 2000        # выборка значений/интервалов на поле
+    coilers_syn_warn: int = 3              # SYN к портам Соilers для info-предупреждения
+    coilers_xml: str | None = None         # путь к Coilers.xml (структура телеграмм)
+
     # --- Прочее ---------------------------------------------------------------
     top_registers_limit: int = 20          # топ-N регистров в отчёте
     skip_gantt: bool = False               # пропускать диаграммы Ганта (режим трендов)

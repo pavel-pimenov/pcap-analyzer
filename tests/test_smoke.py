@@ -106,6 +106,10 @@ class BranchRegistryTest(unittest.TestCase):
         self.assertIn("modbus", BRANCHES)
         self.assertIsNotNone(get_branch("modbus"))
 
+    def test_coilers_registered(self):
+        self.assertIn("coilers", BRANCHES)
+        self.assertIsNotNone(get_branch("coilers"))
+
 
 # ---------------------------------------------------------------------------
 # Интеграционные тесты (нужны tshark и образцы)
@@ -176,6 +180,59 @@ class ModbusAnalyzeTest(unittest.TestCase):
         self.assertTrue(self.result.sections)
         ids = [s.id for s in self.result.sections]
         self.assertIn("general", ids)
+
+    def test_html_is_balanced_and_has_key_blocks(self):
+        self.assertTrue(_balanced_html(self.html), "HTML содержит непарные теги")
+        for frag in ('id="general"', "cmd-line", "copy-btn", "csv-btn"):
+            self.assertIn(frag, self.html)
+
+    def test_examples_have_header_and_limit(self):
+        codes = re.findall(r"<code>(tshark[^<]*)</code>", self.html)
+        self.assertTrue(codes)
+        for c in codes:
+            tail = c.rsplit("|", 1)[-1]
+            if "-T fields" in c and "|" not in c.split("-T fields")[1]:
+                self.assertIn("-E header=y", c)
+            self.assertTrue(re.search(r"\b(head|tail|wc)\b", tail),
+                            f"команда без ограничителя вывода: {c[:80]}")
+
+
+@unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
+@unittest.skipUnless(SAMPLES.is_dir(), "нет каталога образцов")
+class CoilersAnalyzeTest(unittest.TestCase):
+    """Ветка coilers: разбор телеграмм и отчёт на образце plc_cgn."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pcap = _pick_sample("plc_cgn")
+        if cls.pcap is None \
+                or _tshark_count(cls.pcap, "tcp.port==10000 && tcp.payload") == 0:
+            raise unittest.SkipTest("нет образца с трафиком Coilers (порт 10000)")
+        from analyzer.tshark_runner import find_tshark
+        branch = get_branch("coilers")
+        cls.result = branch.analyze(
+            cls.pcap, DEFAULT_CONFIG, progress=lambda m, pct=None: None,
+            tshark_bin=find_tshark(None))
+        from analyzer.report import render_document
+        cls.html = render_document(cls.result)
+
+    def test_telegrams_parsed(self):
+        m = self.result.metrics
+        self.assertGreater(m.get("coilers_frames", 0), 0,
+                           "ни одна телеграмма не разобрана")
+        self.assertGreater(m.get("setup_frames", 0), 0,
+                           "нет телеграмм уставок на полосу (2001)")
+        self.assertGreater(m.get("data_frames", 0), 0,
+                           "нет телеграмм данных моталок (3002)")
+
+    def test_kpi_and_sections_present(self):
+        self.assertTrue(self.result.kpi)
+        ids = [s.id for s in self.result.sections]
+        self.assertIn("general", ids)
+        self.assertTrue(any(i.startswith("fields-3002-") for i in ids),
+                        "нет секций полей канала данных моталок")
+        self.assertTrue(any(i.startswith("strips-") for i in ids),
+                        "нет секций «смены полос»")
 
     def test_html_is_balanced_and_has_key_blocks(self):
         self.assertTrue(_balanced_html(self.html), "HTML содержит непарные теги")

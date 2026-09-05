@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from .base import BaseBranch
+from .coilers import CoilersAnalyzer
 from .modbus_tcp import ModbusTcpAnalyzer
 from .services import ServicesAnalyzer
 from .s7comm import S7CommAnalyzer
@@ -14,6 +15,7 @@ BRANCHES: dict[str, type[BaseBranch]] = {
     ModbusTcpAnalyzer.name: ModbusTcpAnalyzer,
     S7CommAnalyzer.name: S7CommAnalyzer,
     ServicesAnalyzer.name: ServicesAnalyzer,
+    CoilersAnalyzer.name: CoilersAnalyzer,
 }
 
 DEFAULT_BRANCH = "modbus"

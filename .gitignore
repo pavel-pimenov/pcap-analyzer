@@ -224,3 +224,4 @@ __marimo__/
 # Готовые отчёты анализатора
 output/
 *.html
+pcap-sample
