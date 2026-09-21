@@ -145,6 +145,8 @@ class GeneralStats:
     ip_pkts: Counter = field(default_factory=Counter)
     ip_bytes_tx: Counter = field(default_factory=Counter)   # отправлено узлом
     ip_bytes_rx: Counter = field(default_factory=Counter)   # получено узлом
+    icmp_unreach: Counter = field(default_factory=Counter)  # цель :502 -> ICMP unreachable
+    icmp_routers: dict = field(default_factory=dict)        # цель :502 -> set(маршрутизатор)
 
     @property
     def duration(self) -> float:
@@ -261,6 +263,7 @@ class ModbusTcpAnalyzer(BaseBranch):
         "frame.time_epoch", "frame.len", "ip.src", "ip.dst",
         "tcp.stream", "tcp.srcport", "tcp.dstport",
         "tcp.flags.syn", "tcp.flags.ack", "tcp.flags.reset", "tcp.flags.fin",
+        "frame.protocols",
     ]
 
     def _pass_general(self) -> GeneralStats:
@@ -275,6 +278,30 @@ class ModbusTcpAnalyzer(BaseBranch):
                 if g.first_ts is None:
                     g.first_ts = ts
                 g.last_ts = ts
+            protos = r.get("frame.protocols", "") or ""
+            is_icmp = "icmp" in protos
+            if is_icmp:
+                # ICMP-кадр (напр. Destination unreachable) несёт вложенную
+                # копию исходного пакета: tcp-поля относятся к вложенному
+                # заголовку и новым соединением НЕ являются. Для статистики
+                # узлов берём только внешние адреса (первые из агрегата).
+                outer_src = (r.get("ip.src") or "").split(OCC_SEP)[0].strip()
+                outer_dst = (r.get("ip.dst") or "").split(OCC_SEP)[0].strip()
+                if outer_src:
+                    g.ip_pkts[outer_src] += 1
+                    g.ip_bytes_tx[outer_src] += plen
+                if outer_dst:
+                    g.ip_bytes_rx[outer_dst] += plen
+                # ICMP unreachable на запрос к :502 — фиксируем цель:
+                # вложенный dst — последний элемент агрегата ip.dst
+                dport = to_int((r.get("tcp.dstport") or "").split(OCC_SEP)[0].strip(), -1)
+                if truthy((r.get("tcp.flags.syn", "")).split(OCC_SEP)[0].strip()) \
+                        and dport == 502:
+                    inner_dst = (r.get("ip.dst") or "").split(OCC_SEP)[-1].strip()
+                    if inner_dst:
+                        g.icmp_unreach[inner_dst] += 1
+                        g.icmp_routers.setdefault(inner_dst, set()).add(outer_src)
+                continue
             src = r.get("ip.src", "")
             dst = r.get("ip.dst", "")
             if src:

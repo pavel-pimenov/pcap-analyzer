@@ -102,6 +102,17 @@ def _first(value: str) -> str:
     return (value or "").split(",")[0].strip().lower()
 
 
+def _first_c(value: str) -> str:
+    """Первый компонент агрегата без lowercase (для IP-адресов)."""
+    return (value or "").split(",")[0].strip()
+
+
+def _last_c(value: str) -> str:
+    """Последний компонент агрегата без lowercase (вложенный IP в ICMP)."""
+    parts = (value or "").split(",")
+    return parts[-1].strip() if parts else ""
+
+
 def _split_field(value: str) -> list[str]:
     """Разбить агрегированное поле tshark на список значений."""
     return [x.strip().lower()
@@ -196,6 +207,8 @@ class GeneralStats:
     ip_pkts: Counter = field(default_factory=Counter)
     ip_bytes_tx: Counter = field(default_factory=Counter)   # отправлено узлом
     ip_bytes_rx: Counter = field(default_factory=Counter)   # получено узлом
+    icmp_unreach: Counter = field(default_factory=Counter)  # цель :102 -> ICMP unreachable
+    icmp_routers: dict = field(default_factory=dict)        # цель :102 -> set(маршрутизатор)
 
     @property
     def duration(self) -> float:
@@ -310,6 +323,7 @@ class S7CommAnalyzer(BaseBranch):
         "frame.time_epoch", "frame.len", "ip.src", "ip.dst",
         "tcp.stream", "tcp.srcport", "tcp.dstport", "tcp.len",
         "tcp.flags.syn", "tcp.flags.ack", "tcp.flags.reset", "tcp.flags.fin",
+        "frame.protocols",
     ]
 
     def _pass_general(self) -> GeneralStats:
@@ -324,6 +338,30 @@ class S7CommAnalyzer(BaseBranch):
                 if g.first_ts is None:
                     g.first_ts = ts
                 g.last_ts = ts
+            protos = r.get("frame.protocols", "") or ""
+            is_icmp = "icmp" in protos
+            if is_icmp:
+                # ICMP-кадр (напр. Destination unreachable) несёт вложенную
+                # копию исходного пакета: tcp-поля относятся к вложенному
+                # заголовку и новым соединением НЕ являются. Для статистики
+                # узлов берём только внешние адреса (первые из агрегата).
+                outer_src = (_first_c(r.get("ip.src")) or "")
+                outer_dst = (_first_c(r.get("ip.dst")) or "")
+                if outer_src:
+                    g.ip_pkts[outer_src] += 1
+                    g.ip_bytes_tx[outer_src] += plen
+                if outer_dst:
+                    g.ip_bytes_rx[outer_dst] += plen
+                # если это ICMP unreachable на запрос к :102 — фиксируем цель:
+                # вложенный dst — последний элемент агрегата ip.dst
+                if truthy(r.get("tcp.flags.syn", "")) and \
+                        to_int(_first_c(r.get("tcp.dstport")), -1) == PORT:
+                    inner_dst = (_last_c(r.get("ip.dst")) or "")
+                    if inner_dst:
+                        g.icmp_unreach[inner_dst] += 1
+                        g.icmp_routers.setdefault(inner_dst, set()).add(
+                            outer_src)
+                continue
             src = r.get("ip.src", "")
             dst = r.get("ip.dst", "")
             if src:
@@ -991,35 +1029,44 @@ class S7CommAnalyzer(BaseBranch):
         # нагрузки, — признак недоступного или резервного устройства.
         tgt_rows = []
         targets = sorted({info["server"] for info in gen.streams102.values()}
-                         | {s for _t, _c, s in gen.syn102})
+                         | {s for _t, _c, s in gen.syn102}
+                         | set(gen.icmp_unreach))
         for srv in targets:
             streams = {n: i for n, i in gen.streams102.items()
                        if i["server"] == srv}
             syn_n = sum(1 for _t, _c, s in gen.syn102 if s == srv)
             with_s7 = sum(1 for n in streams if n in s7["s7_streams"])
             dead = sum(1 for i in streams.values() if not i["resp_bytes"])
+            icmp_n = gen.icmp_unreach.get(srv, 0)
+            routers = gen.icmp_routers.get(srv, set())
             tgt_rows.append([
                 self._srv_cell(srv),
                 f'<span class="num">{C.fmt_int(syn_n)}</span>',
                 f'<span class="num">{C.fmt_int(len(streams))}</span>',
                 f'<span class="num">{C.fmt_int(with_s7)}</span>',
-                (f'<span class="num">{C.fmt_int(dead)}</span>', "cell-hot")
-                if dead and dead >= len(streams) and syn_n >= 2 else
                 f'<span class="num">{C.fmt_int(dead)}</span>',
+                (f'<span class="num">{C.fmt_int(icmp_n)}'
+                 + (f' <span class="dim">({C.esc(", ".join(sorted(routers)))})</span>'
+                    if routers else '')
+                 + '</span>', "cell-hot")
+                if icmp_n > 0 else f'<span class="num">0</span>',
             ])
         targets_tbl = ""
         if tgt_rows:
             targets_tbl = (
                 '<h3 class="subhead">Цели на порту 102: обмен по соединениям</h3>'
                 + C.table_html(
-                    ["Узел", "SYN", "Потоков", "С S7-обменом", "Молчат"],
+                    ["Узел", "SYN", "Потоков", "С S7-обменом", "Молчат", "ICMP"],
                     tgt_rows)
                 + '<p class="note"><strong>Молчат</strong> — соединения, в '
                   'которых от узла не пришло ни одного байта полезной нагрузки: '
                   'клиенты регулярно подключаются, но контроллер не отвечает '
                   '(устройство обесточено/в резерве, блокировка по IP или '
-                  'ограничение числа TSAP). Розовым отмечены узлы, где молчат '
-                  'все наблюдаемые потоки.</p>')
+                  'ограничение числа TSAP). <strong>ICMP</strong> — сколько раз '
+                  'маршрутизатор вернул ICMP Destination unreachable в ответ на '
+                  'SYN к :102 этого узла: адрес недостижим на сетевом уровне '
+                  '(неверная подсеть в конфигурации HMI или устройство удалено).'
+                  '</p>')
         body = head + detail + targets_tbl + tbl + (
             '<p class="note">Для S7comm нормой считается одно долгоживущее '
             "соединение на пару клиент-PLC. Частые SYN — признак пересоздания "
@@ -1759,8 +1806,11 @@ class S7CommAnalyzer(BaseBranch):
                     "| sort | uniq -c | sort -rn")])
 
         # 3b. «Молчащие» цели :102 — подключения без единого байта ответа
+        # (без ICMP-reach: недостижимые на сетевом уровне разбираются в 3c)
         dead_ev = []
         for srv in sorted({i["server"] for i in gen.streams102.values()}):
+            if gen.icmp_unreach.get(srv):
+                continue
             streams = [i for i in gen.streams102.values()
                        if i["server"] == srv]
             if not streams:
@@ -1785,6 +1835,30 @@ class S7CommAnalyzer(BaseBranch):
                     '-Y "tcp.dstport==102 && tcp.flags.syn==1 && '
                     'tcp.flags.ack==0" -T fields -e ip.dst | '
                     "sort | uniq -c | sort -rn")])
+
+        # 3c. ICMP Destination unreachable на SYN к :102 — адрес недостижим
+        if gen.icmp_unreach:
+            un_ev = []
+            for srv, n in sorted(gen.icmp_unreach.items(),
+                                 key=lambda kv: kv[1], reverse=True):
+                routers = ", ".join(sorted(gen.icmp_routers.get(srv, set())))
+                un_ev.append(
+                    f"{srv}: {n}× ICMP unreachable от {routers or '—'}")
+            add("s7-unreachable", "warning",
+                "Недостижимые целевые узлы :102 (ICMP unreachable)",
+                f"Маршрутизатор вернул ICMP Destination unreachable в ответ "
+                f"на SYN к {len(gen.icmp_unreach)} адресам: всего "
+                f"{sum(gen.icmp_unreach.values())} обращений.",
+                "Адрес недостижим на сетевом уровне — такой цели нет в "
+                "локальной сети (неверная подсеть в конфигурации HMI/SCADA) "
+                "или устройство окончательно удалено. Каждый опрос создаёт "
+                "SYN и ICMP-ошибку впустую и маскируется под «молчащий PLC»; "
+                "исправьте адреса в конфигурации опроса.",
+                evidence=un_ev[:8],
+                commands=[self._cmd(
+                    '-Y "icmp.type == 3 && tcp.dstport==102" -T fields '
+                    " -e frame.time -e icmp.code -e ip.dst "
+                    "-e tcp.dstport | sort | uniq -c | sort -rn")])
 
         # 4. Частые переподключения
         dur = gen.duration
