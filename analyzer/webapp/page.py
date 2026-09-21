@@ -80,7 +80,7 @@ button:disabled { opacity:.5; cursor:default; }
     <div class="panel">
       <h2>Загрузка дампа</h2>
       <div class="row">
-        <input type="file" id="fileinp" accept=".pcap,.pcapng,.cap">
+        <input type="file" id="fileinp" accept=".pcap,.pcapng,.cap" multiple>
       </div>
       <div class="row" style="margin-top:10px;">
         <select id="branch"></select>
@@ -372,17 +372,19 @@ $("upbtn").onclick = async () => {
   const inp = $("fileinp");
   if (!inp.files.length) { $("uphint").textContent = "Выберите файл."; return; }
   const fd = new FormData();
-  fd.append("file", inp.files[0]);
+  for (const f of inp.files) fd.append("file", f);
   $("upbtn").disabled = true;
   $("uphint").textContent = "Загрузка…";
   try {
-    const ent = await api(
+    const res = await api(
       "/api/upload?branch=" + encodeURIComponent($("branch").value),
       {method: "POST", body: fd});
+    const files = res.files || [];
     inp.value = "";
-    $("uphint").textContent = "";
+    $("uphint").textContent =
+      files.length > 1 ? "Загружено файлов: " + files.length : "";
     await loadFiles();
-    select(ent.id);
+    if (files.length) select(files[files.length - 1].id);
   } catch (e) {
     $("uphint").textContent = "Ошибка загрузки: " + e.message;
   } finally { $("upbtn").disabled = false; }

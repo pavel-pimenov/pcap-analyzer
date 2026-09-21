@@ -567,79 +567,137 @@ class AppState:
 # Потоковый разбор multipart/form-data (cgi удалён в Python 3.13+)
 # ---------------------------------------------------------------------------
 
+def _too_big() -> ValueError:
+    gb = MAX_UPLOAD_BYTES >> 30
+    return ValueError(f"файл слишком большой (лимит {gb} ГБ)")
+
+
+def parse_multipart_uploads(rfile, boundary: bytes, total_len: int,
+                            dest_factory) -> list[tuple[str, Path, int]]:
+    """Сохранить ВСЕ файловые части multipart-запроса в отдельные файлы.
+
+    `dest_factory(i)` возвращает Path для i-го файла. Чтение ограничено
+    Content-Length и выполняется через read1(), иначе BufferedReader
+    блокируется, дожидаясь полного чанка за концом тела. Возвращает
+    список (имя_файла, путь, размер) для частей с filename — в порядке
+    появления.
+    """
+    sep = b"\r\n--" + boundary
+    remaining = total_len
+    pending = bytearray()                    # буфер между частями запроса
+
+    def _topup() -> bool:
+        nonlocal remaining, pending
+        if remaining <= 0:
+            return False
+        data = rfile.read1(min(1 << 16, remaining))
+        if not data:
+            return False
+        remaining -= len(data)
+        pending += data
+        return True
+
+    def _topup_some(n: int = 1) -> None:
+        while len(pending) < n:
+            if not _topup():
+                return
+
+    def _readline() -> bytes:
+        while b"\n" not in pending:
+            if not _topup():
+                raise ValueError("неожиданный конец запроса")
+        nl = pending.index(b"\n") + 1
+        line = bytes(pending[:nl])
+        del pending[:nl]
+        return line
+
+    line = _readline()
+    while not line.startswith(b"--" + boundary):
+        line = _readline()                   # пропустить преамбулу
+
+    parsed: list[tuple[str, Path, int]] = []
+    keep = len(sep) - 1
+    while True:
+        headers: dict[str, str] = {}
+        while True:
+            h = _readline()
+            if h in (b"\r\n", b"\n"):
+                break
+            try:
+                text = h.decode("utf-8")
+            except UnicodeDecodeError:
+                text = h.decode("latin-1")
+            k, _, v = text.partition(":")
+            headers[k.strip().lower()] = v.strip()
+        disp = headers.get("content-disposition", "")
+        m = re.search(r'filename="([^"]*)"', disp)
+        filename = m.group(1) if m else ""
+        is_file = bool(filename)
+        dest = dest_factory(len(parsed)) if is_file else None
+        out = open(dest, "wb") if is_file else None
+        total = 0
+        try:
+            while True:
+                ib = pending.find(sep)
+                if ib >= 0:
+                    if out is not None:
+                        out.write(pending[:ib])
+                        total += ib
+                        if total > MAX_UPLOAD_BYTES:
+                            raise _too_big()
+                    del pending[:ib + len(sep)]
+                    break
+                # разделитель не уместился — отдать в файл всё кроме хвоста
+                if len(pending) > keep:
+                    take = len(pending) - keep
+                    if out is not None:
+                        out.write(pending[:take])
+                        total += take
+                        if total > MAX_UPLOAD_BYTES:
+                            raise _too_big()
+                    del pending[:take]
+                if not _topup():
+                    raise ValueError("завершающая граница не найдена "
+                                     "(обрыв или неверный формат запроса)")
+        finally:
+            if out is not None:
+                out.close()
+        if is_file:
+            parsed.append((filename, dest, total))
+        # после разделителя: "--" — финальная граница, иначе "\r\n" и
+        # заголовки следующей части в pending
+        _topup_some(2)
+        if pending.startswith(b"--"):
+            break
+        if pending.startswith(b"\r\n"):
+            del pending[:2]
+        elif pending:
+            raise ValueError("битый multipart: после границы лишние байты")
+        # pending пуст (граница закончилась ровно на краю чтения) — цикл
+    # дочитать остаток Content-Length, чтобы не разорвать keep-alive
+    while remaining > 0:
+        data = rfile.read1(min(1 << 16, remaining))
+        if not data:
+            break
+        remaining -= len(data)
+    return parsed
+
+
 def parse_multipart_file(rfile, boundary: bytes, dest: Path,
                          total_len: int) -> tuple[str, int]:
     """Сохранить первый файл из multipart-запроса в `dest` (потоково).
 
     Чтение ограничено Content-Length и выполняется через read1(), иначе
     BufferedReader блокируется, дожидаясь полного чанка за концом тела.
-    Возвращает (имя_файла, размер).
+    Возвращает (имя_файла, размер). Удобная обёртка для тест-парсеров —
+    боевой /api/upload использует parse_multipart_uploads.
     """
-    sep = b"\r\n--" + boundary
-    remaining = total_len
-
-    def _readline() -> bytes:
-        nonlocal remaining
-        if remaining <= 0:
-            raise ValueError("неожиданный конец запроса")
-        line = rfile.readline(65536)
-        if not line:
-            raise ValueError("неожиданный конец запроса")
-        remaining -= len(line)
-        return line
-
-    def _chunk() -> bytes:
-        nonlocal remaining
-        if remaining <= 0:
-            return b""
-        data = rfile.read1(min(1 << 16, remaining))
-        remaining -= len(data)
-        return data
-
-    line = _readline()
-    while line and not line.startswith(b"--" + boundary):
-        line = _readline()                       # пропустить преамбулу
-    headers: dict[str, str] = {}
-    while True:
-        h = _readline()
-        if h in (b"\r\n", b"\n"):
-            break
-        k, _, v = h.decode("latin-1").partition(":")
-        headers[k.strip().lower()] = v.strip()
-    disp = headers.get("content-disposition", "")
-    m = re.search(r'filename="([^"]*)"', disp)
-    filename = m.group(1) if m else ""
-
-    total = 0
-    tail = b""
-    keep = len(sep) - 1
-    with open(dest, "wb") as out:
-        while True:
-            chunk = _chunk()
-            if not chunk:
-                raise ValueError("завершающая граница не найдена "
-                                 "(обрыв или неверный формат запроса)")
-            buf = tail + chunk
-            idx = buf.find(sep)
-            if idx >= 0:
-                out.write(buf[:idx])
-                total += idx
-                # лимит проверяем и на финальном куске: маленький файл
-                # может целиком уместиться в один чанк чтения
-                if total > MAX_UPLOAD_BYTES:
-                    gb = MAX_UPLOAD_BYTES >> 30
-                    raise ValueError(
-                        f"файл слишком большой (лимит {gb} ГБ)")
-                break
-            if len(buf) > keep:
-                out.write(buf[:-keep])
-                total += len(buf) - keep
-                buf = buf[-keep:]
-            tail = buf
-            if total > MAX_UPLOAD_BYTES:
-                gb = MAX_UPLOAD_BYTES >> 30
-                raise ValueError(f"файл слишком большой (лимит {gb} ГБ)")
-    return filename, total
+    parsed = parse_multipart_uploads(
+        rfile, boundary, total_len, lambda _i: dest)
+    if not parsed:
+        raise ValueError("в запросе нет файлов")
+    fname, _p, size = parsed[0]
+    return fname, size
 
 
 # ---------------------------------------------------------------------------
@@ -952,34 +1010,54 @@ def make_handler(state: AppState, token: str | None = None
             if length < 0:
                 self._json({"error": "некорректный Content-Length"}, 400)
                 return
-            if length > MAX_UPLOAD_BYTES + (1 << 20):
-                gb = MAX_UPLOAD_BYTES >> 30
-                self._json(
-                    {"error": f"файл слишком большой (лимит {gb} ГБ)"}, 413)
-                return
-            tmp = state.uploads_dir / f"tmp-{uuid.uuid4().hex}.part"
-            branch_q = None
+            # суммарная длина тела не лимитируется: лимит — на каждый файл
+            # (parse_multipart_uploads проверяет его в потоке)
+            qs = parse_qs(urlparse(self.path).query)
+            branch_q = (qs.get("branch") or [None])[0]
+            prefix = f"tmp-{uuid.uuid4().hex}-"
+
+            def _fmt_size(sz: int) -> str:
+                if sz >= (1 << 30):
+                    return f"{sz / (1 << 30):.2f} ГБ"
+                if sz >= (1 << 20):
+                    return f"{sz / (1 << 20):.1f} МБ"
+                return f"{sz / 1024:.0f} КБ"
+
             try:
-                fname, size = parse_multipart_file(
-                    self.rfile, m.group(1).encode("latin-1"), tmp, length)
-                if size == 0:
-                    self._json({"error": "пустой файл"}, 400)
-                    return
-                # ветка может идти следующим полем формы; упрощённо — из query
-                qs = parse_qs(urlparse(self.path).query)
-                branch_q = (qs.get("branch") or [None])[0]
-                safe_ext = Path(fname).suffix.lower()
-                if safe_ext not in _PCAP_EXTS:
-                    safe_ext = ".pcap"
-                entry = state.add_upload(tmp, Path(fname).name or "dump.pcap",
-                                         branch_q or DEFAULT_BRANCH)
-                self._json(state.public(entry), 201)
+                parsed = parse_multipart_uploads(
+                    self.rfile, m.group(1).encode("latin-1"), length,
+                    lambda i: state.uploads_dir / f"{prefix}{i}.part")
             except ValueError as ve:
-                tmp.unlink(missing_ok=True)
+                for p in state.uploads_dir.glob(f"{prefix}*.part"):
+                    p.unlink(missing_ok=True)
                 self._json({"error": str(ve)}, 400)
+                return
+            if not parsed:
+                self._json({"error": "в запросе нет файлов"}, 400)
+                return
+            if any(size == 0 for _fname, _p, size in parsed):
+                for p in state.uploads_dir.glob(f"{prefix}*.part"):
+                    p.unlink(missing_ok=True)
+                self._json({"error": "пустой файл"}, 400)
+                return
+            entries: list[dict] = []
+            try:
+                for fname, tmp, size in parsed:
+                    safe_ext = Path(fname).suffix.lower()
+                    if safe_ext not in _PCAP_EXTS:
+                        safe_ext = ".pcap"
+                    entry = state.add_upload(tmp,
+                                             Path(fname).name or "dump.pcap",
+                                             branch_q or DEFAULT_BRANCH)
+                    entries.append(state.public(entry))
             except Exception as ex:              # noqa: BLE001
-                tmp.unlink(missing_ok=True)
-                self._json({"error": f"ошибка приёма файла: {ex}"}, 500)
+                for p in state.uploads_dir.glob(f"{prefix}*.part"):
+                    p.unlink(missing_ok=True)
+                self._json(
+                    {"error": f"ошибка приёма файла: {ex} "
+                     f"(загружено {len(entries)} из {len(parsed)})"}, 500)
+                return
+            self._json({"files": entries}, 201)
 
         # -- DELETE --------------------------------------------------------------
         def do_DELETE(self):                     # noqa: N802

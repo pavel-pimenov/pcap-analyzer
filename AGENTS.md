@@ -52,7 +52,9 @@
 * Данные из tshark читаем потоково (`tshark_runner.stream_fields`) — файлы
   бывают по сотням тысяч пакетов, всё в память грузить нельзя. То же касается
   загрузки pcap в веб-GUI: multipart разбирается потоком с учётом
-  Content-Length (`webapp/server.parse_multipart_file`, чтение `read1`).
+  Content-Length (`webapp/server.parse_multipart_uploads` — несколько файлов
+  за один запрос, чтение `read1`; `parse_multipart_file` — обёртка первого
+  файла для тестов).
 * Идентификаторы файлов в веб-GUI валидируются регуляркой `^[A-Za-z0-9_-]+$`
   перед любым построением путей.
 

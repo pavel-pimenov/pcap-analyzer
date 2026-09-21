@@ -56,6 +56,19 @@ def _multipart(payload: bytes, filename: str) -> bytes:
     ])
 
 
+def _multipart_many(files: list[tuple[str, bytes]]) -> bytes:
+    bnd = b"----WebApiTestBoundary7"
+    out = bytearray()
+    for filename, payload in files:
+        out += (b"--" + bnd + b"\r\n"
+                + b'Content-Disposition: form-data; name="file"; filename="'
+                + filename.encode() + b'"\r\n\r\n')
+        out += payload
+        out += b"\r\n"
+    out += b"--" + bnd + b"--\r\n"
+    return bytes(out)
+
+
 @unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
 @unittest.skipUnless(SAMPLES.is_dir(), f"нет каталога образцов: {SAMPLES}")
 class WebApiTest(unittest.TestCase):
@@ -88,7 +101,9 @@ class WebApiTest(unittest.TestCase):
                                   method="POST", body=body,
                                   content_type=MULTIPART_CT)
         self.assertEqual(code, 201, data[:300])
-        return json.loads(data)
+        files = json.loads(data)["files"]
+        self.assertEqual(len(files), 1)
+        return files[0]
 
     def _wait_done(self, fid: str, timeout: float = 240.0) -> dict:
         deadline = time.monotonic() + timeout
@@ -193,6 +208,30 @@ class WebApiTest(unittest.TestCase):
                                   body=b"not-multipart")
         self.assertEqual(code, 400)
 
+    def test_multi_upload_two_files(self):
+        body = _multipart_many([
+            (self.pcap.name, self.pcap.read_bytes()),
+            ("второй.pcapng", self.pcap.read_bytes()),
+        ])
+        code, _h, data = _request(self.base, "/api/upload?branch=modbus",
+                                  method="POST", body=body,
+                                  content_type=MULTIPART_CT)
+        self.assertEqual(code, 201, data[:300])
+        files = json.loads(data)["files"]
+        self.assertEqual(len(files), 2)
+        ids = [f["id"] for f in files]
+        self.assertEqual(len(set(ids)), 2)       # разные идентификаторы
+        names = [f["name"] for f in files]
+        self.assertIn(self.pcap.name, names)
+        self.assertIn("второй.pcapng", names)
+        for fid in ids:
+            status = self._wait_done(fid)
+            self.assertEqual(status["status"], "done",
+                             f"ошибка анализа: {status.get('error')}")
+            code, _h, _b = _request(self.base, f"/api/files/{fid}",
+                                    method="DELETE")
+            self.assertEqual(code, 200)
+
 
 @unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
 class WebSeriesTest(unittest.TestCase):
@@ -226,7 +265,9 @@ class WebSeriesTest(unittest.TestCase):
             body=_multipart(path.read_bytes(), path.name),
             content_type=MULTIPART_CT)
         self.assertEqual(code, 201, data[:200])
-        return json.loads(data)["id"]
+        files = json.loads(data)["files"]
+        self.assertEqual(len(files), 1)
+        return files[0]["id"]
 
     def _poll_group(self, gid: str, timeout: float = 300.0) -> dict:
         deadline = time.monotonic() + timeout
