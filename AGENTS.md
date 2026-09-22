@@ -146,7 +146,7 @@ python3 -m analyzer analyze <pcap> --config thresholds.toml --tz 3 -o /tmp/r.htm
 ## Docker
 
 ```bash
-docker compose up --build          # веб-интерфейс на :8000 (сервис web)
+docker compose up --build -d     # веб-интерфейс на :8000 (сервис web, restart)
 PCAP_FILE=… REPORT_FILE=… FORMAT=both docker compose run --rm analyzer analyze \
     /data/$PCAP_FILE -o /output/$REPORT_FILE -f $FORMAT
 ```
@@ -155,6 +155,8 @@ PCAP_FILE=… REPORT_FILE=… FORMAT=both docker compose run --rm analyzer analy
 `fonts-dejavu-core` из apt + pip-зависимости из `requirements.txt`.
 ENTRYPOINT — `python -m analyzer`; сервис `web` по умолчанию запускает
 подкоманду `serve` (том `webdata`, образцы из `./pcap-sample` read-only).
+Параметры развёртывания — через `.env` (`WEB_IP`, `WEB_PORT`, `WEB_TOKEN`,
+см. `.env.example`); издалека — `docker compose up --build -d` с `restart`.
 Batch-анализ — профиль `batch` (`docker compose run --rm analyzer …`),
 аргументы CLI передаются в `command:`/`docker run`.
 

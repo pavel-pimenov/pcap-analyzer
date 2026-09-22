@@ -1,12 +1,20 @@
 # =============================================================================
 # pcap-analyzer — анализ pcap-файлов через tshark, отчёты HTML и PDF
 #
-# Веб-интерфейс (по умолчанию):
-#   docker compose up --build          # http://localhost:8000
-#   Загрузка pcap в браузере, анализ, просмотр и экспорт HTML/PDF.
-#   Образцы из ./pcap-sample доступны в списке слева (удалять нельзя).
+# Запуск на сервере:
+#   cp .env.example .env            # при необходимости задать порт/токен
+#   docker compose up --build -d    # демон веб-интерфейса на :8000
 #
-# Разовый анализ из командной строки (профиль batch):
+# Параметры (файл .env рядом с compose-файлом, см. .env.example):
+#   WEB_IP      адрес интерфейса, на который публикуется порт
+#               (0.0.0.0 — все интерфейсы; для локального доступа — 127.0.0.1)
+#   WEB_PORT    внешний порт веб-GUI (по умолчанию 8000)
+#   WEB_TOKEN   токен: если задан, все маршруты API (кроме самой страницы)
+#               требуют его через ?token=... или заголовок X-Auth-Token.
+#               НА УДАЛЁННОМ СЕРВЕРЕ ОБЯЗАТЕЛЬНО задайте свой.
+#               Пустая строка — доступ без авторизации.
+#
+# Разовый batch-анализ из командной строки (профиль batch):
 #   docker compose run --rm analyzer analyze \
 #       /data/kh-kb12ramp-cote1.pcap -o /output/report.html
 #   # вариант с PDF: ... -o /output/report -f both   (получите .html и .pdf)
@@ -14,32 +22,52 @@
 # Список доступных веток анализа:
 #   docker compose run --rm analyzer branches
 #
-# Параметры по умолчанию можно вынести в файл .env рядом с compose-файлом.
-#
-# Закрыть интерфейс токеном (пример):
-#   docker compose run -d --rm web serve --host 0.0.0.0 --port 8000 \
-#       --data-dir /data/webdata --samples-dir /data/pcap-sample \
-#       --token МОЁ_СЛОВО
+# Пороги правил рекомендаций — thresholds.toml рядом с compose-файлом.
+# Настройка: раскомментируйте том и флаг --config в сервисе web (ниже);
+# удобно держать файл в .envignored/гитигнорированном месте, чтобы пороги
+# не попадали в репозиторий.
 # =============================================================================
 
 services:
-  # --- Веб-интерфейс (запускается по умолчанию) -------------------------------
+  # --- Веб-интерфейс (поднимается по умолчанию) -----------------------------
   web:
     build: .
     image: pcap-analyzer:latest
+    restart: unless-stopped
     container_name: pcap-analyzer-web
     ports:
-      - "8000:8000"
+      - "${WEB_IP:-0.0.0.0}:${WEB_PORT:-8000}:8000"
     volumes:
       # Образцы pcap — только чтение, предлагаются в интерфейсе как «образцы»
       - ./pcap-sample:/data/pcap-sample:ro
       # Загрузки пользователей и готовые отчёты (именованный том)
       - webdata:/data/webdata
+      # Пороги правил (опционально): раскомментируйте, если есть thresholds.toml
+      # - ./thresholds.toml:/data/thresholds.toml:ro
+    environment:
+      # токен передаётся аргументом --token; пустое значение — без авторизации
+      # (обработчик считает пустую строку «токена нет»)
+      WEB_TOKEN: ${WEB_TOKEN:-}
+    command:
+      - "serve"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--data-dir"
+      - "/data/webdata"
+      - "--samples-dir"
+      - "/data/pcap-sample"
+      - "--token"
+      - "${WEB_TOKEN:-}"
+      # Пороги правил (опционально), см. комментарий про том:
+      # - "--config"
+      # - "/data/thresholds.toml"
     healthcheck:
       # curl в slim-образе нет — проверяем стандартной библиотекой python;
-      # проверяем страницу "/" — она отдаётся даже при включённом --token
+      # страница "/" отдаётся даже при включённом --token
       test: ["CMD", "python3", "-c",
-             "import urllib.request as u; r=u.urlopen('http://127.0.0.1:8000/', timeout=5); assert r.status==200"]
+             "import urllib.request as u; assert u.urlopen('http://127.0.0.1:8000/', timeout=5).status==200"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -50,7 +78,8 @@ services:
     build: .
     image: pcap-analyzer:latest
     profiles: ["batch"]
-    container_name: pcap-analyzer
+    restart: "no"
+    container_name: pcap-analyzer-batch
     volumes:
       # Каталог с исходными pcap-файлами (монтируется только на чтение)
       - ./pcap-sample:/data:ro
