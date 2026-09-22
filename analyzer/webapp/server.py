@@ -2,7 +2,10 @@
 
 Возможности:
 * загрузка pcap-файлов через браузер (multipart, потоково, без чтения
-  всего файла в память);
+  всего файла в память); несколько файлов за один запрос, приём архивов
+  zip/tar[.gz]/.gz, пакеты загрузки со сводкой прогресса;
+* создание серии сразу из загруженных файлов (as_series);
+* пересчёт серий и сравнений из истории (/api/groups/<id>/rerun);
 * фоновый анализ в рабочих потоках (очередь), статусы в реальном времени;
 * просмотр HTML-отчёта и экспорт в HTML/PDF;
 * каталог образцов (read-only) — предлагается в списке, удалять нельзя.
@@ -13,15 +16,18 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import queue
 import re
 import secrets
 import shutil
+import tarfile
 import threading
 import time
 import uuid
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +44,12 @@ from . import page
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PCAP_EXTS = {".pcap", ".pcapng", ".cap"}
 MAX_UPLOAD_BYTES = DEFAULT_CONFIG.max_upload_bytes
+# Архивы: распаковка ограничена числом членов и суммарным объёмом
+# (лимит на сам загружаемый архив проверяет parse_multipart_uploads).
+_ARCHIVE_TAR_EXTS = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2",
+                     ".tar.xz", ".txz", ".tar")
+ARCHIVE_MAX_FILES = 200
+ARCHIVE_MAX_TOTAL_BYTES = MAX_UPLOAD_BYTES * 4
 
 
 class AnalysisCancelled(Exception):
@@ -166,6 +178,7 @@ class AppState:
             "tookS": "" if e.get("took_s") in (None, "") else str(e["took_s"]),
             "error": e.get("error", ""),
             "added": e.get("added", ""),
+            "batch": e.get("batch", ""),
             "hasHtml": (self.reports_dir / f"{fid}.html").is_file(),
             "hasPdf": (self.reports_dir / f"{fid}.pdf").is_file(),
         }
@@ -191,12 +204,55 @@ class AppState:
     def list_files(self) -> list[dict]:
         with self.lock:
             self._scan_samples()
-            items = [self.public(e) for e in self.entries.values()]
-            items += [self.group_public(g) for g in self.groups.values()]
-        items.sort(key=lambda x: (
-            0 if x["kind"] == "sample" else
-            1 if x["kind"] in ("series", "diff") else 2, x["name"]))
-        return items
+            raw: list[tuple[int, float, str, dict]] = []
+            for e in self.entries.values():
+                raw.append((self._kind_rank(e["kind"]), e.get("ts") or 0.0,
+                            e.get("name", ""), self.public(e)))
+            for g in self.groups.values():
+                raw.append((1, g.get("ts") or 0.0, g.get("name", ""),
+                            self.group_public(g)))
+        # внутри вида — сначала свежие (история последних анализов)
+        raw.sort(key=lambda t: (t[0], -t[1], t[2]))
+        return [t[3] for t in raw]
+
+    @staticmethod
+    def _kind_rank(kind: str) -> int:
+        if kind == "sample":
+            return 0
+        if kind in ("trend", "series", "diff"):
+            return 1
+        return 2
+
+    def list_batches(self) -> list[dict]:
+        """Сводка по пакетам загрузки (несколько файлов за один запрос)."""
+        with self.lock:
+            acc: dict[str, dict] = {}
+            for e in self.entries.values():
+                b = e.get("batch")
+                if not b:
+                    continue
+                d = acc.setdefault(b, {
+                    "batch": b, "total": 0, "done": 0, "running": 0,
+                    "queued": 0, "error": 0, "cancelled": 0, "new": 0,
+                    "added": e.get("added", ""), "ts": e.get("ts") or 0.0,
+                })
+                d["total"] += 1
+                st = e.get("status", "new")
+                d[st] = d.get(st, 0) + 1
+                d["ts"] = max(d["ts"], e.get("ts") or 0.0)
+            out = []
+            for d in acc.values():
+                if d["running"] or d["queued"]:
+                    d["status"] = "running"
+                elif d["error"]:
+                    d["status"] = "error"
+                elif d["done"] == d["total"]:
+                    d["status"] = "done"
+                else:
+                    d["status"] = "partial"
+                out.append(d)
+        out.sort(key=lambda d: -d["ts"])
+        return out
 
     def get(self, fid: str) -> dict | None:
         with self.lock:
@@ -204,9 +260,13 @@ class AppState:
             return self.entries.get(fid)
 
     # -- жизненный цикл файла ---------------------------------------------------
-    def add_upload(self, src: Path, orig_name: str, branch: str) -> dict:
+    def add_upload(self, src: Path, orig_name: str, branch: str,
+                   ext: str | None = None, batch: str | None = None) -> dict:
         fid = uuid.uuid4().hex[:12]
-        dst = self.uploads_dir / f"{fid}{src.suffix.lower()}"
+        suffix = (ext or src.suffix).lower()
+        if suffix not in _PCAP_EXTS:
+            suffix = ".pcap"
+        dst = self.uploads_dir / f"{fid}{suffix}"
         shutil.move(str(src), dst)
         entry = {
             "id": fid, "kind": "upload", "name": orig_name,
@@ -214,7 +274,10 @@ class AppState:
             "branch": branch, "status": "queued",
             "stage": "", "error": "",
             "added": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            "ts": time.time(),
         }
+        if batch:
+            entry["batch"] = batch
         with self.lock:
             self.entries[fid] = entry
             self._persist(entry)
@@ -251,6 +314,7 @@ class AppState:
                 "status": "queued", "stage": "", "progress": 0,
                 "error": "", "added":
                     datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                "ts": time.time(),
             }
             self.groups[gid] = g
             self._persist_group(g)
@@ -273,10 +337,31 @@ class AppState:
                 "status": "queued", "stage": "", "progress": 0,
                 "error": "", "added":
                     datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                "ts": time.time(),
             }
             self.groups[gid] = g
             self._persist_group(g)
         self.jobs.put(("diff", gid))
+        return g
+
+    def rerun_group(self, gid: str) -> dict:
+        """Поставить серию/сравнение на пересчёт (из истории)."""
+        with self.lock:
+            g = self.groups.get(gid)
+            if not g:
+                raise ValueError("серия не найдена")
+            if g.get("status") in ("running", "queued"):
+                raise ValueError("задание уже выполняется")
+            if g["kind"] == "diff":
+                if not (self.groups.get(g.get("a"))
+                        and self.groups.get(g.get("b"))):
+                    raise ValueError(
+                        "исходные серии удалены — сравнение не пересчитать")
+            g.update(status="queued", stage="", progress=0, error="",
+                     cancel=False, took_s="")
+            self._persist_group(g)
+            kind = "series" if g["kind"] == "trend" else "diff"
+        self.jobs.put((kind, gid))
         return g
 
     def request_cancel_group(self, gid: str) -> bool:
@@ -572,6 +657,88 @@ def _too_big() -> ValueError:
     return ValueError(f"файл слишком большой (лимит {gb} ГБ)")
 
 
+def _archive_kind(name: str) -> str | None:
+    """Тип архива по имени: 'zip' | 'tar' | 'gz' | None."""
+    low = name.lower()
+    if low.endswith(_ARCHIVE_TAR_EXTS):
+        return "tar"
+    if low.endswith(".zip"):
+        return "zip"
+    if low.endswith(".gz"):
+        return "gz"
+    return None
+
+
+def _stream_copy(src, dst_path: Path, limit: int, budget: list[int]) -> int:
+    """Скопировать поток в файл, соблюдая лимит на файл и общий бюджет."""
+    total = 0
+    with open(dst_path, "wb") as out:
+        while True:
+            chunk = src.read(1 << 16)
+            if not chunk:
+                break
+            total += len(chunk)
+            budget[0] += len(chunk)
+            if total > limit or budget[0] > ARCHIVE_MAX_TOTAL_BYTES:
+                raise _too_big()
+            out.write(chunk)
+    return total
+
+
+def _extract_archive(path: Path, orig_name: str, dest_factory
+                     ) -> list[tuple[str, Path, int]]:
+    """Распаковать pcap-файлы из архива (zip/tar[.gz]/.gz) в отдельные файлы.
+
+    Из имени члена берётся только basename — пути внутри архива не участвуют
+    в создании файлов (защита от zip-slip). Возвращает список
+    (имя_файла, путь, размер); пустой список — pcap внутри не найдено.
+    """
+    kind = _archive_kind(orig_name)
+    if kind is None:
+        return []
+    out: list[tuple[str, Path, int]] = []
+    budget = [0]
+
+    def _member(name: str, src) -> None:
+        base = Path(name.replace("\\", "/")).name
+        if not base or Path(base).suffix.lower() not in _PCAP_EXTS:
+            return
+        if len(out) >= ARCHIVE_MAX_FILES:
+            raise ValueError(
+                f"в архиве больше {ARCHIVE_MAX_FILES} pcap-файлов")
+        dest = dest_factory(len(out))
+        size = _stream_copy(src, dest, MAX_UPLOAD_BYTES, budget)
+        out.append((base, dest, size))
+
+    try:
+        if kind == "zip":
+            with zipfile.ZipFile(path) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    with zf.open(info, "r") as src:
+                        _member(info.filename, src)
+        elif kind == "tar":
+            with tarfile.open(path, "r:*") as tf:
+                for member in tf:
+                    if not member.isfile():
+                        continue
+                    src = tf.extractfile(member)
+                    if src is None:
+                        continue
+                    with src:
+                        _member(member.name, src)
+        else:                                    # одиночный .gz
+            name = orig_name[:-3] if orig_name.lower().endswith(".gz") \
+                else orig_name
+            with gzip.open(path, "rb") as src:
+                _member(name, src)
+    except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError) as ex:
+        raise ValueError(f"архив не читается: {ex}") from ex
+    return out
+
+
+
 def parse_multipart_uploads(rfile, boundary: bytes, total_len: int,
                             dest_factory) -> list[tuple[str, Path, int]]:
     """Сохранить ВСЕ файловые части multipart-запроса в отдельные файлы.
@@ -834,6 +1001,9 @@ def make_handler(state: AppState, token: str | None = None
             if path == "/api/files":
                 self._json(state.list_files())
                 return
+            if path == "/api/batches":
+                self._json(state.list_batches())
+                return
             if path == "/api/branches":
                 self._json([
                     {"key": k, "title": BRANCHES[k]().title,
@@ -978,6 +1148,18 @@ def make_handler(state: AppState, token: str | None = None
                     return
                 self._json(state.group_public(g), 201)
                 return
+            m = re.fullmatch(r"/api/groups/([A-Za-z0-9_-]+)/rerun", u.path)
+            if m:
+                try:
+                    g = state.rerun_group(m.group(1))
+                except ValueError as ve:
+                    msg = str(ve)
+                    self._json({"error": msg},
+                               404 if "не найдена" in msg or
+                               "удалены" in msg else 409)
+                    return
+                self._json(state.group_public(g), 202)
+                return
             m = re.fullmatch(r"/api/groups/([A-Za-z0-9_-]+)/cancel", u.path)
             if m:
                 if not state.request_cancel_group(m.group(1)):
@@ -1016,13 +1198,6 @@ def make_handler(state: AppState, token: str | None = None
             branch_q = (qs.get("branch") or [None])[0]
             prefix = f"tmp-{uuid.uuid4().hex}-"
 
-            def _fmt_size(sz: int) -> str:
-                if sz >= (1 << 30):
-                    return f"{sz / (1 << 30):.2f} ГБ"
-                if sz >= (1 << 20):
-                    return f"{sz / (1 << 20):.1f} МБ"
-                return f"{sz / 1024:.0f} КБ"
-
             try:
                 parsed = parse_multipart_uploads(
                     self.rfile, m.group(1).encode("latin-1"), length,
@@ -1041,15 +1216,47 @@ def make_handler(state: AppState, token: str | None = None
                 self._json({"error": "пустой файл"}, 400)
                 return
             entries: list[dict] = []
+            files_for_series: list[str] = []
+            batch = uuid.uuid4().hex[:10]
             try:
-                for fname, tmp, size in parsed:
-                    safe_ext = Path(fname).suffix.lower()
-                    if safe_ext not in _PCAP_EXTS:
-                        safe_ext = ".pcap"
-                    entry = state.add_upload(tmp,
-                                             Path(fname).name or "dump.pcap",
-                                             branch_q or DEFAULT_BRANCH)
+                for fname, tmp, _size in parsed:
+                    if _archive_kind(fname) is not None:
+                        try:
+                            members = _extract_archive(
+                                tmp, fname, lambda i: state.uploads_dir /
+                                f"{prefix}arc-{i}.part")
+                        except ValueError as ve:
+                            tmp.unlink(missing_ok=True)
+                            raise ValueError(
+                                f"архив «{Path(fname).name}»: {ve}") from ve
+                        tmp.unlink(missing_ok=True)
+                        if not members:
+                            raise ValueError(
+                                f"в архиве «{Path(fname).name}» "
+                                "нет pcap-файлов")
+                        for mname, mpath, _msize in members:
+                            entry = state.add_upload(
+                                mpath, Path(mname).name, branch_q or
+                                DEFAULT_BRANCH,
+                                ext=Path(mname).suffix.lower(), batch=batch)
+                            entries.append(state.public(entry))
+                            files_for_series.append(entry["id"])
+                        continue
+                    ext = Path(fname).suffix.lower()
+                    if ext not in _PCAP_EXTS:
+                        ext = ".pcap"
+                    entry = state.add_upload(
+                        tmp, Path(fname).name or "dump.pcap",
+                        branch_q or DEFAULT_BRANCH, ext=ext, batch=batch)
                     entries.append(state.public(entry))
+                    files_for_series.append(entry["id"])
+            except ValueError as ve:
+                for p in state.uploads_dir.glob(f"{prefix}*.part"):
+                    p.unlink(missing_ok=True)
+                self._json(
+                    {"error": f"{ve} "
+                     f"(загружено {len(entries)} из {len(parsed)})"}, 400)
+                return
             except Exception as ex:              # noqa: BLE001
                 for p in state.uploads_dir.glob(f"{prefix}*.part"):
                     p.unlink(missing_ok=True)
@@ -1057,7 +1264,16 @@ def make_handler(state: AppState, token: str | None = None
                     {"error": f"ошибка приёма файла: {ex} "
                      f"(загружено {len(entries)} из {len(parsed)})"}, 500)
                 return
-            self._json({"files": entries}, 201)
+            resp = {"files": entries}
+            as_series = (qs.get("as_series") or [""])[0].lower() in \
+                ("1", "true", "on", "yes")
+            if as_series and len(files_for_series) >= 2:
+                try:
+                    resp["series"] = state.group_public(state.create_series(
+                        files_for_series, branch_q or DEFAULT_BRANCH))
+                except ValueError:
+                    resp["series"] = None
+            self._json(resp, 201)
 
         # -- DELETE --------------------------------------------------------------
         def do_DELETE(self):                     # noqa: N802

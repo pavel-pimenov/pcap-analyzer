@@ -78,13 +78,19 @@ button:disabled { opacity:.5; cursor:default; }
 <main>
   <div id="left">
     <div class="panel">
-      <h2>Загрузка дампа</h2>
+      <h2>Загрузка дампов и архивов</h2>
       <div class="row">
-        <input type="file" id="fileinp" accept=".pcap,.pcapng,.cap" multiple>
+        <input type="file" id="fileinp"
+               accept=".pcap,.pcapng,.cap,.zip,.tar,.tar.gz,.tgz,.gz"
+               multiple>
       </div>
       <div class="row" style="margin-top:10px;">
         <select id="branch"></select>
         <button class="primary" id="upbtn">Загрузить и анализировать</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <label class="hint"><input type="checkbox" id="upSeries">
+          сразу собрать серию из загруженных</label>
       </div>
       <div class="hint" style="margin-top:8px;" id="uphint"></div>
     </div>
@@ -113,6 +119,7 @@ button:disabled { opacity:.5; cursor:default; }
 "use strict";
 const $ = (id) => document.getElementById(id);
 let FILES = [];
+let BATCHES = {};
 let SEL = null;
 let POLL = null;
 const SELSET = new Set();     // файлы, выбранные в серию
@@ -158,9 +165,17 @@ async function loadBranches() {
   } catch (e) {}
 }
 
-async function loadFiles() {
+async function loadFiles() { return refresh(); }
+
+async function refresh() {
   FILES = await api("/api/files");
+  BATCHES = {};
+  try {
+    for (const b of await api("/api/batches")) BATCHES[b.batch] = b;
+  } catch (e) {}
   renderFiles();
+  const cur = FILES.find(x => x.id === SEL);
+  updateBar(cur || null);
   schedulePoll();
 }
 
@@ -184,8 +199,19 @@ function renderFiles() {
     meta.innerHTML =
       `<span>${fmtSize(f.size)}</span>` +
       `<span class="chip ${f.status}">${CHIP_RU[f.status] || f.status}</span>` +
+      (f.added ? `<span>${f.added}</span>` : "") +
       (f.hasHtml ? `<span>HTML ✓</span>` : "") +
       (f.hasPdf ? `<span>PDF ✓</span>` : "");
+    const bsum = BATCHES[f.batch];
+    if (bsum && bsum.total > 1) {
+      const bc = document.createElement("span");
+      bc.className = "chip " + (bsum.status === "done" ? "done"
+        : bsum.status === "running" ? "running"
+        : bsum.status === "error" ? "error" : "queued");
+      bc.textContent = "пакет " + bsum.done + "/" + bsum.total;
+      bc.title = "Файлы этого пакета";
+      meta.appendChild(bc);
+    }
     d.appendChild(nm); d.appendChild(meta);
     if (f.status === "running" || f.status === "queued") {
       const st = document.createElement("div"); st.className = "stage";
@@ -264,6 +290,15 @@ function renderFiles() {
           await api("/api/groups/" + f.id + "/cancel", {method:"POST"});
           loadFiles(); };
         acts.appendChild(bX);
+      } else {
+        const bR = document.createElement("button");
+        bR.textContent = "Пересчитать";
+        bR.onclick = async (ev) => { ev.stopPropagation();
+          try {
+            await api("/api/groups/" + f.id + "/rerun", {method:"POST"});
+            loadFiles();
+          } catch(e) { alert("Не удалось пересчитать: " + e.message); } };
+        acts.appendChild(bR);
       }
     }
     if (f.kind !== "sample") {
@@ -309,14 +344,7 @@ function schedulePoll() {
   const active = FILES.some(f => f.status === "running" || f.status === "queued");
   if (!active) return;
   POLL = setTimeout(async () => {
-    try {
-      const prevSel = SEL;
-      FILES = await api("/api/files");
-      renderFiles();
-      const cur = FILES.find(x => x.id === prevSel);
-      updateBar(cur || null);
-      schedulePoll();
-    } catch (e) { schedulePoll(); }
+    try { await refresh(); } catch (e) { schedulePoll(); }
   }, 1500);
 }
 
@@ -376,15 +404,18 @@ $("upbtn").onclick = async () => {
   $("upbtn").disabled = true;
   $("uphint").textContent = "Загрузка…";
   try {
-    const res = await api(
-      "/api/upload?branch=" + encodeURIComponent($("branch").value),
-      {method: "POST", body: fd});
+    let url = "/api/upload?branch=" + encodeURIComponent($("branch").value);
+    if ($("upSeries").checked) url += "&as_series=1";
+    const res = await api(url, {method: "POST", body: fd});
     const files = res.files || [];
     inp.value = "";
-    $("uphint").textContent =
-      files.length > 1 ? "Загружено файлов: " + files.length : "";
+    const parts = [];
+    if (files.length) parts.push("Загружено файлов: " + files.length);
+    if (res.series) parts.push("создана серия");
+    $("uphint").textContent = parts.join(", ");
     await loadFiles();
-    if (files.length) select(files[files.length - 1].id);
+    if (res.series) select(res.series.id);
+    else if (files.length) select(files[files.length - 1].id);
   } catch (e) {
     $("uphint").textContent = "Ошибка загрузки: " + e.message;
   } finally { $("upbtn").disabled = false; }
@@ -394,7 +425,12 @@ $("btnHtml").onclick = () => SEL && window.open(tq("/export/" + SEL + "?fmt=html
 $("btnPdf").onclick = () => SEL && window.open(tq("/export/" + SEL + "?fmt=pdf"));
 $("btnRerun").onclick = () => {
   const f = FILES.find(x => x.id === SEL);
-  if (f) analyze(SEL, f.branch);
+  if (!f) return;
+  if (f.kind === "series" || f.kind === "diff") {
+    api("/api/groups/" + f.id + "/rerun", {method: "POST"})
+      .then(loadFiles)
+      .catch(e => alert("Не удалось пересчитать: " + e.message));
+  } else analyze(SEL, f.branch);
 };
 $("btnDel").onclick = () => {
   const f = FILES.find(x => x.id === SEL);

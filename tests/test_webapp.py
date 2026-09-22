@@ -393,5 +393,127 @@ class WebTokenTest(unittest.TestCase):
         self.assertEqual(code, 401)
 
 
+class WebBatchTest(unittest.TestCase):
+    """Многофайловые пакеты: архивы, серия из загрузки, батч-сводка."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tests import pcapgen
+        cls.tmp = Path(__import__("tempfile").mkdtemp(prefix="pcapweb-b-"))
+        cls.fixtures = []
+        for i, ts in enumerate((1735000000, 1735000300)):
+            p = cls.tmp / f"dump_{i}.pcap"
+            pcapgen.write_modbus_pcap(p, base_ts=ts)
+            cls.fixtures.append(p)
+        cls.state = AppState(cls.tmp / "data", None, None)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0),
+                                        make_handler(cls.state))
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever,
+                         daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _upload(self, filename: str, payload: bytes,
+                query: str = "?branch=modbus"):
+        code, _h, data = _request(self.base, "/api/upload" + query,
+                                  method="POST",
+                                  body=_multipart(payload, filename),
+                                  content_type=MULTIPART_CT)
+        return code, (json.loads(data) if data else {})
+
+    def _get(self, path: str) -> dict | list:
+        code, _h, data = _request(self.base, path)
+        self.assertEqual(code, 200, data[:200])
+        return json.loads(data)
+
+    def _wait_done(self, fid: str, timeout: float = 240.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            _c, _h, data = _request(self.base, f"/api/status/{fid}")
+            st = json.loads(data)
+            if st["status"] in ("done", "error", "cancelled"):
+                return st
+            time.sleep(0.4)
+        self.fail("анализ не завершился")
+
+    def _poll_group(self, gid: str, timeout: float = 300.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            _c, _h, data = _request(self.base, f"/api/groups/{gid}")
+            st = json.loads(data)
+            if st["status"] in ("done", "error", "cancelled"):
+                return st
+            time.sleep(0.4)
+        self.fail("задание группы не завершилось")
+
+    def test_archive_upload_and_batch_progress(self):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for p in self.fixtures:
+                zf.write(p, p.name)
+        code, data = self._upload("dumps.zip", buf.getvalue())
+        self.assertEqual(code, 201, data)
+        files = data["files"]
+        self.assertEqual(len(files), 2)
+        names = {f["name"] for f in files}
+        self.assertEqual(names, {p.name for p in self.fixtures})
+        ids = {f["id"] for f in files}
+        self.assertEqual(len(ids), 2)
+        batch = {f["batch"] for f in files}
+        self.assertEqual(len(batch), 1)          # один пакет загрузки
+        b = next(x for x in self._get("/api/batches")
+                 if x["batch"] == list(batch)[0])
+        self.assertEqual(b["total"], 2)
+        for fid in ids:                          # оба файла анализируются
+            st = self._wait_done(fid)
+            self.assertEqual(st["status"], "done", st.get("error"))
+        b = next(x for x in self._get("/api/batches")
+                 if x["batch"] == list(batch)[0])
+        self.assertEqual(b["status"], "done")
+        self.assertEqual(b["done"], 2)
+
+    def test_archive_without_pcap_rejected(self):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("readme.txt", "нет дампов")
+        code, data = self._upload("empty.zip", buf.getvalue())
+        self.assertEqual(code, 400)
+        self.assertIn("нет pcap", data.get("error", ""))
+
+    def test_upload_series_and_rerun(self):
+        code, _h, data = _request(
+            self.base, "/api/upload?branch=modbus&as_series=1", method="POST",
+            body=_multipart_many([
+                (self.fixtures[0].name, self.fixtures[0].read_bytes()),
+                (self.fixtures[1].name, self.fixtures[1].read_bytes()),
+            ]),
+            content_type=MULTIPART_CT)
+        self.assertEqual(code, 201, data[:300])
+        resp = json.loads(data)
+        self.assertEqual(len(resp["files"]), 2)
+        self.assertIn("series", resp)
+        gid = resp["series"]["id"]
+        st = self._poll_group(gid)
+        self.assertEqual(st["status"], "done", st.get("error"))
+        code, _h, body = _request(self.base, f"/view/{gid}")
+        self.assertEqual(code, 200)
+        self.assertIn("Тренды по серии", body.decode("utf-8"))
+        # пересчёт готовой серии из истории
+        code, _h, data2 = _request(self.base, f"/api/groups/{gid}/rerun",
+                                   method="POST", body=b"")
+        self.assertEqual(code, 202, data2[:200])
+        st = self._poll_group(gid)
+        self.assertEqual(st["status"], "done", st.get("error"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
