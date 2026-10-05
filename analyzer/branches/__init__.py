@@ -10,12 +10,14 @@ from .coilers import CoilersAnalyzer
 from .modbus_tcp import ModbusTcpAnalyzer
 from .services import ServicesAnalyzer
 from .s7comm import S7CommAnalyzer
+from .sinec_h1 import SinecH1Analyzer
 
 BRANCHES: dict[str, type[BaseBranch]] = {
     ModbusTcpAnalyzer.name: ModbusTcpAnalyzer,
     S7CommAnalyzer.name: S7CommAnalyzer,
     ServicesAnalyzer.name: ServicesAnalyzer,
     CoilersAnalyzer.name: CoilersAnalyzer,
+    SinecH1Analyzer.name: SinecH1Analyzer,
 }
 
 DEFAULT_BRANCH = "modbus"

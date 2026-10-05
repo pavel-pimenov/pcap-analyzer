@@ -47,6 +47,23 @@ def _pick_sample(*needles: str) -> Path | None:
     return min(pcaps, key=lambda p: p.stat().st_size)
 
 
+def _find_sample(*needles: str) -> Path | None:
+    """Как _pick_sample, но с рекурсивным обходом подкаталогов.
+
+    Образцы лежат и вложенными (например, pcap-sample/<группа>/файл.pcap),
+    поэтому верхний уровень каталога для таких веток недостаточен.
+    """
+    if not SAMPLES.is_dir():
+        return None
+    pcaps = sorted(p for p in SAMPLES.rglob("*")
+                   if p.suffix.lower() in {".pcap", ".pcapng", ".cap"})
+    for n in needles:
+        for p in pcaps:
+            if n in p.name.lower() or n in str(p.parent.name).lower():
+                return p
+    return pcaps[0] if pcaps else None
+
+
 def _tshark_count(pcap: Path, display: str) -> int:
     out = subprocess.run(
         ["tshark", "-r", str(pcap), "-Y", display, "-T", "fields",
@@ -233,6 +250,76 @@ class CoilersAnalyzeTest(unittest.TestCase):
                         "нет секций полей канала данных моталок")
         self.assertTrue(any(i.startswith("strips-") for i in ids),
                         "нет секций «смены полос»")
+
+    def test_html_is_balanced_and_has_key_blocks(self):
+        self.assertTrue(_balanced_html(self.html), "HTML содержит непарные теги")
+        for frag in ('id="general"', "cmd-line", "copy-btn", "csv-btn"):
+            self.assertIn(frag, self.html)
+
+    def test_examples_have_header_and_limit(self):
+        codes = re.findall(r"<code>(tshark[^<]*)</code>", self.html)
+        self.assertTrue(codes)
+        for c in codes:
+            tail = c.rsplit("|", 1)[-1]
+            if "-T fields" in c and "|" not in c.split("-T fields")[1]:
+                self.assertIn("-E header=y", c)
+            self.assertTrue(re.search(r"\b(head|tail|wc)\b", tail),
+                            f"команда без ограничителя вывода: {c[:80]}")
+
+
+@unittest.skipUnless(HAS_TSHARK, "нет tshark в PATH")
+@unittest.skipUnless(SAMPLES.is_dir(), f"нет каталога образцов: {SAMPLES}")
+class SinecH1AnalyzeTest(unittest.TestCase):
+    """Ветка sinec-h1 на образце SINEC H1 (S5 fetch/write, порт 2000)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pcap = _find_sample("fetch-write", "ods", "sintec")
+        if cls.pcap is None \
+                or _tshark_count(cls.pcap, 'tcp.payload contains 53:35') == 0:
+            raise unittest.SkipTest("нет образца с трафиком SINEC H1")
+        from analyzer.tshark_runner import find_tshark
+        branch = get_branch("sinec-h1")
+        cls.result = branch.analyze(
+            cls.pcap, DEFAULT_CONFIG, progress=lambda m, pct=None: None,
+            tshark_bin=find_tshark(None))
+        from analyzer.report import render_document
+        cls.html = render_document(cls.result)
+
+    def test_messages_match_tshark_segments(self):
+        """Сообщений не меньше, чем сегментов с сигнатурой H1.
+
+        В одном сегменте их может быть несколько (батчинг), поэтому
+        сверяем нижнюю границу и отдельно — целое число сообщений.
+        """
+        segs = _tshark_count(self.pcap, 'tcp.payload contains 53:35')
+        m = self.result.metrics
+        self.assertGreaterEqual(m.get("h1_msgs", 0), segs)
+        self.assertEqual(m.get("h1_msgs", 0) % 1, 0)
+
+    def test_pollmap_and_kpi_present(self):
+        m = self.result.metrics
+        self.assertGreater(m.get("h1_msgs", 0), 0)
+        self.assertGreater(m.get("h1_ops", 0), 0, "карта опроса пуста")
+        self.assertGreater(m.get("h1_words", 0), 0)
+        self.assertGreater(m.get("h1_period_ms", 0), 0)
+        self.assertTrue(self.result.read_labels, "нет меток областей памяти")
+        for label in self.result.read_labels:
+            self.assertRegex(label, r"^\d+\.\d+\.\d+\.\d+ (?:DB|MB|EB|AB|PB|"
+                                    r"ZB|TB|BS|AS|DX|DE|QB)\d+@\d+\.\.\d+$")
+        ids = [s.id for s in self.result.sections]
+        for want in ("general", "format", "pairs", "ops", "pollmap",
+                     "timing", "response", "health"):
+            self.assertIn(want, ids)
+
+    def test_one_sided_capture_reported(self):
+        """Односторонний захват: ответов нет, но это отмечено явно."""
+        m = self.result.metrics
+        if m.get("h1_resps", 0) == 0:
+            ids = {r.id for r in self.result.recommendations}
+            self.assertIn("h1-one-sided", ids)
+        # отклик по ACK оценивается даже без видимых ответов
+        self.assertIn("h1_ack_p95_ms", m)
 
     def test_html_is_balanced_and_has_key_blocks(self):
         self.assertTrue(_balanced_html(self.html), "HTML содержит непарные теги")

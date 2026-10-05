@@ -11,6 +11,7 @@ import re as _re_mod  # noqa: F401 (используется в тестах н�
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -675,6 +676,442 @@ class DiffRenderTest(unittest.TestCase):
         self.assertNotIn("delta bad", html)
         self.assertIn("улучшилось", html)
         self.assertIn("перестало срабатывать", html)
+
+
+# ---------------------------------------------------------------------------
+# SINEC H1 (S5 fetch/write): разбор сообщений и правила (без tshark)
+# ---------------------------------------------------------------------------
+
+#: Чтение DB200 DW0–51 и DB201 DW0–42 — как в образце pcap-sample
+H1_READ_DB200 = bytes.fromhex("533510010305030801c800000034ff02")
+H1_READ_DB201 = bytes.fromhex("533510010305030801c90000002bff02")
+H1_WRITE_DB10 = bytes.fromhex("5335100103030308010a0000000aff02")
+
+
+def h1_response(opcode: int, retcode: int) -> bytes:
+    """Ответ H1: сигнатура, длина, блоки кода операции, кода ответа, хвост.
+
+    Длина блока включает собственный заголовок (тип + длина), поэтому
+    блок «код операции» с одним байтом — это ``01 03 <код>``.
+    """
+    body = bytes([0x01, 0x03, opcode, 0x0F, 0x03, retcode, 0xFF, 0x02])
+    return b"S5" + bytes([len(body) + 3]) + body
+
+
+def h1_addr(org: int, db: int, dwnr: int, dlen: int) -> bytes:
+    """Блок адреса H1: тип памяти, номер блока, первое слово, длина."""
+    return (bytes([0x03, 0x08, org, db]) + dwnr.to_bytes(2, "big")
+            + dlen.to_bytes(2, "big"))
+
+
+def h1_multi_read(*addrs) -> bytes:
+    """Запрос чтения нескольких областей одним сообщением."""
+    body = bytes([0x01, 0x03, 0x05]) + b"".join(addrs) + bytes([0xFF, 0x02])
+    return b"S5" + bytes([len(body) + 3]) + body
+
+
+def h1_read_response(dlen: int, retcode: int = 0) -> bytes:
+    """Настоящий ответ PLC на чтение: заголовок без данных + сырой хвост.
+
+    В ответе нет блока адреса и нет длины — возвращённые слова идут следом
+    без заголовка блока, поэтому ``parse_h1_messages`` берёт их объём из
+    ``expect_data`` (2 × dlen сопоставленного запроса).
+    """
+    body = bytes([0x01, 0x03, 0x06, 0x0F, 0x03, retcode,
+                  0xFF, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00])
+    head = b"S5" + bytes([len(body) + 3]) + body
+    return head + bytes((i * 7) % 256 for i in range(2 * dlen))
+
+
+def _expect_from_fifo(fifo):
+    """Обратный вызов разбора с курсором — как в ветке sinec-h1."""
+    from analyzer.branches.sinec_h1 import OP_READ_REQ, OP_READ_RSP
+    state = {"seen": 0}
+
+    def expect(msg):
+        if msg.opcode != OP_READ_RSP:
+            return 0
+        for i in range(state["seen"], len(fifo)):
+            if fifo[i][0] == OP_READ_REQ:
+                state["seen"] = i + 1
+                return 2 * fifo[i][2]
+        return None
+    return expect
+
+
+def _res(values, cap: int = 100) -> Reservoir:
+    """Reservoir, наполненный готовыми значениями."""
+    r = Reservoir(cap)
+    for v in values:
+        r.add(v)
+    return r
+
+
+class H1ParserTest(unittest.TestCase):
+    """Разбор цепочки сообщений H1 из tcp.payload."""
+
+    def test_read_request(self):
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        msgs, used = parse_h1_messages(H1_READ_DB200)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(used, len(H1_READ_DB200))
+        m = msgs[0]
+        self.assertEqual(m.opcode, 5)                  # чтение, запрос
+        self.assertTrue(m.is_request)
+        self.assertFalse(m.is_response)
+        self.assertEqual(m.org, 0x01)                  # DB
+        self.assertEqual(m.db, 200)
+        self.assertEqual(m.dwnr, 0)
+        self.assertEqual(m.dlen, 52)
+        self.assertEqual(m.words, 52)
+        self.assertIsNone(m.retcode)
+        self.assertFalse(m.error)
+        self.assertFalse(m.truncated)
+        self.assertEqual(m.area(), "DB200")
+        self.assertEqual(m.op_key(), (5, 0x01, 200, 0, 52))
+
+    def test_two_messages_in_one_segment(self):
+        """Батчинг: два запроса в одном TCP-сегменте (главная причина)."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        buf = H1_READ_DB200 + H1_READ_DB201
+        msgs, used = parse_h1_messages(buf)
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(used, len(buf))
+        self.assertEqual([m.db for m in msgs], [200, 201])
+        self.assertEqual([m.dlen for m in msgs], [52, 43])
+
+    def test_trailing_foreign_payload_ignored(self):
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        tail = bytes.fromhex("deadbeef0102")
+        msgs, used = parse_h1_messages(H1_READ_DB200 + tail)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(used, len(H1_READ_DB200),
+                         "хвост чужого payload не должен consumption'ить")
+
+    def test_truncated_message_not_parsed(self):
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        msgs, used = parse_h1_messages(H1_READ_DB200[:-4])
+        self.assertEqual(msgs, [])
+        self.assertEqual(used, 0)
+
+    def test_block_overrun_marked_truncated(self):
+        """Блок объявлен длиннее сообщения — сообщение не отбрасываем."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        bad = bytearray(H1_READ_DB200)
+        bad[4] = 0x20                                 # длина блока адреса
+        msgs, _used = parse_h1_messages(bytes(bad))
+        self.assertEqual(len(msgs), 1)
+        self.assertTrue(msgs[0].truncated)
+
+    def test_response_retcode(self):
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        for code, is_err in ((0x00, False), (0x02, True), (0xFF, True)):
+            msgs, _ = parse_h1_messages(h1_response(6, code))
+            m = msgs[0]
+            self.assertEqual(m.opcode, 6)              # чтение, ответ
+            self.assertTrue(m.is_response)
+            self.assertEqual(m.retcode, code)
+            self.assertEqual(m.error, is_err)
+            self.assertTrue(m.ret_text)
+
+    def test_unknown_opcode_survives(self):
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        body = bytes([0x01, 0x03, 0x63, 0xFF, 0x02])
+        msgs, used = parse_h1_messages(b"S5" + bytes([len(body) + 3]) + body)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(used, 8)
+        m = msgs[0]
+        self.assertEqual(m.opcode, 0x63)
+        self.assertIsNone(m.org)                       # блока адреса не было
+        self.assertFalse(m.is_request)
+        self.assertFalse(m.is_response)
+        self.assertFalse(m.truncated)
+
+    def test_describe_message_rows(self):
+        from analyzer.branches.sinec_h1 import describe_message
+        rows = describe_message(H1_READ_DB200)
+        text = " ".join(t for _o, _b, t in rows)
+        self.assertIn("S5", text)
+        self.assertIn("чтение", text)
+        self.assertIn("DB200", text)
+        self.assertIn("52 слов", text)
+        self.assertIn("конец сообщения", text)
+        self.assertEqual(describe_message(b"\x00\x01"), [])
+
+    def test_read_response_data_taken_from_matched_request(self):
+        """Ответ на чтение: данных нет в заголовке — длина из FIFO."""
+        from analyzer.branches.sinec_h1 import (OP_READ_REQ,
+                                                 parse_h1_messages)
+        buf = h1_read_response(52)
+        fifo = [(OP_READ_REQ, 0.0, 52)]
+        msgs, used = parse_h1_messages(buf, expect_data=_expect_from_fifo(fifo))
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(used, len(buf), "хвост данных должен быть разобран")
+        m = msgs[0]
+        self.assertEqual(m.opcode, 6)
+        self.assertEqual(m.retcode, 0)
+        self.assertFalse(m.error)
+        self.assertEqual(len(m.data), 104)
+        self.assertEqual(m.data_words, 52)
+        self.assertIsNone(m.org, "в ответе нет блока адреса")
+
+    def test_two_responses_in_one_segment(self):
+        """Два ответа в сегменте: каждому — своя длина из своей очереди."""
+        from analyzer.branches.sinec_h1 import (OP_READ_REQ,
+                                                 parse_h1_messages)
+        buf = h1_read_response(52) + h1_read_response(43)
+        fifo = [(OP_READ_REQ, 0.0, 52), (OP_READ_REQ, 1.0, 43)]
+        msgs, used = parse_h1_messages(buf, expect_data=_expect_from_fifo(fifo))
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(used, len(buf))
+        self.assertEqual([m.data_words for m in msgs], [52, 43])
+        self.assertNotEqual(msgs[0].data, msgs[1].data)
+
+    def test_error_response_data_left_to_segment_end(self):
+        """Без сопоставленного запроса отклик приходит один — данные целиком."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        buf = h1_read_response(52, retcode=0x02)
+        msgs, used = parse_h1_messages(buf)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(used, len(buf))
+        self.assertTrue(msgs[0].error)
+        self.assertEqual(msgs[0].data_words, 52)
+
+    def test_describe_message_data_row(self):
+        """Хвост ответа показывается отдельной строкой разбора."""
+        from analyzer.branches.sinec_h1 import (describe_message,
+                                                 parse_h1_messages)
+        buf = h1_read_response(4)
+        msgs, _ = parse_h1_messages(buf)
+        rows = describe_message(msgs[0].raw, msgs[0].data)
+        text = " ".join(t for _o, _b, t in rows)
+        self.assertIn("возвращённые данные идут после неё", text)
+        self.assertIn("8 Б = 4 слов", text)
+        # без хвоста терминатор читается как конец сообщения
+        only = describe_message(msgs[0].raw)
+        self.assertIn("конец сообщения",
+                      " ".join(t for _o, _b, t in only))
+
+    def test_read_two_areas_in_one_request(self):
+        """Два блока адреса в одном запросе: оба сохранены, слова summed."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        buf = h1_multi_read(h1_addr(0x01, 200, 0, 52),
+                            h1_addr(0x01, 201, 0, 43))
+        msgs, used = parse_h1_messages(buf)
+        self.assertEqual(used, len(buf))
+        m = msgs[0]
+        self.assertTrue(m.multi_addr)
+        self.assertEqual(m.addrs, [(1, 200, 0, 52), (1, 201, 0, 43)])
+        self.assertEqual(m.words, 95, "сумма по обоим блокам")
+        # синонимы остались от первого блока — на них завязаны h1.* поля tshark
+        self.assertEqual((m.org, m.db, m.dwnr, m.dlen), (1, 200, 0, 52))
+        self.assertEqual(m.areas_text(), "DB200 DW0–51 + DB201 DW0–42")
+
+    def test_multi_area_op_key_and_helpers(self):
+        from analyzer.branches.sinec_h1 import (op_all_addrs, op_areas, op_label,
+                                                 op_name, op_words,
+                                                 parse_h1_messages)
+        m = parse_h1_messages(
+            h1_multi_read(h1_addr(0x01, 200, 0, 52),
+                          h1_addr(0x01, 201, 0, 43)))[0][0]
+        op = m.op_key()
+        self.assertEqual(op_name(op), "чтение DB200 DW0–51 + DB201 DW0–42")
+        self.assertEqual(op_label(op), "чтение DB200 DW0-51 + DB201 DW0-42")
+        self.assertEqual(op_words(op), 95, "слова суммируются по обоим блокам")
+        self.assertEqual(op_all_addrs(op),
+                         [(1, 200, 0, 52), (1, 201, 0, 43)])
+        self.assertEqual(op_areas(op), [(0, 52), (0, 43)])
+        # одиночная операция даёт прежний короткий ключ
+        one = parse_h1_messages(H1_READ_DB200)[0][0].op_key()
+        self.assertEqual(one, (5, 1, 200, 0, 52))
+
+    def test_multi_area_response_data_length(self):
+        """Ответ на комбинированный запрос: данных 2 × суммы dlen."""
+        from analyzer.branches.sinec_h1 import (OP_READ_REQ,
+                                                 parse_h1_messages)
+        buf = h1_multi_read(h1_addr(0x01, 200, 0, 52),
+                            h1_addr(0x01, 201, 0, 43)) + h1_read_response(95)
+        fifo = [(OP_READ_REQ, 0.0, 95)]
+        msgs, used = parse_h1_messages(buf, expect_data=_expect_from_fifo(fifo))
+        self.assertEqual(used, len(buf))
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(msgs[1].data_words, 95)
+        self.assertEqual(len(msgs[1].data), 190)
+
+    def test_single_area_key_shape_unchanged(self):
+        """Обычный запрос не должен ломать форму ключа операции."""
+        from analyzer.branches.sinec_h1 import (op_all_addrs, op_areas, op_words,
+                                                 parse_h1_messages)
+        op = parse_h1_messages(H1_READ_DB200)[0][0].op_key()
+        self.assertEqual(len(op), 5)
+        self.assertEqual(op_words(op), 52)
+        self.assertEqual(op_all_addrs(op), [(1, 200, 0, 52)])
+        self.assertEqual(op_areas(op), [(0, 52)])
+
+    def test_op_name_and_label(self):
+        from analyzer.branches.sinec_h1 import op_label, op_name
+        self.assertEqual(op_name((5, 0x01, 200, 0, 52)), "чтение DB200 DW0–51")
+        self.assertEqual(op_name((5, 0x01, 201, 0, 1)), "чтение DB201 DW0")
+        self.assertEqual(op_name((3, 0x01, 10, 4, 1), dash="-"),
+                         "запись DB10 DW4")
+        # по умолчанию — обычное тире, а не HTML-сущность: результат
+        # попадает и в текст KPI, и в C.esc(...)
+        self.assertNotIn("&", op_name((5, 0x01, 200, 0, 52)))
+        self.assertEqual(op_label((5, 0x01, 200, 0, 52)), "DB200@0..51")
+        # для записи метка-подпись не строится, остаётся читаемое имя операции
+        self.assertEqual(op_label((3, 0x02, 8, 0, 4)), "запись MB8 DW0-3")
+
+
+def _h1_branch():
+    """Ветка sinec-h1 с подставленными атрибутами — только для правил."""
+    from analyzer.branches.sinec_h1 import SinecH1Analyzer
+    b = SinecH1Analyzer()
+    b.cfg = Config()
+    b.pcap = Path("sample.pcap")
+    b.pcap_str = "sample.pcap"
+    b.tshark = "tshark"
+    b.progress = lambda m, pct=None: None
+    return b
+
+
+def _h1_pair(**kw):
+    """Агрегат пары клиент→PLC для правил рекомендаций."""
+    from analyzer.branches.sinec_h1 import _PairStats
+    p = _PairStats(client="10.0.0.1", server="10.0.0.2",
+                   server_ports={2000})
+    for k, v in kw.items():
+        setattr(p, k, v)
+    return p
+
+
+class H1RuleTest(unittest.TestCase):
+    """Пороги правил ветки sinec-h1 (без tshark)."""
+
+    def test_errors_below_threshold_silent(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            req_msgs=100, resp_msgs=100,
+            retcodes=Counter({0x00: 100}))}
+        self.assertEqual(b._rule_errors(_General()), [])
+
+    def test_errors_warning_and_critical(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            req_msgs=100, resp_msgs=100,
+            retcodes=Counter({0x00: 96, 0x02: 4}))}
+        recs = b._rule_errors(_General())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "warning")
+        self.assertIn("не существует", " ".join(recs[0].evidence))
+        b.cfg.critical_rate_pct = 1.0
+        self.assertEqual(b._rule_errors(_General())[0].severity, "critical")
+
+    def test_unanswered_below_threshold_silent(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            req_msgs=1000, req_segs=1000, unacked=1)}   # 0.1% < 0.5%
+        self.assertEqual(b._rule_unanswered(_General()), [])
+
+    def test_unanswered_fires_with_examples(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            req_msgs=100, req_segs=100, unacked=12, unacked_bytes=384,
+            unacked_frames=[1, 2, 3])}
+        recs = b._rule_unanswered(_General())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "warning")
+        self.assertIn("1, 2, 3", " ".join(recs[0].evidence))
+
+    def test_slow_response_by_visible_rtt(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        b.cfg.slow_rtt_p95_ms = 50.0
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            req_msgs=10, resp_msgs=10,
+            rtt=_res([0.20, 0.25, 0.30, 0.31, 0.9]))}
+        self.assertEqual(len(b._rule_slow_response(_General())), 1)
+
+    def test_fast_response_silent(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        b.cfg.slow_rtt_p95_ms = 50.0
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            req_msgs=10, resp_msgs=10,
+            rtt=_res([0.001] * 10))}
+        self.assertEqual(b._rule_slow_response(_General()), [])
+
+    def test_repeats_only_on_adjacent_duplicates(self):
+        """Фиксированная карта опроса чередует операции — это не повтор."""
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        alternating = _h1_pair(req_msgs=100)
+        alternating.repeat_msgs = 0
+        b._pairs = {("10.0.0.1", "10.0.0.2"): alternating}
+        self.assertEqual(b._rule_repeats(_General()), [])
+
+        stuck = _h1_pair(req_msgs=100, repeat_msgs=90, repeat_run_max=90,
+                         repeat_examples=[7, 8])
+        b._pairs = {("10.0.0.1", "10.0.0.2"): stuck}
+        recs = b._rule_repeats(_General())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "info")
+        self.assertIn("7, 8", " ".join(recs[0].evidence))
+
+    def test_retrans_needs_enough_traffic(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        pair = _h1_pair(req_msgs=20, resp_msgs=20, retrans=2)
+        b._pairs = {("10.0.0.1", "10.0.0.2"): pair}
+        self.assertEqual(b._rule_retrans(_General()), [],
+                         "на малом объёме шум ретраев не показываем")
+        pair.req_msgs = pair.resp_msgs = 1000
+        pair.retrans = 60                       # 3% — ниже порога 5%
+        self.assertEqual(b._rule_retrans(_General()), [])
+        pair.retrans = 120                      # 6% — warning
+        recs = b._rule_retrans(_General())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "warning")
+
+    def test_one_sided_only_when_no_pair_answers(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(req_msgs=10)}
+        self.assertEqual(len(b._rule_one_sided(_General())), 1)
+        b._pairs[("10.0.0.1", "10.0.0.2")].resp_msgs = 10
+        self.assertEqual(b._rule_one_sided(_General()), [])
+
+    def test_churn_requires_syns_and_rate(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        gen = _General(first_ts=0.0, last_ts=600.0)     # 10 минут
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(req_msgs=100)}
+        self.assertEqual(b._rule_churn(gen), [], "без SYN переподключений нет")
+        gen.syn_to_ip["10.0.0.2"] = 20           # 2/мин — ниже порога 6/мин
+        self.assertEqual(b._rule_churn(gen), [])
+        gen.syn_to_ip["10.0.0.2"] = 90           # 9/мин
+        recs = b._rule_churn(gen)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "warning")
+        self.assertIn("2000", " ".join(recs[0].commands))
+
+
+class H1RegistrationTest(unittest.TestCase):
+    """Ветка зарегистрирована и подписи метрик на месте."""
+
+    def test_registered(self):
+        from analyzer.branches import BRANCHES
+        self.assertIn("sinec-h1", BRANCHES)
+        self.assertEqual(BRANCHES["sinec-h1"].name, "sinec-h1")
+
+    def test_metric_titles_cover_metrics(self):
+        from analyzer.report.trend_report import METRIC_TITLES
+        for key in ("h1_msgs", "h1_period_ms", "h1_ack_p95_ms",
+                    "h1_busy_pct", "h1_ops", "h1_unans_pct"):
+            self.assertIn(key, METRIC_TITLES)
 
 
 if __name__ == "__main__":

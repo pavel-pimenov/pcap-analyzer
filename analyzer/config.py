@@ -88,6 +88,17 @@ class Config:
     svc_one_way_min_kb: int = 64           # минимальный объём одностороннего потока, КБ
     arp_storm_per_min: float = 30.0        # ARP-кадров в минуту для предупреждения
 
+    # --- Ветка SINEC H1 (fetch/write, ISO-TCP) --------------------------------
+    h1_min_msgs_for_period: int = 10      # минимум сообщений для оценки периодики
+    h1_period_jitter_pct: float = 5.0     # разброс периода выше N% — джиттер таймера
+    h1_timer_quantum_ms: float = 32.0     # базовый квант цикла таймера S5/S7
+    h1_idle_headroom_pct: float = 80.0    # PLC простаивает выше N% времени
+    h1_single_msg_seg_pct: float = 90.0   # доля сегментов с одним сообщением, %
+    h1_full_range_words: int = 32         # диапазон длиннее N слов — «весь блок»
+    h1_repeat_share_pct: float = 60.0     # доля повторов одного запроса, %
+    h1_retrans_warn_pct: float = 5.0      # доля ретрансмиссий для warning, %
+    h1_unacked_examples: int = 10         # примеров сегментов без ACK-подтверждения
+
     # --- Ветка Coilers (телеграммы прокатного стана) --------------------------
     coilers_fast_interval_ms: float = 5.0  # медиана интервала ниже — «слишком часто»
     coilers_gap_mult: float = 10.0         # пауза длиннее N×медианы — «длительная пауза»

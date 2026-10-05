@@ -14,10 +14,10 @@
 (`requirements.txt`); системные библиотеки Pango/GDK-Pixbuf и шрифты с
 кириллицей ставятся apt-пакетами (см. `Dockerfile`).
 
-Ветки анализа (протоколы): `modbus` (Modbus/TCP, порт 502) и `s7comm`
-(Siemens S7 Communication, порт 102) и **services** (TCP/UDP-сервисы
-без дизассемблера), реестр — `BRANCHES` в
-`analyzer/branches/__init__.py`.
+Ветки анализа (протоколы): `modbus` (Modbus/TCP, порт 502), `s7comm`
+(Siemens S7 Communication, порт 102), **sinec-h1** (SINEC H1 / S5
+fetch-write, порт 2000), **services** (TCP/UDP-сервисы без дизассемблера),
+реестр — `BRANCHES` в `analyzer/branches/__init__.py`.
 
 ## Ключевые соглашения
 
@@ -85,9 +85,10 @@ analyzer/
 └── branches/
     ├── base.py           # BaseBranch, BranchResult, Section, Recommendation, KpiItem,
     │                     # Reservoir, общие утилиты (to_int/percentile/…), Гант-хелперы
-    ├── __init__.py       # BRANCHES: modbus / s7comm / services
+    ├── __init__.py       # BRANCHES: modbus / s7comm / sinec-h1 / services
     ├── modbus_tcp.py     # два прохода по pcap + правила рекомендаций
     ├── s7comm.py         # ветка S7comm (Siemens, порт 102)
+    ├── sinec_h1.py       # ветка SINEC H1 (S5 fetch/write, порт 2000)
     └── services.py       # ветка TCP/UDP-сервисов без дизассемблера
 ```
 
@@ -202,6 +203,27 @@ Batch-анализ — профиль `batch` (`docker compose run --rm analyzer
 Логика — `_pass_modbus` в `branches/modbus_tcp.py`. Приоритет определения
 направления: порт 502 → наличие `modbus.request_frame`. Сопоставление — по
 номеру кадра запроса, резерв — FIFO по ключу `(stream, trans_id, unit_id)`.
+
+### Разбор сообщений SINEC H1
+
+Логика — `parse_h1_messages(buf, expect_data=…)` в `branches/sinec_h1.py`.
+Тонкости формата, которые обязаны учитываться:
+
+* tshark разбирает только первое сообщение сегмента, остальные идут как `Data`,
+  поэтому ветка читает `tcp.payload` и разбирает цепочку сама;
+* в одном сообщении может быть несколько блоков адреса `03 08` (чтение двух DB
+  одной командой) — `H1Message.addrs`, `words` = сумма `dlen` по всем блокам;
+* у ответа на чтение блока адреса нет, а данные идут после объявленной длины
+  единым хвостом без заголовка: длина берётся из сопоставленного запроса,
+  который лежит в начале FIFO (`pair.fifo`, записи `(opcode, ts, words)`);
+* в одном сегменте ответов может быть несколько — callback `expect_data`
+  держит курсор `seen` по FIFO, сама очередь уменьшается позже, в
+  `_on_response`;
+* номера транзакции в протоколе нет, сопоставление строго FIFO; отличить
+  ретрай запроса от нового запроса невозможно;
+* отклик по ACK считается только для чистых ACK (`tcp.len == 0`): у кадра с
+  payload `tcp.ack` подтверждает байты обратного направления, то есть собственный
+  запрос.
 
 ## Чего не делать
 
