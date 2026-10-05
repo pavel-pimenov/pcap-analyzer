@@ -66,6 +66,8 @@ METRIC_TITLES = {
     "h1_busy_pct": "Занятость PLC, %",
     "h1_ops": "Уникальных операций H1",
     "h1_words": "Прочитано слов H1",
+    "h1_words_per_s": "Слов H1 в секунду",
+    "h1_write_msgs": "Сообщений записи H1",
     "h1_plcs": "PLC (H1)",
     "h1_clients": "Клиентов (H1)",
     "h1_streams": "Потоков H1",

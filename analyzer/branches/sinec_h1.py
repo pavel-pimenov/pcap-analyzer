@@ -7,10 +7,18 @@ RFC 1006 (fetch/write); типовой порт — 2000. Каждое сооб�
     53 35 | len | [тип, длина блока, тело…]… | ff 02
 
 Типы блоков: ``0x01`` — код операции, ``0x03`` — адрес (область памяти,
-номер блока, начальное слово, число слов), ``0x0F`` — код ответа,
-``0xFF`` — пустой блок-терминатор. Длина блока включает собственный
-заголовок (тип + длина), то есть блок «код операции» — это ``01 03 <код>``.
-Коды операций: 3/4 — запись (запрос/ответ), 5/6 — чтение (запрос/ответ).
+номер блока, начальное слово, число слов), ``0x09`` — данные записи
+(слова, которые пишут в PLC), ``0x0F`` — код ответа, ``0xFF`` — пустой
+блок-терминатор. Длина блока включает собственный заголовок (тип +
+длина), то есть блок «код операции» — это ``01 03 <код>``. Коды операций:
+3/4 — запись (запрос/ответ), 5/6 — чтение (запрос/ответ).
+
+Запись отличается от чтения тем, что в запросе после блоков адреса идёт
+блок данных ``0x09`` с теми же словами, которые пишутся, — длина известна
+из адресных блоков, поэтому объявленная длина сообщения покрывает всю
+запись целиком::
+
+    53 35 14 | 01 03 03 | 03 08 01 c8 00 00 00 34 | 09 02 00 2a … | ff 02
 
 Ответ на чтение устроен иначе: адресного блока в нём нет (какой DB
 отвечает — известно только из запроса), объявленная длина покрывает
@@ -78,6 +86,7 @@ H1_MAGIC = b"S5"
 BLOCK_EMPTY = 0xFF
 BLOCK_OPCODE = 0x01
 BLOCK_REQUEST = 0x03
+BLOCK_WRITE_DATA = 0x09
 BLOCK_RESPONSE = 0x0F
 
 OP_WRITE_REQ = 3
@@ -105,16 +114,30 @@ ORG_NAMES = {
     0x10: "DE", 0x11: "QB",
 }
 
+#: Коды ответа PLC (h1.resvalue). Значения выше 0x0C в H1 не используются.
 RETURN_CODES = {
     0x00: "нет ошибки",
+    0x01: "блок защищён от записи",
     0x02: "запрошенный блок не существует",
     0x03: "запрошенный блок слишком мал",
-    0xFF: "ошибка, причина неизвестна",
+    0x04: "запрошенный диапазон вне размера блока",
+    0x05: "неизвестный тип памяти",
+    0x06: "недопустимый номер блока",
+    0x07: "недопустимый адрес слова",
+    0x08: "недопустимая длина (0 слов или больше блока)",
+    0x09: "не поддерживается этим контроллером",
+    0x0A: "нет доступа на запись (защищённый блок)",
+    0x0B: "нет доступа на чтение",
+    0x0C: "нет доступа к блоку (не сконфигурирован в раскладке)",
 }
+
+#: Коды, которые означают проблему доступа к памяти (а не «PLC занят»)
+ACCESS_CODES = frozenset({0x01, 0x05, 0x06, 0x07, 0x08, 0x0A, 0x0B, 0x0C})
 
 BLOCK_NAMES = {
     BLOCK_OPCODE: "код операции",
     BLOCK_REQUEST: "адрес",
+    BLOCK_WRITE_DATA: "данные записи",
     BLOCK_RESPONSE: "код ответа",
     BLOCK_EMPTY: "пустой блок",
 }
@@ -146,6 +169,7 @@ class H1Message:
     blocks: int = 0                  # сколько блоков разобрано
     truncated: bool = False          # длина блока вышла за границу сообщения
     data: bytes = b""                # хвост ответа на чтение (без заголовка)
+    wdata: bytes = b""               # блоки 0x09 — слова, пишущиеся в PLC
 
     @property
     def org(self) -> int | None:
@@ -210,6 +234,27 @@ class H1Message:
     def data_words(self) -> int:
         """Слов в хвосте ответа на чтение (длина известна только из запроса)."""
         return len(self.data) // 2
+
+    @property
+    def is_write(self) -> bool:
+        """Запрос пишет данные в PLC (код 3)."""
+        return self.opcode == OP_WRITE_REQ
+
+    @property
+    def wdata_words(self) -> int:
+        """Слов в блоках данных записи."""
+        return len(self.wdata) // 2
+
+    @property
+    def write_values(self) -> list[int]:
+        """Значения слов записи (S5 — big-endian)."""
+        return [int.from_bytes(self.wdata[i:i + 2], "big")
+                for i in range(0, len(self.wdata) - 1, 2)]
+
+    @property
+    def write_words_ok(self) -> bool:
+        """Число слов в данных записи совпадает с суммой по блокам адреса."""
+        return bool(self.addrs) and self.wdata_words == self.words
 
     def area(self) -> str:
         """Область памяти в виде «DB200» (пусто, если адреса нет)."""
@@ -304,6 +349,9 @@ def _parse_one(raw: bytes, data: bytes = b"") -> H1Message:
                             int.from_bytes(body[4:6], "big")))
         elif btype == BLOCK_RESPONSE and body:
             m.retcode = body[0]
+        elif btype == BLOCK_WRITE_DATA and body:
+            # слова, которые пишут в PLC; длина известна из блоков адреса
+            m.wdata += body
         m.blocks += 1
         off = end
     return m
@@ -351,6 +399,14 @@ def describe_message(raw: bytes,
             rows.append((off, raw[off:end],
                          "блок кода ответа: "
                          f"{RETURN_CODES.get(body[0], 'неизвестный код')}"))
+        elif btype == BLOCK_WRITE_DATA and body:
+            vals = [int.from_bytes(body[i:i + 2], "big")
+                    for i in range(0, len(body) - 1, 2)]
+            shown = ", ".join(str(v) for v in vals[:8])
+            if len(vals) > 8:
+                shown += f", … (ещё {len(vals) - 8})"
+            rows.append((off, raw[off:end],
+                         f"блок данных записи: {len(vals)} слов = {shown}"))
         elif btype == BLOCK_EMPTY:
             rows.append((off, raw[off:end],
                          "пустой блок" + (" — дальше идут данные ответа"
@@ -476,6 +532,62 @@ class _General:
 
 
 @dataclass
+class _BlockTrack:
+    """Как менялись значения слов одного диапазона между чтениями.
+
+    Хранится только последнее значение каждого слова и счётчики; сами
+    прочитанные значения не накапливаются — файлы бывают на сотни тысяч
+    сообщений. Ключевой результат — доля слов, которые не менялись ни
+    разу: по ней видно, что можно вынести в медленный цикл опроса.
+    """
+
+    last: dict = field(default_factory=dict)     # смещение слова -> значение
+    words: int = 0                                # слов в диапазоне (из запроса)
+    reads: int = 0                                # ответов с этим диапазоном
+    changes: int = 0                              # всего изменений слов
+    changed_words: set = field(default_factory=set)   # какие слова менялись
+    changed_reads: int = 0                        # ответов, где что-то поменялось
+    examples: list = field(default_factory=list)  # (кадр, список изменений)
+
+    def update(self, frame: int, values: list[int]) -> None:
+        """Сравнить значения очередного ответа с предыдущим чтением."""
+        self.reads += 1
+        diff = []
+        for off, val in enumerate(values):
+            old = self.last.get(off)
+            if old is None:
+                pass            # первое чтение диапазона — не изменение
+            elif old == val:
+                self.changed_words.discard(off)
+            else:
+                self.changes += 1
+                self.changed_words.add(off)
+                diff.append((off, old, val))
+            self.last[off] = val
+        if diff:
+            self.changed_reads += 1
+            if len(self.examples) < 6:
+                self.examples.append((frame, diff[:6]))
+
+    @property
+    def static_words(self) -> int:
+        """Слов, которые ни разу не поменялись между чтениями."""
+        return max(self.words - len(self.changed_words), 0) if self.words else 0
+
+    @property
+    def static_share(self) -> float | None:
+        """Доля неизменных слов (None, если неизвестна длина диапазона)."""
+        if not self.words:
+            return None
+        return self.static_words / self.words
+
+    @property
+    def change_rate(self) -> float | None:
+        """Доля ответов, в которых что-то поменялось."""
+        return self.changed_reads / self.reads if self.reads else None
+
+
+@dataclass
 class _AckState:
     """Учёт ACK по одному соединению пары клиент↔PLC.
 
@@ -521,6 +633,15 @@ class _PairStats:
     rtt: Reservoir = field(default_factory=lambda: Reservoir(0))      # по видимым ответам
     ack_rtt: Reservoir = field(default_factory=lambda: Reservoir(0))  # нижняя оценка по ACK
     last_req_raw: bytes | None = None
+    #: сколько раз значение каждого слова менялось между чтениями —
+    #: обновляется только для видимых ответов (FIFO)
+    blocks: dict = field(default_factory=dict)     # AddrBlock -> _BlockTrack
+    write_msgs: int = 0
+    write_words: int = 0
+    #: поток -> (чем закрыт: «клиент»/«PLC»/«rst», время закрытия)
+    streams_closed: dict = field(default_factory=dict)
+    write_bad_data: int = 0             # блоков 0x09 со словами ≠ dlen
+    write_examples: list = field(default_factory=list)
     repeat_msgs: int = 0
     repeat_run: int = 0
     repeat_run_max: int = 0
@@ -565,6 +686,7 @@ class SinecH1Analyzer(BaseBranch):
         "frame.number", "frame.time_epoch", "frame.len",
         "ip.src", "ip.dst", "tcp.stream", "tcp.srcport", "tcp.dstport",
         "tcp.seq", "tcp.ack", "tcp.len", "tcp.payload", "tcp.flags.ack",
+        "tcp.flags.fin", "tcp.flags.reset",
         "tcp.analysis.retransmission", "tcp.window_size_value",
     ]
 
@@ -572,6 +694,10 @@ class SinecH1Analyzer(BaseBranch):
     FIFO_MAX = 20000
     #: Потолок длины очереди неподтверждённых сегментов в _AckState
     PENDING_MAX = 4096
+    #: Потолок числа диапазонов памяти со статистикой значений на пару
+    BLOCK_TRACK_MAX = 64
+    #: Диапазоны длиннее этого отслеживаются лишь по объёму (словарь дорог)
+    BLOCK_WORDS_MAX = 512
 
     def __init__(self) -> None:
         super().__init__()
@@ -674,9 +800,11 @@ class SinecH1Analyzer(BaseBranch):
         self._dir_role: dict[tuple, str] = {}     # (src,dst,stream) -> роль
         self._reset_pass_state()
 
-        # Кандидаты — сегменты с сигнатурой H1 плюс чистые ACK: по ACK мы
-        # считаем приход ответов PLC, даже когда самих ответов в файле нет.
-        filt = "tcp.payload contains 53:35 || (tcp.flags.ack==1 && tcp.len==0)"
+        # Кандидаты — сегменты с сигнатурой H1, чистые ACK (по ним считаем приход
+        # ответов PLC, даже когда самих ответов в файле нет) и FIN/RST
+        # (по ним известно состояние соединений на конец захвата).
+        filt = ("tcp.payload contains 53:35 || (tcp.flags.ack==1 && tcp.len==0)"
+                " || tcp.flags.fin==1 || tcp.flags.reset==1")
         for row in stream_fields(self.tshark, self.pcap_str, self.FIELDS_H1,
                                  display_filter=filt):
             src, dst = row.get("ip.src", ""), row.get("ip.dst", "")
@@ -721,6 +849,7 @@ class SinecH1Analyzer(BaseBranch):
                 # обратном направлении: такой кадр подтверждал бы собственный
                 # запрос, поэтому в учёте отклика участвуют только чистые ACK.
                 self._on_ack(row, src, dst, stream, ts)
+            self._on_close(row, src, dst, stream, ts)
         self._finalize()
 
     # -- учёт ------------------------------------------------------------------
@@ -824,7 +953,7 @@ class SinecH1Analyzer(BaseBranch):
         pair.opcodes[msg.opcode if msg.opcode is not None else -1] += 1
 
         if not msg.is_request:
-            self._on_response(msg, pair, ts)
+            self._on_response(msg, pair, ts, frame)
             return pair
 
         pair.req_msgs += 1
@@ -846,10 +975,19 @@ class SinecH1Analyzer(BaseBranch):
             pair.repeat_run = 1
         pair.repeat_run_max = max(pair.repeat_run_max, pair.repeat_run)
         pair.last_req_raw = msg.raw
+        if msg.is_write:
+            # запись: данные идут блоками 0x09 после блоков адреса
+            pair.write_msgs += 1
+            pair.write_words += msg.wdata_words
+            if msg.wdata and not msg.write_words_ok:
+                pair.write_bad_data += 1
+            if len(pair.write_examples) < 6:
+                pair.write_examples.append((frame, msg))
         if len(pair.fifo) < self.FIFO_MAX:
-            # (код операции, время, длина запроса): по длине запроса
-            # определяется объём данных в ответе на чтение
-            pair.fifo.append((msg.opcode, ts, msg.words))
+            # (код операции, время, длина, блоки адреса): по длине запроса
+            # определяется объём данных в ответе на чтение, по адресам —
+            # какому диапазону принадлежат слова ответа
+            pair.fifo.append((msg.opcode, ts, msg.words, tuple(msg.addrs)))
         return pair
 
     def _data_expecter(self, stream: int):
@@ -872,7 +1010,7 @@ class SinecH1Analyzer(BaseBranch):
             if pair is None:
                 return None
             for i in range(seen, len(pair.fifo)):
-                op, _ots, words = pair.fifo[i]
+                op, _ots, words, _addrs = pair.fifo[i]
                 if op == OP_READ_REQ:
                     seen = i + 1                   # следующий ответ — за ним
                     return 2 * words
@@ -880,7 +1018,7 @@ class SinecH1Analyzer(BaseBranch):
         return expect
 
     def _on_response(self, msg: H1Message, pair: _PairStats,
-                     ts: float | None) -> None:
+                     ts: float | None, frame: int = 0) -> None:
         """Ответ PLC: код ответа и отклик по порядковой (FIFO) очереди."""
         pair.resp_msgs += 1
         pair.resp_bytes += len(msg.raw) + len(msg.data)
@@ -891,10 +1029,10 @@ class SinecH1Analyzer(BaseBranch):
         # тот же порядок обхода, что и в _data_expecter: ответ на чтение идёт
         # к первому неотвеченному запросу чтения, прочие ответы — к первому
         # запросу своего типа операции
-        for i, (op, ots, words) in enumerate(pair.fifo):
+        for i, (op, ots, words, addrs) in enumerate(pair.fifo):
             if want is not None and op != want:
                 continue
-            matched = (op, ots, words)
+            matched = (op, ots, words, addrs)
             # deque не умеет удалять срезы — выбрасываем по одному
             for _ in range(i + 1):
                 pair.fifo.popleft()
@@ -902,7 +1040,7 @@ class SinecH1Analyzer(BaseBranch):
         if matched is None:
             pair.orphan_resps += 1
             return
-        _op, ots, words = matched
+        _op, ots, words, addrs = matched
         # объём данных известен только из запроса; проверяем, что PLC вернул
         # столько же (при ошибке код ответа ненулевой и данных может не быть)
         pair.resp_words += words
@@ -910,6 +1048,38 @@ class SinecH1Analyzer(BaseBranch):
             pair.size_mismatch += 1
         if ts is not None and ots is not None and ts >= ots:
             pair.rtt.add(ts - ots)
+        if msg.data and not msg.error:
+            self._track_values(pair, msg.data, addrs, words, frame)
+
+    def _track_values(self, pair: _PairStats, data: bytes,
+                      addrs: tuple, words: int, frame: int) -> None:
+        """Разложить хвост ответа по диапазонам запроса и обновить статистику.
+
+        Слова ответа идут в том же порядке, что и блоки адреса запроса, —
+        поэтому первый диапазон получает первые ``dlen`` слов и так далее.
+        Ограничение по числу отслеживаемых диапазонов нужно, чтобы в отчёт
+        не попали единичные адреса: у каждого диапазона хранится словарь
+        последних значений.
+        """
+        if not addrs or len(pair.blocks) >= self.BLOCK_TRACK_MAX:
+            return
+        off = 0
+        for org, db, dwnr, dlen in addrs:
+            end = off + 2 * dlen
+            if end > len(data):
+                break
+            if dlen > 0:
+                key = (org, db, dwnr, dlen)
+                track = pair.blocks.get(key)
+                if track is None and dlen <= self.BLOCK_WORDS_MAX:
+                    track = pair.blocks[key] = _BlockTrack(words=dlen)
+                if track is not None:
+                    vals = [int.from_bytes(data[i:i + 2], "big")
+                            for i in range(off, end, 2)]
+                    track.update(frame, vals)
+            off = end
+            if off >= len(data):
+                break
 
     @staticmethod
     def _paired_opcode(op: int | None) -> int | None:
@@ -918,6 +1088,25 @@ class SinecH1Analyzer(BaseBranch):
             if rsp == op:
                 return req
         return None
+
+    def _on_close(self, row: dict, src: str, dst: str, stream: int,
+                    ts: float | None) -> None:
+        """Учёт закрытия соединения: кто инициировал, RST или обычный FIN.
+
+        Пара определяется по уже известному направлению ролей: FIN без
+        сообщений H1 может прийти раньше первого запроса, и тогда пару
+        ещё не создать (её создаст первый запрос).
+        """
+        fin = truthy(row.get("tcp.flags.fin", ""))
+        rst = truthy(row.get("tcp.flags.reset", ""))
+        if not fin and not rst:
+            return
+        pair = self._pair_by_role(src, dst, stream)
+        if pair is None:
+            return
+        pair.streams_closed[stream] = (
+            "rst" if rst else ("клиент" if src == pair.client else "PLC"),
+            ts)
 
     def _on_ack(self, row: dict, src: str, dst: str, stream: int,
                 ts: float | None) -> None:
@@ -1042,6 +1231,8 @@ class SinecH1Analyzer(BaseBranch):
             "h1_busy_pct": (100.0 * t["busy"] / dur) if dur else 0.0,
             "h1_ops": float(len(t["ops"])),
             "h1_words": float(t["req_words"]),
+            "h1_words_per_s": (t["req_words"] / dur) if dur else 0.0,
+            "h1_write_msgs": float(sum(p.write_msgs for p in t["pairs"])),
             "h1_plcs": float(len({p.server for p in t["pairs"]})),
             "h1_clients": float(len({p.client for p in t["pairs"]})),
             "h1_streams": float(t["streams"]),
@@ -1105,6 +1296,7 @@ class SinecH1Analyzer(BaseBranch):
             self._sec_pollmap(gen),
             self._sec_timing(gen),
             self._sec_response(gen),
+            self._sec_values(gen),
             self._sec_health(gen),
         ]
 
@@ -1407,6 +1599,7 @@ class SinecH1Analyzer(BaseBranch):
                 '<span class="hot-legend">ненулевые коды ответа '
                 "выделяются розовым</span>.</p>"
             )
+        body += self._writes_html(gen, dur)
         body += (
             '<p class="note">Коды операций H1: <code>03</code>/<code>04</code> '
             '— запись и её ответ, <code>05</code>/<code>06</code> — чтение и '
@@ -1427,6 +1620,105 @@ class SinecH1Analyzer(BaseBranch):
                        "-e h1.dbnr -e h1.dwnr -e h1.dlen | sort | uniq -c "
                        "| sort -rn | head -40")),
         ])
+
+    def _writes_html(self, gen: _General, dur: float) -> str:
+        """Блок «Записи в память PLC» с примерами пишущихся слов."""
+        writes = [p for p in self._pairs.values() if p.write_msgs]
+        if not writes:
+            return ""
+        rows = []
+        for p in sorted(writes, key=lambda x: -x.write_msgs):
+            rows.append([
+                self._srv_cell(p.server),
+                f'<span class="num">{C.fmt_int(p.write_msgs)}</span>',
+                f'<span class="num">{C.fmt_int(p.write_words)}</span>',
+                f'<span class="num">{p.write_words / dur:.2f}</span>',
+                (f'<span class="num">{C.fmt_int(p.write_bad_data)}</span>',
+                 "cell-hot") if p.write_bad_data else "&mdash;",
+            ])
+        body = ('<h3 class="subhead">Записи в память PLC</h3>'
+                + C.table_html(["PLC", "Сообщений", "Слов", "Слов/с",
+                                "Расхождений объёма"], rows))
+        ex_rows = []
+        for p in writes:
+            for frame, msg in p.write_examples[:3]:
+                vals = msg.write_values
+                shown = ", ".join(str(v) for v in vals[:10])
+                if len(vals) > 10:
+                    shown += f", … (ещё {len(vals) - 10})"
+                ex_rows.append([
+                    f'<span class="num">{frame}</span>',
+                    self._srv_cell(p.server),
+                    f"<strong>{C.esc(msg.areas_text())}</strong>",
+                    f'<span class="num">{C.fmt_int(msg.wdata_words)}</span>',
+                    C.esc(shown) if shown else "&mdash;",
+                    (C.esc(msg.ret_text), "cell-hot") if msg.error
+                    else C.esc(msg.ret_text),
+                ])
+        if ex_rows:
+            body += ('<h3 class="subhead">Примеры записей</h3>'
+                     + C.table_html(["Кадр", "PLC", "Диапазон", "Слов",
+                                     "Значения", "Код ответа"], ex_rows))
+        body += (
+            '<p class="note">Данные записи идут блоками типа <code>09</code> '
+            "после блоков адреса и содержат ровно те слова, которые пишутся "
+            "в PLC. Значения показаны как есть — 16-битные слова S5 в "
+            "big-endian; тип данных (INT/DWORD/REAL) известен только из "
+            "конфигурации PLC, поэтому для датчиков и счётчиков слова стоит "
+            "приводить в отчёте к типу вручную.</p>"
+        )
+        return body
+
+    def _values_html(self) -> str:
+        """Блок «Значения блоков памяти»: что меняется между чтениями."""
+        tracked = []
+        for p in self._pairs.values():
+            for key, tr in p.blocks.items():
+                if tr.reads:
+                    tracked.append((p, key, tr))
+        if not tracked:
+            return ""
+        rows = []
+        for p, key, tr in sorted(tracked,
+                                 key=lambda x: -(x[2].words * x[2].reads)):
+            org, db, dwnr, dlen = key
+            share = tr.static_share
+            rate = tr.change_rate
+            rows.append([
+                self._srv_cell(p.server),
+                f"<strong>{C.esc(ORG_NAMES.get(org, '?'))}{db}</strong>",
+                f"<code>{C.esc(_range_text(dwnr, dlen))}</code>",
+                f'<span class="num">{C.fmt_int(tr.words)}</span>',
+                f'<span class="num">{C.fmt_int(tr.reads)}</span>',
+                (f'<span class="num">{100.0 * share:.1f}%</span>', "cell-good")
+                if share is not None and share >= 0.9 else
+                (f'<span class="num">{100.0 * share:.1f}%</span>'
+                 if share is not None else "&mdash;"),
+                f'<span class="num">{C.fmt_int(tr.changes)}</span>',
+                (f'<span class="num">{100.0 * rate:.0f}%</span>'
+                 if rate is not None else "&mdash;"),
+            ])
+        body = ('<h3 class="subhead">Изменение значений между чтениями</h3>'
+                + C.table_html(["PLC", "Блок", "Диапазон", "Слов", "Прочтений",
+                                "Не менялись", "Изменений",
+                                "Ответов с изменением"], rows))
+        ch_rows = []
+        for p, key, tr in tracked:
+            for frame, diff in tr.examples[:2]:
+                txt = ", ".join(
+                    f"DW{key[2] + off}: {old} → {new}"
+                    for off, old, new in diff)
+                ch_rows.append([
+                    f'<span class="num">{frame}</span>',
+                    self._srv_cell(p.server),
+                    f"<strong>{C.esc(ORG_NAMES.get(key[0], '?'))}{key[1]}</strong>",
+                    C.esc(txt) + (", …" if len(diff) >= 6 else ""),
+                ])
+        if ch_rows:
+            body += ('<h3 class="subhead">Примеры изменений</h3>'
+                     + C.table_html(["Кадр", "PLC", "Блок", "Что изменилось"],
+                                    ch_rows))
+        return body
 
     def _pollmap_labels(self) -> list[str]:
         """Метки карты опроса для diff-отчёта («PLC DB200@0..51»)."""
@@ -1716,6 +2008,64 @@ class SinecH1Analyzer(BaseBranch):
                           "-e tcp.seq -e tcp.ack -e tcp.len")))
         return Section("response", "Отклик PLC и учёт байтов", body, cmds)
 
+    def _sec_values(self, gen: _General) -> Section:
+        """Значения блоков памяти: что реально меняется между циклами."""
+        body = self._values_html()
+        if not body:
+            return Section(
+                "values",
+                "Значения блоков памяти",
+                '<p class="note">Ответы PLC в файле <strong>не видны</strong> '
+                "(односторонний захват), поэтому значения блоков памяти "
+                "восстановить не из чего: H1 не переносит их в отдельный "
+                "заголовок и не защищает контрольной суммой — единственный "
+                "источник данных — тело ответа. Косвенно судить о том, что "
+                "PLC отвечает, можно по объёму подтверждённых ответов в "
+                "секции «Отклик PLC и учёт байтов».</p>",
+                [],
+            )
+        body += (
+            '<p class="note">Каждое прочитанное слово сравнивается с его '
+            "значением в предыдущем чтении того же диапазона. Колонка "
+            "«Не менялись» показывает долю слов, которые за весь захват ни разу "
+            "не обновились: если она близка к 100%, диапазон опрашивается "
+            "чаще, чем меняется, и его можно перевести в медленный цикл — "
+            "объём трафика снизится без потери актуальности данных. "
+            "Отслеживаются только видимые ответы, поэтому в одностороннем "
+            "захвате секция пуста.</p>"
+        )
+        return Section("values", "Значения блоков памяти", body, [
+            ("Сколько слов опрошено и сколько ответов пришло (tshark)",
+             self._cmd('-Y "h1.dlen" -T fields -e h1.dlen | '
+                       "awk '{s+=$1; n++} END {print s, n}'")),
+            ("Сколько ответов PLC в файле",
+             self._cmd('-Y "tcp.dstport==2000 && tcp.len > 0" '
+                       '| wc -l')),
+        ])
+
+    def _streams_txt(self, pairs) -> str:
+        """Пояснение к колонкам состояния соединений."""
+        total = sum(len(p.streams) for p in pairs)
+        closed = sum(len(p.streams_closed) for p in pairs)
+        if not closed:
+            return ('<p class="note">Захват ни разу не закрыл соединение H1 '
+                    "явно: опрос к PLC идёт постоянно, поэтому соединение "
+                    "к моменту конца захвата остаётся открытым — так и должно "
+                    "быть на работающей линии. Если в файле видны закрытия, "
+                    "колонки «Закрыл клиент» и «Закрыл PLC» показывают, чья "
+                    "сторона инициировала разрыв, а «RST» — аварийные сбросы "
+                    "(потеря соединения без согласования).</p>")
+        open_now = max(total - closed, 0)
+        return (f'<p class="note">Соединений в файле '
+                f"<strong>{C.fmt_int(total)}</strong>, закрыто явно "
+                f"<strong>{C.fmt_int(closed)}</strong>, к концу захвата "
+                f"осталось открытыми {C.fmt_int(open_now)}. Закрытие по инициативе "
+                "клиента — обычное завершение сессии опроса (например, при "
+                "перезапуске ПО). Закрытие по инициативе PLC вместе с RST — "
+                "повод смотреть перезагрузки контроллера, watchdog и сетевые "
+                "сбои; регулярное закрытие со стороны PLC на работающей линии "
+                "обычно означает перезапуск PLC или истечение keepalive.</p>")
+
     def _sec_health(self, gen: _General) -> Section:
         t = self._totals(gen)
         pairs = t["pairs"]
@@ -1724,14 +2074,25 @@ class SinecH1Analyzer(BaseBranch):
         rows = []
         for p in pairs:
             syn = gen.syn_to_ip.get(p.server, 0)
+            closed = list(p.streams_closed.values())
+            n_client = sum(1 for who, _ts in closed if who == "клиент")
+            n_srv = sum(1 for who, _ts in closed if who == "PLC")
+            n_rst = sum(1 for who, _ts in closed if who == "rst")
+            n_open = max(len(p.streams) - len(closed), 0)
             rows.append([
                 self._srv_cell(p.server),
                 f'<span class="num">{C.fmt_int(len(p.streams))}</span>',
+                f'<span class="num">{C.fmt_int(n_open)}</span>'
+                if n_open else '<span class="muted">0</span>',
+                f'<span class="num">{C.fmt_int(n_client)}</span>'
+                if n_client else "&mdash;",
+                f'<span class="num">{C.fmt_int(n_srv)}</span>'
+                if n_srv else "&mdash;",
+                (f'<span class="num">{C.fmt_int(n_rst)}</span>', "cell-hot")
+                if n_rst else "&mdash;",
                 f'<span class="num">{C.fmt_int(syn)}</span>' if syn
                 else '<span class="muted">не видно</span>',
                 f'<span class="num">{C.fmt_int(p.retrans)}</span>',
-                f'<span class="num">{C.fmt_int(gen.rst_total)}</span>'
-                if gen.rst_total else "0",
                 f'<span class="num">{C.fmt_bytes(p.window)}</span>'
                 if p.window else "&mdash;",
                 f'<span class="num">{C.fmt_int(p.unacked)}</span>',
@@ -1755,8 +2116,9 @@ class SinecH1Analyzer(BaseBranch):
         body = (
             "<p>Состояние TCP-соединений по парам H1:</p>"
             + C.table_html(
-                ["PLC", "Потоков", "SYN", "Ретрансмиссий", "RST в файле",
-                 "Окно", "Без ACK", "Ответов-сирот"], rows)
+                ["PLC", "Потоков", "Открыто", "Закрыл клиент", "Закрыл PLC",
+                 "RST", "SYN", "Ретрансмиссий", "Окно", "Без ACK",
+                 "Ответов-сирот"], rows)
             + f'<p>Ретрансмиссий TCP: <strong>{C.fmt_int(retrans)}</strong> '
               f"({100.0 * retrans / msgs:.2f}% от сообщений H1), RST: "
               f"<strong>{C.fmt_int(gen.rst_total)}</strong>.</p>"
@@ -1769,6 +2131,7 @@ class SinecH1Analyzer(BaseBranch):
               '«Ответов-сирот» — ответы, которым не нашёлся неотвеченный '
               'запрос в очереди FIFO: признак начала захвата с середины обмена '
               'либо повторов запросов.</p>'
+            + self._streams_txt(pairs)
         )
         return Section("health", "Состояние TCP и односторонние захваты",
                        body, [
@@ -1796,6 +2159,8 @@ class SinecH1Analyzer(BaseBranch):
         recs.extend(self._rule_slow_response(gen))
         recs.extend(self._rule_fast_poll(gen))
         recs.extend(self._rule_period_jitter(gen))
+        recs.extend(self._rule_timer_quantum(gen))
+        recs.extend(self._rule_static_blocks(gen))
         recs.extend(self._rule_idle_headroom(gen))
         recs.extend(self._rule_batching(gen))
         recs.extend(self._rule_full_range(gen))
@@ -1869,10 +2234,14 @@ class SinecH1Analyzer(BaseBranch):
                     f"{errs} из {C.fmt_int(p.resp_msgs)} ответов "
                     f"({pct:.2f}%) содержат ненулевой код ответа."),
                 advice=(
-                    "Коды ответа H1: 0x02 — запрошенный блок не существует, "
-                    "0x03 — блок слишком мал, 0xFF — ошибка без причины. "
-                    "Проверьте номера и длины диапазонов в конфигурации опроса "
-                    "против фактической раскладки DB в PLC и убедитесь, что "
+                    "Коды ответа H1 различают проблему доступа и состояние "
+                    "PLC: 0x02 — блок не существует, 0x03/0x04 — блок или "
+                    "диапазон меньше запрошенного, 0x05–0x08 — неверный тип "
+                    "памяти, номер блока, адрес или длина, 0x01/0x0A — блок "
+                    "защищён от записи, 0x0B — нет доступа на чтение, "
+                    "0x0C — блок не сконфигурирован в раскладке. Проверьте "
+                    "номера и длины диапазонов в конфигурации опроса против "
+                    "фактической раскладки DB в PLC и убедитесь, что "
                     "запрашиваемые блоки не удалены при изменении программы."),
                 evidence=[f"код 0x{rc:02x} ({RETURN_CODES.get(rc, '?')}): "
                           f"{C.fmt_int(n)} ответов" for rc, n in top],
@@ -2005,6 +2374,114 @@ class SinecH1Analyzer(BaseBranch):
                 commands=[self._cmd(
                     f'-Y "tcp.payload contains 53:35 && ip.dst=={p.server}" '
                     "-T fields -e frame.time -e tcp.stream | head -40")],
+            ))
+        return out
+
+    def _rule_timer_quantum(self, gen: _General) -> list[Recommendation]:
+        """Период опроса не кратен базовому кванту таймера S5/S7.
+
+        Если цикл заметно отличается от кванта (32 мс по умолчанию), значит
+        он задан вручную и не попадает в разрядность таймера: реальная
+        длительность цикла «плавает» вместе с нагрузкой. Со временем это
+        даёт накопление расхождения с расписанием PLC и лишние перезапуски
+        цикла на стороне клиента.
+        """
+        out = []
+        q = self.cfg.h1_timer_quantum_ms
+        if q <= 0:
+            return out
+        tol = self.cfg.h1_timer_quantum_warn
+        for p in self._pairs.values():
+            if len(p.period) < self.cfg.h1_min_msgs_for_period:
+                continue
+            vals = sorted(p.period)
+            med = percentile(vals, 50)               # период хранится в секундах
+            if med <= 0:
+                continue
+            med_ms = med * 1000.0
+            ratio = med_ms / q
+            dev = abs(ratio - round(ratio)) * q      # отклонение от кратного, мс
+            dev_pct = 100.0 * dev / med_ms            # …в долях самого периода
+            if dev_pct < tol:
+                continue
+            out.append(Recommendation(
+                id=f"h1-timer-{p.server}".replace(".", "-"),
+                severity="warning" if dev_pct >= tol * 2 else "info",
+                title=f"Цикл опроса к {p.server} не кратен кванту таймера",
+                problem=(
+                    f"медиана периода {C.fmt_ms(med_ms)} мс — это "
+                    f"{ratio:.3f} от базового кванта {C.fmt_int(q)} мс, "
+                    f"то есть отклонение {C.fmt_ms(dev)} мс "
+                    f"({dev_pct:.1f}% периода) от ближайшего кратного "
+                    f"{C.fmt_ms(round(ratio) * q)} мс."
+                ),
+                advice=(
+                    "Задавайте период кратным базовому кванту таймера "
+                    f"({C.fmt_int(q)} мс), а не произвольным числом миллисекунд: "
+                    "тогда цикл будет повторяться без накопления ошибки, и "
+                    "пропуски тактов станут заметны. Если нужна именно такая "
+                    "длительность, добавьте в конфигурацию PLC отдельный таймер "
+                    "с нужным коэффициентом, а не подгоняйте период на стороне "
+                    "клиента."
+                ),
+                evidence=[f"медиана периода: {C.fmt_ms(med_ms)} мс",
+                          f"ближайшее кратное: {C.fmt_ms(round(ratio) * q)} мс",
+                          f"PLC: {p.server}"],
+                commands=[self._cmd(
+                    f'-Y "tcp.dstport=={p.server_port or H1_PORTS[0]} && '
+                    'tcp.payload contains 53:35" -T fields -e frame.time '
+                    "| awk 'NR > 1 {print $1 - p} {p = $1}' | head -40")],
+            ))
+        return out
+
+    def _rule_static_blocks(self, gen: _General) -> list[Recommendation]:
+        """Диапазоны, которые опрашиваются часто, но почти не меняются."""
+        out = []
+        threshold = self.cfg.h1_static_share_pct
+        for p in self._pairs.values():
+            rows = [(key, tr) for key, tr in p.blocks.items()
+                    if tr.reads >= self.cfg.h1_static_min_reads
+                    and tr.words >= self.cfg.h1_static_min_words
+                    and tr.static_share is not None
+                    and 100.0 * tr.static_share >= threshold]
+            if not rows:
+                continue
+            static_words = sum(tr.static_words for _k, tr in rows)
+            total_words = sum(tr.words for _k, tr in rows)
+            reads = sum(tr.reads for _k, tr in rows)
+            names = ", ".join(
+                f"{ORG_NAMES.get(k[0], '?')}{k[1]} "
+                f"{_range_text(k[2], k[3])} ({tr.words} слов, "
+                f"{tr.changes} изменений)"
+                for k, tr in sorted(rows, key=lambda x: -x[1].words)[:5])
+            out.append(Recommendation(
+                id=f"h1-static-{p.server}".replace(".", "-"),
+                severity="info",
+                title=f"Большая часть опрашиваемых значений не меняется: "
+                      f"{p.server}",
+                problem=(
+                    f"из {C.fmt_int(total_words)} слов в {len(rows)} "
+                    f"диапазонах {C.fmt_int(static_words)} не обновились ни разу "
+                    f"за {C.fmt_int(reads)} прочтений — доля неизменных "
+                    f"слов {100.0 * static_words / max(total_words, 1):.1f}%. "
+                    "Данные читаются с прежней частотой, хотя не меняются."
+                ),
+                advice=(
+                    "Переведите эти диапазоны в отдельный медленный цикл (в "
+                    "5–20 раз реже) либо вообще оставьте только первое чтение "
+                    "после запуска. Объём трафика и нагрузка на PLC снизятся "
+                    "пропорционально, а актуальные значения быстрых тегов "
+                    "не пострадают. Сверьте список диапазонов с циклом "
+                    "обновления самих параметров: у температур и давлений он "
+                    "обычно секунды, у счётчиков — миллисекунды."
+                ),
+                evidence=[f"неизменные диапазоны: {names}",
+                          f"PLC: {p.server}"],
+                commands=[self._cmd(
+                    f'-Y "tcp.dstport=={p.server_port or H1_PORTS[0]} && '
+                    "tcp.payload contains 53:35\" -T fields -e h1.org "
+                    "-e h1.dbnr -e h1.dwnr -e h1.dlen | sort | uniq -c "
+                    "| sort -rn | head -20")],
             ))
         return out
 

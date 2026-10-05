@@ -98,6 +98,10 @@ class Config:
     h1_repeat_share_pct: float = 60.0     # доля повторов одного запроса, %
     h1_retrans_warn_pct: float = 5.0      # доля ретрансмиссий для warning, %
     h1_unacked_examples: int = 10         # примеров сегментов без ACK-подтверждения
+    h1_static_share_pct: float = 90.0  # доля неизменных слов для «перевести в медленный цикл»
+    h1_static_min_reads: int = 5       # минимум прочтений для оценки неизменности
+    h1_static_min_words: int = 4       # минимум слов в диапазоне для правила
+    h1_timer_quantum_warn: float = 25.0  # отклонение от кванта, % периода (×2 — warning)
 
     # --- Ветка Coilers (телеграммы прокатного стана) --------------------------
     coilers_fast_interval_ms: float = 5.0  # медиана интервала ниже — «слишком часто»

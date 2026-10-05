@@ -739,6 +739,28 @@ def _expect_from_fifo(fifo):
     return expect
 
 
+def h1_write_request(*addrs, words=()) -> bytes:
+    """Запрос записи: блоки адреса, затем блоки данных 0x09.
+
+    Каждая группа ``words`` кладётся в свой блок 0x09 — так выглядит запись
+    в H1: длина объявлена в заголовке сообщения, поэтому слова известны из
+    блоков адреса.
+    """
+    data = b"".join(bytes([0x09, 2 + 2 * len(group)])
+                    + b"".join(v.to_bytes(2, "big") for v in group)
+                    for group in words)
+    body = bytes([0x01, 0x03, 0x03]) + b"".join(addrs) + data + bytes([0xFF, 0x02])
+    return b"S5" + bytes([len(body) + 3]) + body
+
+
+def h1_read_response_words(values, retcode: int = 0) -> bytes:
+    """Ответ PLC на чтение с заданными значениями слов."""
+    body = bytes([0x01, 0x03, 0x06, 0x0F, 0x03, retcode,
+                  0xFF, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00])
+    head = b"S5" + bytes([len(body) + 3]) + body
+    return head + b"".join(v.to_bytes(2, "big") for v in values)
+
+
 def _res(values, cap: int = 100) -> Reservoir:
     """Reservoir, наполненный готовыми значениями."""
     r = Reservoir(cap)
@@ -961,6 +983,52 @@ class H1ParserTest(unittest.TestCase):
         # для записи метка-подпись не строится, остаётся читаемое имя операции
         self.assertEqual(op_label((3, 0x02, 8, 0, 4)), "запись MB8 DW0-3")
 
+    def test_write_request_data_block(self):
+        """Запись: блоки 0x09 разбираются в слова, объём сверяется с dlen."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        buf = h1_write_request(h1_addr(1, 10, 4, 2), words=[[1000, 2000]])
+        msgs, used = parse_h1_messages(buf)
+        self.assertEqual(used, len(buf))
+        m = msgs[0]
+        self.assertEqual(m.opcode, 3)
+        self.assertTrue(m.is_write)
+        self.assertEqual(m.addrs, [(1, 10, 4, 2)])
+        self.assertEqual(m.wdata_words, 2)
+        self.assertEqual(m.write_values, [1000, 2000])
+        self.assertTrue(m.write_words_ok)
+
+    def test_write_request_several_data_blocks(self):
+        """Несколько блоков данных подряд — слова собираются в один хвост."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        buf = h1_write_request(h1_addr(1, 10, 0, 2), h1_addr(1, 11, 0, 1),
+                               words=[[7, 8], [9]])
+        m = parse_h1_messages(buf)[0][0]
+        self.assertEqual(m.addrs, [(1, 10, 0, 2), (1, 11, 0, 1)])
+        self.assertEqual(m.words, 3)
+        self.assertEqual(m.write_values, [7, 8, 9])
+        self.assertTrue(m.write_words_ok)
+
+    def test_write_request_data_shorter_than_dlen(self):
+        """Объём данных не совпадает с dlen — write_words_ok должно быть False."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        buf = h1_write_request(h1_addr(1, 10, 0, 4), words=[[1, 2]])
+        m = parse_h1_messages(buf)[0][0]
+        self.assertEqual(m.wdata_words, 2)
+        self.assertEqual(m.words, 4)
+        self.assertFalse(m.write_words_ok)
+
+    def test_describe_message_write_rows(self):
+        """Разбор записи по байтам показывает и адрес, и данные."""
+        from analyzer.branches.sinec_h1 import describe_message
+        buf = h1_write_request(h1_addr(1, 10, 4, 2), words=[[0x0A, 0x0B]])
+        rows = describe_message(buf)
+        types = [raw[0] for off, raw, _note in rows if off >= 3]
+        self.assertIn(0x03, types, "блок адреса должен быть в разборе")
+        self.assertIn(0x09, types, "блок данных записи должен быть в разборе")
+        notes = " ".join(note for _b, _r, note in rows)
+        self.assertIn("блок данных записи", notes)
+        self.assertIn("10, 11", notes)
+
 
 def _h1_branch():
     """Ветка sinec-h1 с подставленными атрибутами — только для правил."""
@@ -1099,6 +1167,176 @@ class H1RuleTest(unittest.TestCase):
         self.assertIn("2000", " ".join(recs[0].commands))
 
 
+class H1ValuesTest(unittest.TestCase):
+    """Учёт значений блоков памяти и записи (без tshark)."""
+
+    def test_value_tracking_marks_stable_words(self):
+        """Слова, не менявшиеся между чтениями, видно как статичные."""
+        from analyzer.branches.sinec_h1 import SinecH1Analyzer, _BlockTrack
+        pair = _h1_pair()
+        b = SinecH1Analyzer()
+        b.cfg = Config()
+        addr = ((0x01, 200, 0, 4),)
+        for vals in ([1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 9, 4]):
+            data = b"".join(v.to_bytes(2, "big") for v in vals)
+            b._track_values(pair, data, addr, 4, 10)
+        track = pair.blocks[(0x01, 200, 0, 4)]
+        self.assertEqual(track.reads, 3)
+        self.assertEqual(track.changes, 1)
+        self.assertEqual(track.changed_reads, 1)
+        self.assertEqual(track.static_words, 3)
+        self.assertAlmostEqual(track.static_share, 0.75)
+        self.assertIsInstance(track, _BlockTrack)
+
+    def test_value_tracking_respects_limits(self):
+        """Слишком много диапазонов или слишком длинные — не отслеживаем."""
+        from analyzer.branches.sinec_h1 import SinecH1Analyzer
+        b = SinecH1Analyzer()
+        b.cfg = Config()
+        b.BLOCK_TRACK_MAX = 2
+        pair = _h1_pair()
+        data = b"\x00\x01" * 4
+        for db in (1, 2, 3):
+            b._track_values(pair, data, ((0x01, db, 0, 4),), 4, 10)
+        self.assertEqual(len(pair.blocks), 2, "третий диапазон уже не пишем")
+
+        pair2 = _h1_pair()
+        b2 = SinecH1Analyzer()
+        b2.cfg = Config()
+        b2.BLOCK_WORDS_MAX = 8
+        b2._track_values(pair2, b"\x00\x01" * 64, ((0x01, 1, 0, 64),), 64, 10)
+        self.assertEqual(pair2.blocks, {}, "длинный диапазон пропускаем")
+
+    def test_write_request_accounted(self):
+        """Запись попадает в счётчики пары вместе со словами данных."""
+        from analyzer.branches.sinec_h1 import parse_h1_messages
+        msg = parse_h1_messages(
+            h1_write_request(h1_addr(1, 10, 4, 2), words=[[5, 6]]))[0][0]
+        pair = _h1_pair()
+        pair.write_msgs = 1
+        pair.write_words = msg.wdata_words
+        self.assertEqual(pair.write_words, 2)
+        self.assertTrue(msg.write_words_ok)
+
+    def test_timer_quantum_rule(self):
+        """Период, не кратный кванту таймера, — предупреждение."""
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        good = _h1_pair(period=_res([0.032] * 40))       # ровно квант
+        b._pairs = {("10.0.0.1", "10.0.0.2"): good}
+        self.assertEqual(b._rule_timer_quantum(_General()), [])
+
+        # 96 мс = ровно 3 кванта — тоже молчим
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            period=_res([0.096] * 40))}
+        self.assertEqual(b._rule_timer_quantum(_General()), [])
+
+        # 25 мс против кванта 32 мс: отклонение 7 мс = 28% периода
+        bad = _h1_pair(period=_res([0.025] * 40))
+        b._pairs = {("10.0.0.1", "10.0.0.2"): bad}
+        recs = b._rule_timer_quantum(_General())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "info")
+        self.assertIn("не кратен", recs[0].title)
+
+    def test_timer_quantum_rule_severity_scales(self):
+        from analyzer.branches.sinec_h1 import _General
+        b = _h1_branch()
+        # 150 мс: ближайшее кратное 160 мс, отклонение 10 мс = 6.7% периода
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            period=_res([0.150] * 40))}
+        self.assertEqual(b._rule_timer_quantum(_General()), [])
+
+        # 2000 мс: ближайшее кратное 1984 мс, отклонение 16 мс = 0.8%
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            period=_res([2.0] * 40))}
+        self.assertEqual(b._rule_timer_quantum(_General()), [])
+
+        # 20 мс против кванта 32 мс: отклонение 12 мс = 60% периода
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            period=_res([0.020] * 40))}
+        recs = b._rule_timer_quantum(_General())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "warning")
+
+    def test_static_blocks_rule(self):
+        """Диапазон, который не меняется, — повод перевести в медленный цикл."""
+        from analyzer.branches.sinec_h1 import _BlockTrack, _General
+        b = _h1_branch()
+        track = _BlockTrack(words=8)
+        track.update(1, [1, 2, 3, 4, 5, 6, 7, 8])
+        for _ in range(9):
+            track.update(2, [1, 2, 3, 4, 5, 6, 7, 8])
+        pair = _h1_pair(resp_msgs=10, req_msgs=10)
+        pair.blocks[(0x01, 200, 0, 8)] = track
+        b._pairs = {("10.0.0.1", "10.0.0.2"): pair}
+        recs = b._rule_static_blocks(_General())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].severity, "info")
+        self.assertIn("DB200", " ".join(recs[0].evidence))
+
+    def test_static_blocks_rule_needs_reads_and_size(self):
+        """Мало прочтений или слишком короткий диапазон — не показываем."""
+        from analyzer.branches.sinec_h1 import _BlockTrack, _General
+        b = _h1_branch()
+        few = _BlockTrack(words=8)
+        few.update(1, [1] * 8)
+        pair = _h1_pair(resp_msgs=2, req_msgs=2)
+        pair.blocks[(0x01, 200, 0, 8)] = few
+        b._pairs = {("10.0.0.1", "10.0.0.2"): pair}
+        self.assertEqual(b._rule_static_blocks(_General()), [])
+
+        small = _BlockTrack(words=2)
+        for _ in range(10):
+            small.update(1, [1, 2])
+        pair2 = _h1_pair(resp_msgs=10, req_msgs=10)
+        pair2.blocks[(0x01, 200, 0, 2)] = small
+        b._pairs = {("10.0.0.1", "10.0.0.2"): pair2}
+        self.assertEqual(b._rule_static_blocks(_General()), [])
+
+    def test_close_accounting_by_initiator(self):
+        """FIN клиента, FIN PLC и RST считаются раздельно."""
+        from analyzer.branches.sinec_h1 import SinecH1Analyzer
+        b = SinecH1Analyzer()
+        b.cfg = Config()
+        pair = _h1_pair()
+        b._pairs = {("10.0.0.1", "10.0.0.2"): pair}
+        b._dir_role = {
+            ("10.0.0.1", "10.0.0.2", 1): "client",
+            ("10.0.0.2", "10.0.0.1", 1): "server",
+            ("10.0.0.1", "10.0.0.2", 2): "client",
+            ("10.0.0.2", "10.0.0.1", 2): "server",
+            ("10.0.0.1", "10.0.0.2", 3): "client",
+            ("10.0.0.2", "10.0.0.1", 3): "server",
+        }
+        pair.streams = {1, 2, 3}
+        base = {"tcp.len": "0", "frame.number": "1"}
+        b._on_close({**base, "tcp.flags.fin": "1", "tcp.flags.reset": "0"},
+                    "10.0.0.1", "10.0.0.2", 1, 100.0)
+        b._on_close({**base, "tcp.flags.fin": "1", "tcp.flags.reset": "0"},
+                    "10.0.0.2", "10.0.0.1", 2, 101.0)
+        b._on_close({**base, "tcp.flags.fin": "0", "tcp.flags.reset": "1"},
+                    "10.0.0.2", "10.0.0.1", 3, 102.0)
+        self.assertEqual(pair.streams_closed[1], ("клиент", 100.0))
+        self.assertEqual(pair.streams_closed[2], ("PLC", 101.0))
+        self.assertEqual(pair.streams_closed[3], ("rst", 102.0))
+        # ничего не закрыто — текст объясняет, что это нормально
+        pair2 = _h1_pair(streams={1})
+        self.assertIn("открытым", b._streams_txt([pair2]))
+        self.assertIn("осталось открытыми 0",
+                      b._streams_txt([_h1_pair(streams={1},
+                                               streams_closed={1: ("клиент", 1.0)})]))
+
+    def test_return_codes_cover_access_errors(self):
+        """Коды 0x01–0x0C расшифрованы, помечены как проблемы доступа."""
+        from analyzer.branches.sinec_h1 import ACCESS_CODES, RETURN_CODES
+        for code in range(0x01, 0x0D):
+            self.assertIn(code, RETURN_CODES, f"код 0x{code:02x} не описан")
+        self.assertIn(0x01, ACCESS_CODES)
+        self.assertNotIn(0x00, ACCESS_CODES)
+        self.assertNotIn(0x02, ACCESS_CODES, "нет блока — это не доступ")
+
+
 class H1RegistrationTest(unittest.TestCase):
     """Ветка зарегистрирована и подписи метрик на месте."""
 
@@ -1110,8 +1348,22 @@ class H1RegistrationTest(unittest.TestCase):
     def test_metric_titles_cover_metrics(self):
         from analyzer.report.trend_report import METRIC_TITLES
         for key in ("h1_msgs", "h1_period_ms", "h1_ack_p95_ms",
-                    "h1_busy_pct", "h1_ops", "h1_unans_pct"):
+                    "h1_busy_pct", "h1_ops", "h1_unans_pct",
+                    "h1_words_per_s", "h1_write_msgs"):
             self.assertIn(key, METRIC_TITLES)
+
+    def test_all_metrics_have_titles(self):
+        """Каждая метрика ветки подписана в METRIC_TITLES (для trend/diff)."""
+        from analyzer.branches.sinec_h1 import SinecH1Analyzer
+        from analyzer.report.trend_report import METRIC_TITLES
+        b = _h1_branch()
+        from analyzer.branches.sinec_h1 import _General
+        b._pairs = {("10.0.0.1", "10.0.0.2"): _h1_pair(
+            req_msgs=10, resp_msgs=10, req_words=520, write_msgs=2)}
+        metrics = b._metrics(_General(first_ts=0.0, last_ts=10.0))
+        self.assertTrue(metrics)
+        for key in metrics:
+            self.assertIn(key, METRIC_TITLES, f"нет подписи для метрики {key}")
 
 
 if __name__ == "__main__":

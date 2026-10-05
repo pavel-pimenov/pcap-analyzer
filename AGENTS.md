@@ -16,7 +16,8 @@
 
 Ветки анализа (протоколы): `modbus` (Modbus/TCP, порт 502), `s7comm`
 (Siemens S7 Communication, порт 102), **sinec-h1** (SINEC H1 / S5
-fetch-write, порт 2000), **services** (TCP/UDP-сервисы без дизассемблера),
+fetch-write, порт 2000), **coilers** (телеграммы прокатного стана, по
+конфигурации `Coilers.xml`), **services** (TCP/UDP-сервисы без дизассемблера),
 реестр — `BRANCHES` в `analyzer/branches/__init__.py`.
 
 ## Ключевые соглашения
@@ -85,10 +86,12 @@ analyzer/
 └── branches/
     ├── base.py           # BaseBranch, BranchResult, Section, Recommendation, KpiItem,
     │                     # Reservoir, общие утилиты (to_int/percentile/…), Гант-хелперы
-    ├── __init__.py       # BRANCHES: modbus / s7comm / sinec-h1 / services
+    ├── __init__.py       # BRANCHES: modbus / s7comm / sinec-h1 /
+    │                     #   coilers / services
     ├── modbus_tcp.py     # два прохода по pcap + правила рекомендаций
     ├── s7comm.py         # ветка S7comm (Siemens, порт 102)
     ├── sinec_h1.py       # ветка SINEC H1 (S5 fetch/write, порт 2000)
+    ├── coilers.py        # ветка телеграмм прокатного стана (Coilers.xml)
     └── services.py       # ветка TCP/UDP-сервисов без дизассемблера
 ```
 
@@ -143,6 +146,22 @@ python3 -m analyzer analyze <pcap> --config thresholds.toml --tz 3 -o /tmp/r.htm
 * малый: 13 111 запросов, медиана RTT ~1.9 мс, 49 SYN (одна пара),
   53 потока закрыл клиент; рекомендаций 6 (5 warning, включая
   «Частые переподключения», 1 info), критичных нет.
+
+Для `sinec-h1` контрольные значения — два образца из
+`pcap-sample/siemns-fetch-write-ods/` (при замене пересчитать по tshark):
+
+* `tcpdump_odskc2_and_one_plc_lb_v1.pcap` — 96 запросов, 0 видимых ответов,
+  4560 запрошенных слов, медиана ACK ~22.8 мс (нижняя оценка), p95 ~51 мс,
+  цикл ~2076 мс, неразобранных байт 0, неотвеченных 0; 3 рекомендации
+  (все info: чтение целого диапазона, запас PLC, односторонний захват);
+* `tcpdump_odskc2_and_one_plc_lb.pcap` — 34 запроса / 34 ответа, по 1615
+  слов, медиана RTT ~41 мс, p95 ~106 мс, цикл ~2064 мс, коды ответа только
+  `0x00`, mismatch размеров 0, сирот 0, неразобранных байт 0;
+  4 рекомендации (1 warning «PLC отвечает медленно», 3 info, включая
+  «большая часть значений не меняется»).
+
+Значения блоков видны только в двустороннем файле: DB200 (52 слова) не
+менялся ни разу, DB201 (43 слова) — 93% слов изменились.
 
 ## Docker
 
